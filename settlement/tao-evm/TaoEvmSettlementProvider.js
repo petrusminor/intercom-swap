@@ -1,8 +1,24 @@
-import { JsonRpcProvider, Wallet } from 'ethers';
+import {
+  Contract,
+  JsonRpcProvider,
+  Wallet,
+  ZeroAddress,
+  getAddress,
+  hexlify,
+  isAddress,
+  randomBytes,
+} from 'ethers';
 
 const DEFAULT_RPC_URL = 'https://lite.chain.opentensor.ai';
 const DEFAULT_CHAIN_ID = 964n;
 const DEFAULT_CONFIRMATIONS = 1;
+
+const TAO_HTLC_ABI = [
+  'function lock(address receiver, bytes32 hashlock, uint256 refundAfter, bytes32 clientSalt) payable returns (bytes32 swapId)',
+  'function claim(bytes32 swapId, bytes preimage)',
+  'function refund(bytes32 swapId)',
+  'function swaps(bytes32 swapId) view returns (address sender, address receiver, uint256 amount, uint256 refundAfter, bytes32 hashlock, bool claimed, bool refunded)',
+];
 
 export class NotImplementedError extends Error {
   constructor(message) {
@@ -53,11 +69,53 @@ function normalizeTxHash(value) {
   return hash;
 }
 
+function normalizeHex32(value, label) {
+  const s = String(value || '').trim();
+  if (!s) throw new Error(`${label} is required`);
+  const noPrefix = s.startsWith('0x') || s.startsWith('0X') ? s.slice(2) : s;
+  if (!/^[0-9a-fA-F]{64}$/.test(noPrefix)) {
+    throw new Error(`${label} must be 32-byte hex`);
+  }
+  return `0x${noPrefix.toLowerCase()}`;
+}
+
+function normalizeAddress(value, label) {
+  const s = String(value || '').trim();
+  if (!s || !isAddress(s)) throw new Error(`${label} must be an EVM address`);
+  return getAddress(s);
+}
+
+function parseAmountAtomic(value) {
+  const s = String(value ?? '').trim();
+  if (!/^[0-9]+$/.test(s)) throw new Error('amountAtomic must be a positive wei integer string');
+  const n = BigInt(s);
+  if (n <= 0n) throw new Error('amountAtomic must be > 0');
+  return n;
+}
+
+function parseRefundAfterUnix(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    throw new Error('refundAfterUnix must be a unix seconds integer');
+  }
+  return BigInt(n);
+}
+
+function parseMetadataObject(value) {
+  return value && typeof value === 'object' ? value : {};
+}
+
+function normalizeSwapId(value) {
+  return normalizeHex32(value, 'settlementId');
+}
+
 /**
- * EVM settlement provider scaffold for TAO EVM.
+ * EVM settlement provider for TAO EVM.
  *
- * Phase 3 scope is connectivity and tx plumbing only. HTLC lock/claim/refund
- * behavior will be added in Phase 4.
+ * Phase 4 scope:
+ * - implements lock/claim/refund against TaoHTLC
+ * - keeps feeSnapshot as a placeholder
+ * - leaves verifySwapPrePayOnchain for a later integration phase
  *
  * @implements {import('../SettlementProvider').SettlementProvider}
  */
@@ -67,6 +125,7 @@ export class TaoEvmSettlementProvider {
     chainId = DEFAULT_CHAIN_ID,
     privateKey = process.env.TAO_EVM_PRIVATE_KEY || '',
     confirmations = process.env.TAO_EVM_CONFIRMATIONS || DEFAULT_CONFIRMATIONS,
+    htlcAddress = process.env.TAO_EVM_HTLC_ADDRESS || '',
   } = {}) {
     this.rpcUrl = String(rpcUrl || DEFAULT_RPC_URL).trim() || DEFAULT_RPC_URL;
     this.expectedChainId = parseChainId(chainId, DEFAULT_CHAIN_ID);
@@ -81,6 +140,11 @@ export class TaoEvmSettlementProvider {
     this.provider = new JsonRpcProvider(this.rpcUrl);
     this.wallet = new Wallet(pk, this.provider);
 
+    const rawHtlc = String(htlcAddress || '').trim();
+    this.htlcAddress = rawHtlc ? normalizeAddress(rawHtlc, 'TAO_EVM_HTLC_ADDRESS') : '';
+    this.htlc = this.htlcAddress ? new Contract(this.htlcAddress, TAO_HTLC_ABI, this.wallet) : null;
+
+    this._metaBySettlementId = new Map();
     this._ready = this._assertExpectedChainId();
   }
 
@@ -97,8 +161,31 @@ export class TaoEvmSettlementProvider {
     await this._ready;
   }
 
-  _phase4(methodName) {
-    throw new NotImplementedError(`${methodName} not implemented yet. Phase 4 will add HTLC.`);
+  _phaseLater(methodName, phase = 'Phase 5') {
+    throw new NotImplementedError(`${methodName} not implemented yet. ${phase} will add HTLC integration checks.`);
+  }
+
+  _requireHtlc() {
+    if (this.htlc) return this.htlc;
+    throw new Error('Missing TAO_EVM_HTLC_ADDRESS');
+  }
+
+  _setMetadata(settlementId, metadata) {
+    const id = String(settlementId || '').trim().toLowerCase();
+    if (!id) return;
+    const prev = parseMetadataObject(this._metaBySettlementId.get(id));
+    this._metaBySettlementId.set(id, { ...prev, ...metadata });
+  }
+
+  _getMetadata(settlementId) {
+    return parseMetadataObject(this._metaBySettlementId.get(String(settlementId || '').trim().toLowerCase()));
+  }
+
+  _resolveClientSalt(terms = {}) {
+    const t = parseMetadataObject(terms);
+    const fromTerms = String(t.client_salt || t.clientSalt || '').trim();
+    if (fromTerms) return normalizeHex32(fromTerms, 'terms.client_salt');
+    return hexlify(randomBytes(32));
   }
 
   async getSignerAddress() {
@@ -110,6 +197,7 @@ export class TaoEvmSettlementProvider {
     await this._ensureReady();
     const signer = await this.wallet.getAddress();
 
+    // Placeholder fee model for Phase 4: defaults to zero fees unless env overrides are set.
     const platformFeeBps = parseFeeBps(process.env.TAO_EVM_PLATFORM_FEE_BPS, 0);
     const tradeFeeBps = parseFeeBps(process.env.TAO_EVM_TRADE_FEE_BPS, 0);
 
@@ -128,24 +216,150 @@ export class TaoEvmSettlementProvider {
     };
   }
 
-  async lock(_input) {
-    this._phase4('lock');
+  async lock(input) {
+    await this._ensureReady();
+    const htlc = this._requireHtlc();
+
+    const signerAddress = await this.wallet.getAddress();
+    const receiver = normalizeAddress(input?.recipient, 'recipient');
+    const refundAddress = normalizeAddress(input?.refundAddress, 'refundAddress');
+    if (refundAddress !== getAddress(signerAddress)) {
+      throw new Error(`refundAddress must match signer address (${signerAddress})`);
+    }
+
+    const hashlock = normalizeHex32(input?.paymentHashHex, 'paymentHashHex');
+    const amount = parseAmountAtomic(input?.amountAtomic);
+    const refundAfter = parseRefundAfterUnix(input?.refundAfterUnix);
+    const clientSalt = this._resolveClientSalt(input?.terms);
+
+    const swapId = await htlc.lock.staticCall(receiver, hashlock, refundAfter, clientSalt, {
+      value: amount,
+    });
+
+    const tx = await htlc.lock(receiver, hashlock, refundAfter, clientSalt, {
+      value: amount,
+    });
+    await tx.wait(this.confirmations);
+
+    const settlementId = normalizeSwapId(swapId);
+    this._setMetadata(settlementId, {
+      settlement_id: settlementId,
+      tx_id: tx.hash,
+      tx_hash: tx.hash,
+      swap_id: settlementId,
+      hashlock,
+      sender: signerAddress,
+      receiver,
+      amount_atomic: amount.toString(),
+      refund_after_unix: Number(refundAfter),
+      contract_address: this.htlcAddress,
+      client_salt: clientSalt,
+    });
+
+    return {
+      settlementId,
+      txId: tx.hash,
+      metadata: this._getMetadata(settlementId),
+    };
   }
 
-  async verifyPrePay(_input) {
-    this._phase4('verifyPrePay');
+  async verifyPrePay(input) {
+    try {
+      await this._ensureReady();
+      const htlc = this._requireHtlc();
+
+      const settlementId = normalizeSwapId(input?.settlementId);
+      const hashlock = normalizeHex32(input?.paymentHashHex, 'paymentHashHex');
+      const s = await htlc.swaps(settlementId);
+
+      const sender = String(s?.sender || ZeroAddress);
+      if (sender.toLowerCase() === ZeroAddress.toLowerCase()) {
+        return { ok: false, error: 'swap not found on chain' };
+      }
+      const receiver = String(s?.receiver || ZeroAddress);
+      const amount = BigInt(s?.amount ?? 0n);
+      const refundAfter = BigInt(s?.refundAfter ?? 0n);
+      const onchainHashlock = normalizeHex32(s?.hashlock, 'swap.hashlock');
+      const claimed = Boolean(s?.claimed);
+      const refunded = Boolean(s?.refunded);
+
+      if (onchainHashlock !== hashlock) {
+        return { ok: false, error: 'swap hashlock mismatch' };
+      }
+      if (claimed || refunded) {
+        return { ok: false, error: `swap not active (claimed=${claimed} refunded=${refunded})` };
+      }
+
+      if (input?.nowUnix !== undefined && input?.nowUnix !== null) {
+        const nowUnix = Number(input.nowUnix);
+        if (!Number.isFinite(nowUnix) || !Number.isInteger(nowUnix) || nowUnix <= 0) {
+          return { ok: false, error: 'nowUnix must be a unix seconds integer' };
+        }
+        if (BigInt(nowUnix) >= refundAfter) {
+          return { ok: false, error: 'swap refund_after already reached' };
+        }
+      }
+
+      const metadata = {
+        settlement_id: settlementId,
+        swap_id: settlementId,
+        contract_address: this.htlcAddress,
+        hashlock: onchainHashlock,
+        sender,
+        receiver,
+        amount_atomic: amount.toString(),
+        refund_after_unix: Number(refundAfter),
+        claimed,
+        refunded,
+      };
+      this._setMetadata(settlementId, metadata);
+      return { ok: true, metadata };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
   }
 
   async verifySwapPrePayOnchain(_input) {
-    this._phase4('verifySwapPrePayOnchain');
+    this._phaseLater('verifySwapPrePayOnchain');
   }
 
-  async claim(_input) {
-    this._phase4('claim');
+  async claim(input) {
+    await this._ensureReady();
+    const htlc = this._requireHtlc();
+
+    const settlementId = normalizeSwapId(input?.settlementId);
+    const preimageHex = normalizeHex32(input?.preimageHex, 'preimageHex');
+
+    const tx = await htlc.claim(settlementId, preimageHex);
+    await tx.wait(this.confirmations);
+
+    this._setMetadata(settlementId, {
+      settlement_id: settlementId,
+      tx_id: tx.hash,
+      tx_hash: tx.hash,
+      preimage_hex: preimageHex,
+      claim_tx_id: tx.hash,
+    });
+
+    return { txId: tx.hash };
   }
 
-  async refund(_input) {
-    this._phase4('refund');
+  async refund(input) {
+    await this._ensureReady();
+    const htlc = this._requireHtlc();
+
+    const settlementId = normalizeSwapId(input?.settlementId);
+    const tx = await htlc.refund(settlementId);
+    await tx.wait(this.confirmations);
+
+    this._setMetadata(settlementId, {
+      settlement_id: settlementId,
+      tx_id: tx.hash,
+      tx_hash: tx.hash,
+      refund_tx_id: tx.hash,
+    });
+
+    return { txId: tx.hash };
   }
 
   async waitForConfirmation(txId) {
