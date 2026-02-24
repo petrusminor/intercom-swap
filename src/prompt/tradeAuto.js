@@ -1,4 +1,5 @@
 import { hashUnsignedEnvelope } from '../swap/hash.js';
+import { SETTLEMENT_KIND, normalizeSettlementKind } from '../../settlement/providerFactory.js';
 
 const FIXED_PLATFORM_FEE_BPS = 10; // 0.1%
 const DEFAULT_TRADE_FEE_BPS = 10; // 0.1%
@@ -340,7 +341,7 @@ export class TradeAutoManager {
     this._swapAutoLeaveByTrade = new Map(); // trade_id -> { attempts, nextAtMs, lastTs }
     this._eventSeenAt = new Map(); // dedupe key -> seen_at_ms
     this._cachedLocalPeer = '';
-    this._cachedLocalSolSigner = '';
+    this._cachedLocalSettlementSigner = '';
     this._waitingTermsState = new Map(); // trade_id -> { firstSeenAt,lastTs,lastTraceAt,lastPingAt,nextPingAt,pings,timedOutAt }
     this._lnPayFailByTrade = new Map(); // trade_id -> { channel, failures, firstFailAt, lastFailAt, abortedAt, abortReason, lastAbortTraceAt }
     this._abortedTrades = new Map(); // trade_id -> { at_ms, stage, channel, reason }
@@ -582,6 +583,7 @@ export class TradeAutoManager {
     const lnLiquidityModeRaw = String(opts.ln_liquidity_mode || 'aggregate').trim().toLowerCase();
     const lnLiquidityMode = lnLiquidityModeRaw === 'single_channel' ? 'single_channel' : 'aggregate';
     const usdtMint = String(opts.usdt_mint || '').trim();
+    const settlementKind = normalizeSettlementKind(opts.settlement_kind || opts.settlement || SETTLEMENT_KIND.SOLANA);
 
     this.opts = {
       channels,
@@ -617,6 +619,7 @@ export class TradeAutoManager {
       ln_route_precheck_wait_cooldown_ms: lnRoutePrecheckWaitCooldownMs,
       trace_enabled: traceEnabled,
       ln_liquidity_mode: lnLiquidityMode,
+      settlement_kind: settlementKind,
       usdt_mint: usdtMint || null,
       enable_quote_from_offers: opts.enable_quote_from_offers !== false,
       enable_quote_from_rfqs: opts.enable_quote_from_rfqs === true,
@@ -659,7 +662,7 @@ export class TradeAutoManager {
     this._swapAutoLeaveByTrade.clear();
     this._eventSeenAt.clear();
     this._cachedLocalPeer = '';
-    this._cachedLocalSolSigner = '';
+    this._cachedLocalSettlementSigner = '';
     this._waitingTermsState.clear();
     this._lnPayFailByTrade.clear();
     this._abortedTrades.clear();
@@ -695,6 +698,7 @@ export class TradeAutoManager {
       ln_route_precheck_wait_cooldown_ms: lnRoutePrecheckWaitCooldownMs,
       trace_enabled: traceEnabled,
       enable_quote_from_rfqs: opts.enable_quote_from_rfqs === true,
+      settlement_kind: settlementKind,
     });
 
     await this._runToolWithTimeout(
@@ -739,7 +743,7 @@ export class TradeAutoManager {
     this._swapAutoLeaveByTrade.clear();
     this._eventSeenAt.clear();
     this._cachedLocalPeer = '';
-    this._cachedLocalSolSigner = '';
+    this._cachedLocalSettlementSigner = '';
     this._waitingTermsState.clear();
     this._lnPayFailByTrade.clear();
     this._abortedTrades.clear();
@@ -1192,7 +1196,7 @@ export class TradeAutoManager {
         if (kind === 'swap.terms') ctx.terms = msg;
         else if (kind === 'swap.accept') ctx.accept = msg;
         else if (kind === 'swap.ln_invoice') ctx.invoice = msg;
-        else if (kind === 'swap.sol_escrow_created') ctx.escrow = msg;
+        else if (kind === 'swap.sol_escrow_created' || kind === 'swap.tao_htlc_locked') ctx.escrow = msg;
         else if (kind === 'swap.ln_paid') ctx.ln_paid = msg;
         else if (kind === 'swap.status') {
           if (!Array.isArray(ctx.statuses)) ctx.statuses = [];
@@ -1201,10 +1205,10 @@ export class TradeAutoManager {
             ctx.statuses.splice(0, ctx.statuses.length - 40);
           }
         }
-        else if (kind === 'swap.sol_claimed') {
+        else if (kind === 'swap.sol_claimed' || kind === 'swap.tao_claimed') {
           ctx.claimed = msg;
           terminalTradeIds.add(tradeId);
-        } else if (kind === 'swap.sol_refunded') {
+        } else if (kind === 'swap.sol_refunded' || kind === 'swap.tao_refunded') {
           ctx.refunded = msg;
           terminalTradeIds.add(tradeId);
         } else if (kind === 'swap.cancel') {
@@ -1380,21 +1384,21 @@ export class TradeAutoManager {
           error: err?.message || String(err),
         });
       }
-      let localSolSigner = '';
+      let localSettlementSigner = '';
       try {
-        localSolSigner = String(
+        localSettlementSigner = String(
           (
             await this._runToolWithTimeout(
-              { tool: 'intercomswap_sol_signer_pubkey', args: {} },
-              { timeoutMs: Math.min(this._toolTimeoutMs, 8_000), label: 'tradeauto_sol_signer' }
+              { tool: 'intercomswap_settlement_signer_address', args: {} },
+              { timeoutMs: Math.min(this._toolTimeoutMs, 8_000), label: 'tradeauto_settlement_signer' }
             )
-          )?.pubkey || ''
+          )?.address || ''
         ).trim();
-        if (localSolSigner) this._cachedLocalSolSigner = localSolSigner;
+        if (localSettlementSigner) this._cachedLocalSettlementSigner = localSettlementSigner;
       } catch (err) {
-        localSolSigner = String(this._cachedLocalSolSigner || '').trim();
-        this._trace('sol_signer_warn', {
-          fallback_cached: Boolean(localSolSigner),
+        localSettlementSigner = String(this._cachedLocalSettlementSigner || '').trim();
+        this._trace('settlement_signer_warn', {
+          fallback_cached: Boolean(localSettlementSigner),
           error: err?.message || String(err),
         });
       }
@@ -1492,7 +1496,7 @@ export class TradeAutoManager {
                       offer_line_index: Number(match.offerLineIndex),
                     }
                   : {}),
-                trade_fee_collector: localSolSigner,
+                trade_fee_collector: localSettlementSigner,
                 sol_refund_window_sec: refundWindowSec,
                 valid_for_sec: 180,
               },
@@ -1816,7 +1820,7 @@ export class TradeAutoManager {
               iAmInvitedTaker ||
               ctx.myRfqTradeIds.has(tradeId) ||
               (localPeer && /^[0-9a-f]{64}$/i.test(termsLnPayerPeer) && termsLnPayerPeer === localPeer) ||
-              (localSolSigner && termsSolRecipient && termsSolRecipient === localSolSigner)
+              (localSettlementSigner && termsSolRecipient && termsSolRecipient === localSettlementSigner)
           );
           if (!iAmMaker && !iAmTaker) {
             const lastTrace = Number(this._notOwnerTraceAt.get(tradeId) || 0);
@@ -1825,7 +1829,7 @@ export class TradeAutoManager {
                 trade_id: tradeId,
                 channel: String(tradeCtx?.channel || neg?.swap_channel || '').trim() || null,
                 local_peer: localPeer || null,
-                local_sol_signer: localSolSigner || null,
+                settlement_signer: localSettlementSigner || null,
                 maker_signer: makerSigner || null,
                 taker_signer: takerSigner || null,
                 invitee_peer: inviteePeer || null,
@@ -1849,8 +1853,8 @@ export class TradeAutoManager {
           })();
           const termsBoundToLocalSolRecipient = (() => {
             if (!termsEnv) return true;
-            if (!localSolSigner) return false;
-            return Boolean(termsSolRecipient && termsSolRecipient === localSolSigner);
+            if (!localSettlementSigner) return false;
+            return Boolean(termsSolRecipient && termsSolRecipient === localSettlementSigner);
           })();
 
           if (iAmMaker && !termsEnv && quoteEnv && rfqEnv && quoteAcceptEnv) {
@@ -1863,7 +1867,7 @@ export class TradeAutoManager {
                 const btcSats = toIntOrNull(quoteBody?.btc_sats ?? rfqBody?.btc_sats);
                 const usdtAmount = String(quoteBody?.usdt_amount ?? rfqBody?.usdt_amount ?? '').trim();
                 const solRecipient = String(rfqBody?.sol_recipient || '').trim();
-                const solRefund = localSolSigner;
+                const solRefund = localSettlementSigner;
                 const tradeFeeCollector = String(quoteBody?.trade_fee_collector || '').trim();
                 const lnPayerPeer = String(quoteAcceptEnv?.signer || rfqEnv?.signer || '').trim().toLowerCase();
                 const solMint = String(this.opts.usdt_mint || rfqBody?.sol_mint || quoteBody?.sol_mint || '').trim();
@@ -2305,7 +2309,8 @@ export class TradeAutoManager {
           }
 
           if (iAmMaker && termsEnv && invoiceEnv && !escrowEnv) {
-            const stageKey = `${tradeId}:sol_escrow`;
+            const escrowStageName = this.opts.settlement_kind === SETTLEMENT_KIND.TAO_EVM ? 'tao_htlc' : 'sol_escrow';
+            const stageKey = `${tradeId}:${escrowStageName}`;
             if (this._canRunStage(stageKey)) {
               const okTs = Number(routePrecheckStatus?.ok_ts || 0);
               const failTs = Number(routePrecheckStatus?.fail_ts || 0);
@@ -2325,7 +2330,7 @@ export class TradeAutoManager {
                   await this._abortTrade({
                     tradeId,
                     channel: swapChannel,
-                    stage: 'sol_escrow_gate',
+                    stage: `${escrowStageName}_gate`,
                     reason: failNote ? `ln_route_precheck_fail ${failNote}` : 'ln_route_precheck_fail',
                     canCancel: true,
                   });
@@ -2335,7 +2340,7 @@ export class TradeAutoManager {
                   stageKey,
                   tradeId,
                   channel: swapChannel,
-                  stage: 'sol_escrow_gate',
+                  stage: `${escrowStageName}_gate`,
                   error: 'waiting_for_payer_precheck',
                   cooldownMs: Math.max(250, Number(this.opts?.ln_route_precheck_wait_cooldown_ms || 4_000)),
                   canCancel: true,
@@ -2358,13 +2363,13 @@ export class TradeAutoManager {
                 const refund = String(termsBody?.sol_refund || '').trim();
                 const refundAfterUnix = toIntOrNull(termsBody?.sol_refund_after_unix);
                 const tradeFeeCollector = String(termsBody?.trade_fee_collector || '').trim();
-                if (!/^[0-9a-f]{64}$/i.test(paymentHashHex)) throw new Error('sol_escrow: missing payment_hash_hex');
-                if (!mint) throw new Error('sol_escrow: missing mint');
-                if (!/^[0-9]+$/.test(amount)) throw new Error('sol_escrow: missing amount');
-                if (!recipient) throw new Error('sol_escrow: missing recipient');
-                if (!refund) throw new Error('sol_escrow: missing refund');
-                if (refundAfterUnix === null || refundAfterUnix < 1) throw new Error('sol_escrow: missing refund_after_unix');
-                if (!tradeFeeCollector) throw new Error('sol_escrow: missing trade_fee_collector');
+                if (!/^[0-9a-f]{64}$/i.test(paymentHashHex)) throw new Error(`${escrowStageName}: missing payment_hash_hex`);
+                if (!mint) throw new Error(`${escrowStageName}: missing mint`);
+                if (!/^[0-9]+$/.test(amount)) throw new Error(`${escrowStageName}: missing amount`);
+                if (!recipient) throw new Error(`${escrowStageName}: missing recipient`);
+                if (!refund) throw new Error(`${escrowStageName}: missing refund`);
+                if (refundAfterUnix === null || refundAfterUnix < 1) throw new Error(`${escrowStageName}: missing refund_after_unix`);
+                if (!tradeFeeCollector) throw new Error(`${escrowStageName}: missing trade_fee_collector`);
 
                 await this._runToolWithTimeout({
                   tool: 'intercomswap_swap_sol_escrow_init_and_post',
@@ -2392,7 +2397,7 @@ export class TradeAutoManager {
                   stageKey,
                   tradeId,
                   channel: swapChannel,
-                  stage: 'sol_escrow',
+                  stage: escrowStageName,
                   error: errMsg,
                   cooldownMs: 10_000,
                   canCancel: true,
@@ -2498,13 +2503,14 @@ export class TradeAutoManager {
           }
 
           if (iAmTaker && termsEnv && lnPaidEnv && !tradeCtx?.claimed) {
-            const stageKey = `${tradeId}:sol_claim`;
+            const claimStageName = this.opts.settlement_kind === SETTLEMENT_KIND.TAO_EVM ? 'tao_claim' : 'sol_claim';
+            const stageKey = `${tradeId}:${claimStageName}`;
             if (this._canRunStage(stageKey)) {
               this._markStageInFlight(stageKey);
               try {
-                if (!termsBoundToLocalSolRecipient) throw new Error('sol_claim: terms.sol_recipient mismatch');
+                if (!termsBoundToLocalSolRecipient) throw new Error(`${claimStageName}: terms.sol_recipient mismatch`);
                 const mint = String(termsBody?.sol_mint || this.opts.usdt_mint || '').trim();
-                if (!mint) throw new Error('sol_claim: missing mint');
+                if (!mint) throw new Error(`${claimStageName}: missing mint`);
                 let preimageHex = String(this._tradePreimage.get(tradeId) || '').trim().toLowerCase();
                 if (!/^[0-9a-f]{64}$/i.test(preimageHex)) {
                   const rec = await this._runToolWithTimeout({
@@ -2515,7 +2521,7 @@ export class TradeAutoManager {
                   if (/^[0-9a-f]{64}$/i.test(preimageHex)) this._tradePreimage.set(tradeId, preimageHex);
                   this._pruneCaches();
                 }
-                if (!/^[0-9a-f]{64}$/i.test(preimageHex)) throw new Error('sol_claim: missing LN preimage');
+                if (!/^[0-9a-f]{64}$/i.test(preimageHex)) throw new Error(`${claimStageName}: missing LN preimage`);
                 await this._runToolWithTimeout({
                   tool: 'intercomswap_swap_sol_claim_and_post',
                   args: { channel: swapChannel, trade_id: tradeId, preimage_hex: preimageHex, mint },
@@ -2530,7 +2536,7 @@ export class TradeAutoManager {
                   stageKey,
                   tradeId,
                   channel: swapChannel,
-                  stage: 'sol_claim',
+                  stage: claimStageName,
                   error: errMsg,
                   cooldownMs: 15_000,
                   canCancel: false,

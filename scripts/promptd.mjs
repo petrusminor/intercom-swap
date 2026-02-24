@@ -12,6 +12,7 @@ import { ToolExecutor } from '../src/prompt/executor.js';
 import { DEFAULT_PROMPT_SETUP_PATH, loadPromptSetupFromFile } from '../src/prompt/config.js';
 import { INTERCOMSWAP_TOOLS } from '../src/prompt/tools.js';
 import { ACINQ_PEER_URI, LnPeerGuard } from '../src/prompt/lnPeerGuard.js';
+import { SETTLEMENT_KIND, normalizeSettlementKind } from '../settlement/providerFactory.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,6 +39,7 @@ Starts a local HTTP server that:
 
 Setup JSON (gitignored):
   --config <path>   (default: ${DEFAULT_PROMPT_SETUP_PATH})
+  --settlement <solana|tao-evm> (default: solana)
 
   promptd reads all model + tool wiring from a local JSON file (recommended under onchain/ so it never gets committed).
 
@@ -305,6 +307,13 @@ async function main() {
   }
 
   const configPath = flags.get('config') ? String(flags.get('config')).trim() : DEFAULT_PROMPT_SETUP_PATH;
+  const settlementKindRaw = flags.get('settlement');
+  let settlementKind = SETTLEMENT_KIND.SOLANA;
+  try {
+    settlementKind = normalizeSettlementKind(settlementKindRaw || SETTLEMENT_KIND.SOLANA);
+  } catch (err) {
+    die(err?.message || String(err));
+  }
   const setup = loadPromptSetupFromFile({ configPath, cwd: repoRoot });
 
   // Collin UI (built assets). Optional: if dist is missing, promptd still runs as an API server.
@@ -318,6 +327,7 @@ async function main() {
     ln: setup.ln,
     solana: setup.solana,
     receipts: setup.receipts,
+    settlementKind,
   });
 
   const router = new PromptRouter({
@@ -357,6 +367,7 @@ async function main() {
         {
           channels: tradeAutoBootstrap.channels,
           usdt_mint: String(setup?.solana?.usdtMint || '').trim(),
+          settlement: settlementKind,
           trace_enabled: tradeAutoBootstrap.traceEnabled,
           ln_liquidity_mode: 'aggregate',
           enable_quote_from_offers: true,

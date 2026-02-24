@@ -39,6 +39,13 @@ const base58Param = {
   pattern: '^[1-9A-HJ-NP-Za-km-z]+$',
 };
 
+const settlementAddressParam = {
+  type: 'string',
+  minLength: 2,
+  maxLength: 66,
+  pattern: '^(?:[1-9A-HJ-NP-Za-km-z]+|0x[0-9a-fA-F]{40})$',
+};
+
 const unixSecParam = { type: 'integer', minimum: 1, description: 'Unix seconds timestamp' };
 
 const atomicAmountParam = {
@@ -387,8 +394,8 @@ export const INTERCOMSWAP_TOOLS = [
       btc_sats: satsParam,
       usdt_amount: atomicAmountParam,
       sol_recipient: {
-        ...base58Param,
-        description: 'Optional Solana recipient pubkey for USDT settlement. Recommended/required for full auto swap settlement.',
+        ...settlementAddressParam,
+        description: 'Optional settlement recipient (base58 Solana pubkey or 0x EVM address). Recommended/required for full auto swap settlement.',
       },
       max_platform_fee_bps: { type: 'integer', minimum: 0, maximum: 500, description: 'Optional fee ceiling for platform fee (bps).' },
       max_trade_fee_bps: { type: 'integer', minimum: 0, maximum: 1000, description: 'Optional fee ceiling for trade fee (bps).' },
@@ -417,7 +424,10 @@ export const INTERCOMSWAP_TOOLS = [
       rfq_id: hex32Param,
       btc_sats: satsParam,
       usdt_amount: atomicAmountParam,
-      trade_fee_collector: { ...base58Param, description: 'Fee receiver pubkey. trade_fee_bps is read from the trade-config PDA for this address.' },
+      trade_fee_collector: {
+        ...settlementAddressParam,
+        description: 'Fee receiver address (base58 for Solana, 0x for TAO EVM). trade_fee_bps is read from the active settlement backend.',
+      },
       sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Solana refund/claim window (seconds) that will be used in binding TERMS.' },
       valid_until_unix: unixSecParam,
       valid_for_sec: { type: 'integer', minimum: 10, maximum: 60 * 60 * 24 * 7 },
@@ -451,7 +461,10 @@ export const INTERCOMSWAP_TOOLS = [
           maximum: 1000000,
           description: 'Optional offer line index (requires offer_envelope). Used to lock exactly one offer line.',
         },
-        trade_fee_collector: { ...base58Param, description: 'Fee receiver pubkey. trade_fee_bps is read from the trade-config PDA for this address.' },
+        trade_fee_collector: {
+          ...settlementAddressParam,
+          description: 'Fee receiver address (base58 for Solana, 0x for TAO EVM). trade_fee_bps is read from the active settlement backend.',
+        },
         sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Solana refund/claim window (seconds) that will be used in binding TERMS.' },
         valid_until_unix: unixSecParam,
         valid_for_sec: { type: 'integer', minimum: 10, maximum: 60 * 60 * 24 * 7 },
@@ -565,7 +578,15 @@ export const INTERCOMSWAP_TOOLS = [
       stage_retry_max: { type: 'integer', minimum: 0, maximum: 50, description: 'Max per-stage retries before tradeauto aborts (cancel+leave when safe). Default 2.' },
       trace_enabled: { type: 'boolean', description: 'Enable verbose in-worker trace events (disabled by default).' },
       ln_liquidity_mode: { type: 'string', enum: ['single_channel', 'aggregate'] },
-      usdt_mint: base58Param,
+      usdt_mint: {
+        ...settlementAddressParam,
+        description: 'Settlement mint/address used in TERMS (base58 for Solana, 0x address for TAO EVM mode).',
+      },
+      settlement: {
+        type: 'string',
+        enum: ['solana', 'tao-evm'],
+        description: 'Settlement backend for this worker (default inherited from promptd).',
+      },
       enable_quote_from_offers: { type: 'boolean' },
       enable_quote_from_rfqs: { type: 'boolean', description: 'Quote actionable RFQs even when no local offer line matched.' },
       enable_accept_quotes: { type: 'boolean' },
@@ -700,13 +721,16 @@ export const INTERCOMSWAP_TOOLS = [
       trade_id: { type: 'string', minLength: 1, maxLength: 128 },
       btc_sats: satsParam,
       usdt_amount: atomicAmountParam,
-      sol_mint: base58Param,
-      sol_recipient: base58Param,
-      sol_refund: base58Param,
+      sol_mint: settlementAddressParam,
+      sol_recipient: settlementAddressParam,
+      sol_refund: settlementAddressParam,
       sol_refund_after_unix: unixSecParam,
       ln_receiver_peer: hex32Param,
       ln_payer_peer: hex32Param,
-      trade_fee_collector: { ...base58Param, description: 'Fee receiver pubkey. trade_fee_bps is read from the trade-config PDA for this address.' },
+      trade_fee_collector: {
+        ...settlementAddressParam,
+        description: 'Fee receiver address (base58 for Solana, 0x for TAO EVM). trade_fee_bps is read from the active settlement backend.',
+      },
       terms_valid_until_unix: { ...unixSecParam, description: 'Optional expiry for terms acceptance.' },
     },
     required: [
@@ -1070,7 +1094,7 @@ export const INTERCOMSWAP_TOOLS = [
   }),
 		  tool(
 		    'intercomswap_swap_sol_escrow_init_and_post',
-		    'Maker: init Solana escrow and post SOL_ESCROW_CREATED into swap:<id>. Requires taker to post ln_route_precheck_ok (swap.status) after LN invoice is posted. Fees are read from on-chain config/trade-config (not negotiated).',
+		    'Maker: initialize settlement lock and post settlement escrow envelope into swap:<id> (SOL_ESCROW_CREATED for Solana, TAO_HTLC_LOCKED for TAO EVM). Requires taker to post ln_route_precheck_ok (swap.status) after LN invoice is posted. Fees are read from the active settlement backend (not negotiated).',
 		    {
 	      type: 'object',
 	      additionalProperties: false,
@@ -1078,12 +1102,15 @@ export const INTERCOMSWAP_TOOLS = [
 	        channel: channelParam,
 	        trade_id: { type: 'string', minLength: 1, maxLength: 128 },
 	        payment_hash_hex: hex32Param,
-	        mint: base58Param,
+	        mint: settlementAddressParam,
 	        amount: atomicAmountParam,
-	        recipient: base58Param,
-	        refund: base58Param,
+	        recipient: settlementAddressParam,
+	        refund: settlementAddressParam,
 	        refund_after_unix: unixSecParam,
-	        trade_fee_collector: { ...base58Param, description: 'Fee receiver pubkey. trade_fee_bps is read from the trade-config PDA for this address.' },
+	        trade_fee_collector: {
+            ...settlementAddressParam,
+            description: 'Fee receiver address (base58 for Solana, 0x for TAO EVM). trade_fee_bps is read from the active settlement backend.',
+          },
 	        cu_limit: solCuLimitParam,
 	        cu_price: solCuPriceParam,
 	      },
@@ -1102,7 +1129,7 @@ export const INTERCOMSWAP_TOOLS = [
 	  ),
   tool(
     'intercomswap_swap_verify_pre_pay',
-    'Taker: verify (terms + LN invoice + Sol escrow) and validate the escrow exists on-chain before paying.',
+    'Taker: verify (terms + LN invoice + settlement escrow) and validate the lock exists on-chain before paying.',
     {
       type: 'object',
       additionalProperties: false,
@@ -1121,8 +1148,8 @@ export const INTERCOMSWAP_TOOLS = [
         },
         escrow_envelope: {
           anyOf: [
-            { type: 'object', description: 'Full signed SOL_ESCROW_CREATED envelope received from the network.' },
-            { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to a SOL_ESCROW_CREATED envelope.' },
+            { type: 'object', description: 'Full signed settlement lock envelope (SOL_ESCROW_CREATED or TAO_HTLC_LOCKED).' },
+            { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to a settlement lock envelope.' },
           ],
         },
         now_unix: { ...unixSecParam, description: 'Optional unix seconds for expiry checks; defaults to now.' },
@@ -1185,7 +1212,7 @@ export const INTERCOMSWAP_TOOLS = [
   ),
   tool(
     'intercomswap_swap_ln_pay_and_post_verified',
-    'Taker: verify (terms + invoice + escrow on-chain), then pay the LN invoice and post LN_PAID into swap:<id>.',
+    'Taker: verify (terms + invoice + settlement lock on-chain), then pay the LN invoice and post LN_PAID into swap:<id>.',
     {
       type: 'object',
       additionalProperties: false,
@@ -1205,8 +1232,8 @@ export const INTERCOMSWAP_TOOLS = [
         },
         escrow_envelope: {
           anyOf: [
-            { type: 'object', description: 'Full signed SOL_ESCROW_CREATED envelope received from the network.' },
-            { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to a SOL_ESCROW_CREATED envelope.' },
+            { type: 'object', description: 'Full signed settlement lock envelope (SOL_ESCROW_CREATED or TAO_HTLC_LOCKED).' },
+            { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to a settlement lock envelope.' },
           ],
         },
         now_unix: { ...unixSecParam, description: 'Optional unix seconds for expiry checks; defaults to now.' },
@@ -1214,7 +1241,7 @@ export const INTERCOMSWAP_TOOLS = [
       required: ['channel', 'terms_envelope', 'invoice_envelope', 'escrow_envelope'],
     }
   ),
-  tool('intercomswap_swap_sol_claim_and_post', 'Taker: claim Solana escrow and post SOL_CLAIMED into swap:<id>.', {
+  tool('intercomswap_swap_sol_claim_and_post', 'Taker: claim settlement lock and post claimed envelope into swap:<id> (SOL_CLAIMED for Solana, TAO_CLAIMED for TAO EVM).', {
     type: 'object',
     additionalProperties: false,
     properties: {
@@ -1226,9 +1253,20 @@ export const INTERCOMSWAP_TOOLS = [
           { type: 'string', minLength: 8, maxLength: 200, pattern: '^secret:[0-9a-fA-F-]+$' },
         ],
       },
-      mint: base58Param,
+      mint: settlementAddressParam,
     },
     required: ['channel', 'trade_id', 'preimage_hex', 'mint'],
+  }),
+  tool('intercomswap_swap_sol_refund_and_post', 'Maker: refund settlement lock and post refunded envelope into swap:<id> (SOL_REFUNDED for Solana, TAO_REFUNDED for TAO EVM).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      channel: channelParam,
+      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+      payment_hash_hex: hex32Param,
+      mint: settlementAddressParam,
+    },
+    required: ['channel', 'trade_id', 'payment_hash_hex', 'mint'],
   }),
 
   // Solana wallet operator actions (local keys only; signer configured in prompt setup JSON unless otherwise noted).
@@ -1266,6 +1304,7 @@ export const INTERCOMSWAP_TOOLS = [
     required: [],
   }),
   tool('intercomswap_sol_signer_pubkey', 'Get the configured Solana signer pubkey for this promptd instance.', emptyParams),
+  tool('intercomswap_settlement_signer_address', 'Get the configured settlement signer address for the active settlement backend.', emptyParams),
   tool('intercomswap_sol_keygen', 'Generate a new Solana keypair JSON file under onchain/ (gitignored).', {
     type: 'object',
     additionalProperties: false,
