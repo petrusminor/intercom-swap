@@ -243,6 +243,18 @@ node scripts/swaprecover.mjs refund \
   --settlement tao-evm
 ```
 
+swaprecover SOL status example (for mixed environments / legacy SOL rows):
+
+```bash
+cd ~/intercom-swap
+node scripts/swaprecover.mjs status \
+  --receipts-db onchain/receipts/rfq-bots/swap-maker/maker.sqlite \
+  --trade-id <trade_id> \
+  --settlement solana \
+  --solana-rpc-url http://127.0.0.1:8899 \
+  --solana-keypair stores/swap-maker/db/keypair.json
+```
+
 TAO env required for TAO recovery:
 - `TAO_EVM_RPC_URL`
 - `TAO_EVM_PRIVATE_KEY`
@@ -251,6 +263,9 @@ TAO env required for TAO recovery:
 Note on improved error guidance:
 - `swaprecover status|inspect` now prints clearer missing-flag/env messages
   (for example missing `TAO_EVM_PRIVATE_KEY` or missing Solana signer flags).
+- Current behavior: `swaprecover status|inspect` on SOL requires signer flags:
+  - `--solana-rpc-url`
+  - `--solana-keypair`
 
 ## 7) Safety Checklist
 

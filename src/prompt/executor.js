@@ -214,9 +214,19 @@ function parseLocalRpcPortFromUrls(urls, fallback = 8899) {
   }
 }
 
+function parsePositiveIntEnv(name, fallback) {
+  const raw = String(process.env[name] || '').trim();
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return fallback;
+  return n;
+}
+
 const SOL_REFUND_MIN_SEC = 3600; // 1h
 const SOL_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
 const SOL_REFUND_DEFAULT_SEC = 72 * 3600; // 72h
+const MIN_TIMELOCK_REMAINING_SEC = parsePositiveIntEnv('INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC', 3600);
+const INVOICE_EXPIRY_SAFETY_MARGIN_SEC = parsePositiveIntEnv('INTERCOMSWAP_INVOICE_EXPIRY_SAFETY_MARGIN_SEC', 900);
 const FIXED_PLATFORM_FEE_BPS = 10; // 0.1%
 const DEFAULT_TRADE_FEE_BPS = 10; // 0.1%
 const DEFAULT_TOTAL_FEE_BPS = FIXED_PLATFORM_FEE_BPS + DEFAULT_TRADE_FEE_BPS; // 0.2%
@@ -1024,6 +1034,49 @@ function assertRefundAfterUnixWindow(refundAfterUnix, toolName) {
   if (delta > SOL_REFUND_MAX_SEC) {
     throw new Error(`${toolName}: refund_after_unix too far (max ${SOL_REFUND_MAX_SEC}s from now)`);
   }
+}
+
+function parseUnixSecondsOrNull(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
+function assertPrePayTimelockSafety({
+  toolName,
+  nowUnix,
+  escrowBody,
+  invoiceBody,
+  decodedInvoice = null,
+}) {
+  const refundAfterUnix = parseUnixSecondsOrNull(escrowBody?.refund_after_unix);
+  if (refundAfterUnix === null) {
+    return { ok: false, error: `${toolName}: escrow refund_after_unix missing/invalid` };
+  }
+
+  const remainingSec = refundAfterUnix - Number(nowUnix);
+  if (remainingSec < MIN_TIMELOCK_REMAINING_SEC) {
+    return {
+      ok: false,
+      error: `${toolName}: refund_after_unix too soon for safe pay (remaining=${remainingSec}s min=${MIN_TIMELOCK_REMAINING_SEC}s)`,
+    };
+  }
+
+  const invoiceExpiryUnix =
+    parseUnixSecondsOrNull(invoiceBody?.expires_at_unix) ??
+    parseUnixSecondsOrNull(decodedInvoice?.expires_at_unix);
+  if (invoiceExpiryUnix !== null) {
+    const minRefundAfter = invoiceExpiryUnix + INVOICE_EXPIRY_SAFETY_MARGIN_SEC;
+    if (refundAfterUnix < minRefundAfter) {
+      return {
+        ok: false,
+        error: `${toolName}: refund_after_unix must be >= invoice_expiry_unix + ${INVOICE_EXPIRY_SAFETY_MARGIN_SEC}s (refund_after_unix=${refundAfterUnix} invoice_expiry_unix=${invoiceExpiryUnix})`,
+      };
+    }
+  }
+
+  return { ok: true, error: null };
 }
 
 function stripSignature(envelope) {
@@ -6313,13 +6366,17 @@ export class ToolExecutor {
           swap_channel: channel,
           settlement_kind: isTao ? SETTLEMENT_KIND.TAO_EVM : SETTLEMENT_KIND.SOLANA,
           ln_payment_hash_hex: paymentHashHex,
-          sol_mint: String(envelopeBody.mint || mint).trim(),
-          sol_program_id: this._settlementAppBinding(),
-          sol_recipient: String(envelopeBody.recipient || recipient).trim(),
-          sol_refund: String(envelopeBody.refund || refund).trim(),
-          sol_escrow_pda: settlementId,
-          ...(envelopeBody.vault_ata ? { sol_vault_ata: String(envelopeBody.vault_ata).trim() } : {}),
-          sol_refund_after_unix: Number(envelopeBody.refund_after_unix || refundAfterUnix),
+          ...(!isTao
+            ? {
+                sol_mint: String(envelopeBody.mint || mint).trim(),
+                sol_program_id: this._settlementAppBinding(),
+                sol_recipient: String(envelopeBody.recipient || recipient).trim(),
+                sol_refund: String(envelopeBody.refund || refund).trim(),
+                sol_escrow_pda: settlementId,
+                ...(envelopeBody.vault_ata ? { sol_vault_ata: String(envelopeBody.vault_ata).trim() } : {}),
+                sol_refund_after_unix: Number(envelopeBody.refund_after_unix || refundAfterUnix),
+              }
+            : {}),
           ...(isTao
             ? {
                 tao_settlement_id: settlementId,
@@ -6471,13 +6528,24 @@ export class ToolExecutor {
           }
         }
       }
+      const timelockSafety = assertPrePayTimelockSafety({
+        toolName,
+        nowUnix,
+        escrowBody: escrow.body,
+        invoiceBody: invoice.body,
+        decodedInvoice: res.decoded_invoice,
+      });
+      const timelockError = timelockSafety.ok ? null : timelockSafety.error;
 
       return {
         type: 'pre_pay_check',
-        ok: Boolean(res.ok) && !feeMismatchError,
+        ok: Boolean(res.ok) && !feeMismatchError && !timelockError,
         trade_id: tradeId,
-        error: res.ok ? feeMismatchError : res.error,
-        payment_hash_hex: res.ok && !feeMismatchError ? String(invoice.body?.payment_hash_hex || '').trim().toLowerCase() : null,
+        error: res.ok ? (feeMismatchError || timelockError) : res.error,
+        payment_hash_hex:
+          res.ok && !feeMismatchError && !timelockError
+            ? String(invoice.body?.payment_hash_hex || '').trim().toLowerCase()
+            : null,
         decoded_invoice: res.decoded_invoice ?? null,
         onchain: sanitizeEscrowVerifyOnchain(res.onchain),
       };
@@ -6544,123 +6612,16 @@ export class ToolExecutor {
 
     if (toolName === 'intercomswap_swap_ln_pay_and_post') {
       assertAllowedKeys(args, toolName, ['channel', 'trade_id', 'bolt11', 'payment_hash_hex']);
-      requireApproval(toolName, autoApprove);
-      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
-      const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
-      const bolt11 = expectString(args, toolName, 'bolt11', { min: 20, max: 8000 });
-      const paymentHashHex = normalizeHex32(expectString(args, toolName, 'payment_hash_hex', { min: 64, max: 64 }), 'payment_hash_hex');
-      if (dryRun) return { type: 'dry_run', tool: toolName, channel, trade_id: tradeId, payment_hash_hex: paymentHashHex };
-
-      const store = await this._openReceiptsStore({ required: true });
-      try {
-        const payRes = await lnPay(this.ln, { bolt11 });
-        const preimageHex = String(payRes?.payment_preimage || '').trim().toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(preimageHex)) throw new Error(`${toolName}: missing payment_preimage`);
-
-        store.upsertTrade(tradeId, {
-          role: 'taker',
-          swap_channel: channel,
-          ln_payment_hash_hex: paymentHashHex,
-          ln_preimage_hex: preimageHex,
-          state: 'ln_paid',
-          last_error: null,
-        });
-        store.appendEvent(tradeId, 'ln_paid', { channel, payment_hash_hex: paymentHashHex });
-
-        const unsigned = createUnsignedEnvelope({
-          v: 1,
-          kind: KIND.LN_PAID,
-          tradeId,
-          body: { payment_hash_hex: paymentHashHex },
-        });
-
-        const signing = await this._requirePeerSigning();
-        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
-        const signed = signSwapEnvelope(unsigned, signing);
-        await this._sendEnvelopeLogged(sc, channel, signed);
-        store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
-        const envHandle = secrets && typeof secrets.put === 'function'
-          ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-          : null;
-        return {
-          type: 'ln_paid_posted',
-          channel,
-          trade_id: tradeId,
-          payment_hash_hex: paymentHashHex,
-          preimage_hex: preimageHex,
-          envelope_handle: envHandle,
-          envelope: envHandle ? null : signed,
-        };
-      } finally {
-        store.close();
-      }
+      throw new Error(
+        `${toolName}: disabled for safety; use intercomswap_swap_ln_pay_and_post_verified (enforces pre-pay on-chain/timelock checks before LN pay)`
+      );
     }
 
     if (toolName === 'intercomswap_swap_ln_pay_and_post_from_invoice') {
       assertAllowedKeys(args, toolName, ['channel', 'invoice_envelope']);
-      requireApproval(toolName, autoApprove);
-      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
-      const inv = resolveSecretArg(secrets, args.invoice_envelope, { label: 'invoice_envelope', expectType: 'object' });
-      if (!isObject(inv)) throw new Error(`${toolName}: invoice_envelope must be an object`);
-      const v = validateSwapEnvelope(inv);
-      if (!v.ok) throw new Error(`${toolName}: invalid invoice_envelope: ${v.error}`);
-      if (inv.kind !== KIND.LN_INVOICE) throw new Error(`${toolName}: invoice_envelope.kind must be ${KIND.LN_INVOICE}`);
-      const sigOk = verifySignedEnvelope(inv);
-      if (!sigOk.ok) throw new Error(`${toolName}: invoice_envelope signature invalid: ${sigOk.error}`);
-
-      const tradeId = expectString({ trade_id: String(inv.trade_id || '') }, toolName, 'trade_id', {
-        min: 1,
-        max: 128,
-        pattern: /^[A-Za-z0-9_.:-]+$/,
-      });
-      const bolt11 = expectString({ bolt11: String(inv.body?.bolt11 || '') }, toolName, 'bolt11', { min: 20, max: 8000 });
-      const paymentHashHex = normalizeHex32(String(inv.body?.payment_hash_hex || ''), 'payment_hash_hex');
-
-      if (dryRun) return { type: 'dry_run', tool: toolName, channel, trade_id: tradeId, payment_hash_hex: paymentHashHex };
-
-      const store = await this._openReceiptsStore({ required: true });
-      try {
-        const payRes = await lnPay(this.ln, { bolt11 });
-        const preimageHex = String(payRes?.payment_preimage || '').trim().toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(preimageHex)) throw new Error(`${toolName}: missing payment_preimage`);
-
-        store.upsertTrade(tradeId, {
-          role: 'taker',
-          swap_channel: channel,
-          ln_payment_hash_hex: paymentHashHex,
-          ln_preimage_hex: preimageHex,
-          state: 'ln_paid',
-          last_error: null,
-        });
-        store.appendEvent(tradeId, 'ln_paid', { channel, payment_hash_hex: paymentHashHex });
-
-        const unsigned = createUnsignedEnvelope({
-          v: 1,
-          kind: KIND.LN_PAID,
-          tradeId,
-          body: { payment_hash_hex: paymentHashHex },
-        });
-
-        const signing = await this._requirePeerSigning();
-        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
-        const signed = signSwapEnvelope(unsigned, signing);
-        await this._sendEnvelopeLogged(sc, channel, signed);
-        store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
-        const envHandle = secrets && typeof secrets.put === 'function'
-          ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-          : null;
-        return {
-          type: 'ln_paid_posted',
-          channel,
-          trade_id: tradeId,
-          payment_hash_hex: paymentHashHex,
-          preimage_hex: preimageHex,
-          envelope_handle: envHandle,
-          envelope: envHandle ? null : signed,
-        };
-      } finally {
-        store.close();
-      }
+      throw new Error(
+        `${toolName}: disabled for safety; use intercomswap_swap_ln_pay_and_post_verified (enforces pre-pay on-chain/timelock checks before LN pay)`
+      );
     }
 
     if (toolName === 'intercomswap_swap_ln_pay_and_post_verified') {
@@ -6754,6 +6715,19 @@ export class ToolExecutor {
               verifyRes.ok = false;
               verifyRes.error = 'trade_fee_collector mismatch vs onchain';
             }
+          }
+        }
+        if (verifyRes.ok) {
+          const timelockSafety = assertPrePayTimelockSafety({
+            toolName,
+            nowUnix,
+            escrowBody: escrow.body,
+            invoiceBody: invoice.body,
+            decodedInvoice: verifyRes.decoded_invoice,
+          });
+          if (!timelockSafety.ok) {
+            verifyRes.ok = false;
+            verifyRes.error = timelockSafety.error;
           }
         }
         if (!verifyRes.ok) throw new Error(`${toolName}: pre-pay verification failed: ${verifyRes.error}`);
@@ -6927,10 +6901,14 @@ export class ToolExecutor {
         ).trim();
         if (!settlementId) {
           const trade = store.getTrade(tradeId);
-          settlementId = String(trade?.sol_escrow_pda || '').trim();
+          settlementId = String(
+            isTao ? trade?.tao_settlement_id || trade?.sol_escrow_pda || '' : trade?.sol_escrow_pda || ''
+          ).trim();
         }
         if (!settlementId) {
-          throw new Error(`${toolName}: missing settlement id (need prior ${expectedEscrowKind} envelope or stored trade.sol_escrow_pda)`);
+          throw new Error(
+            `${toolName}: missing settlement id (need prior ${expectedEscrowKind} envelope or stored trade.${isTao ? 'tao_settlement_id' : 'sol_escrow_pda'})`
+          );
         }
 
         const claimRes = await settlement.claim({ settlementId, preimageHex });
@@ -6959,10 +6937,14 @@ export class ToolExecutor {
           settlement_kind: isTao ? SETTLEMENT_KIND.TAO_EVM : SETTLEMENT_KIND.SOLANA,
           ln_payment_hash_hex: paymentHashHex,
           ln_preimage_hex: preimageHex,
-          sol_mint: mint,
-          sol_program_id: this._settlementAppBinding(),
-          sol_escrow_pda: settlementId,
-          ...(escrowBody?.vault_ata ? { sol_vault_ata: String(escrowBody.vault_ata).trim() } : {}),
+          ...(!isTao
+            ? {
+                sol_mint: mint,
+                sol_program_id: this._settlementAppBinding(),
+                sol_escrow_pda: settlementId,
+                ...(escrowBody?.vault_ata ? { sol_vault_ata: String(escrowBody.vault_ata).trim() } : {}),
+              }
+            : {}),
           ...(isTao
             ? {
                 tao_settlement_id: settlementId,
@@ -7079,10 +7061,14 @@ export class ToolExecutor {
         ).trim();
         if (!settlementId) {
           const trade = store.getTrade(tradeId);
-          settlementId = String(trade?.sol_escrow_pda || '').trim();
+          settlementId = String(
+            isTao ? trade?.tao_settlement_id || trade?.sol_escrow_pda || '' : trade?.sol_escrow_pda || ''
+          ).trim();
         }
         if (!settlementId) {
-          throw new Error(`${toolName}: missing settlement id (need prior ${expectedEscrowKind} envelope or stored trade.sol_escrow_pda)`);
+          throw new Error(
+            `${toolName}: missing settlement id (need prior ${expectedEscrowKind} envelope or stored trade.${isTao ? 'tao_settlement_id' : 'sol_escrow_pda'})`
+          );
         }
 
         const refundRes = await settlement.refund({ settlementId });
@@ -7110,9 +7096,13 @@ export class ToolExecutor {
           swap_channel: channel,
           settlement_kind: isTao ? SETTLEMENT_KIND.TAO_EVM : SETTLEMENT_KIND.SOLANA,
           ln_payment_hash_hex: paymentHashHex,
-          sol_mint: mint,
-          sol_program_id: this._settlementAppBinding(),
-          sol_escrow_pda: settlementId,
+          ...(!isTao
+            ? {
+                sol_mint: mint,
+                sol_program_id: this._settlementAppBinding(),
+                sol_escrow_pda: settlementId,
+              }
+            : {}),
           ...(isTao
             ? {
                 tao_settlement_id: settlementId,

@@ -12,6 +12,7 @@ import {
 const DEFAULT_RPC_URL = 'https://lite.chain.opentensor.ai';
 const DEFAULT_CHAIN_ID = 964n;
 const DEFAULT_CONFIRMATIONS = 1;
+const DEFAULT_MIN_REFUND_SAFETY_SEC = 3600;
 
 const TAO_HTLC_ABI = [
   'function lock(address receiver, bytes32 hashlock, uint256 refundAfter, bytes32 clientSalt) payable returns (bytes32 swapId)',
@@ -79,10 +80,31 @@ function normalizeHex32(value, label) {
   return `0x${noPrefix.toLowerCase()}`;
 }
 
+function normalizePaymentHashHex(value) {
+  const s = String(value || '').trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(s)) {
+    throw new Error('paymentHashHex must be 32-byte hex without 0x prefix');
+  }
+  return `0x${s.toLowerCase()}`;
+}
+
 function normalizeAddress(value, label) {
   const s = String(value || '').trim();
   if (!s || !isAddress(s)) throw new Error(`${label} must be an EVM address`);
   return getAddress(s);
+}
+
+function parseMinRefundSafetySec() {
+  const raw =
+    process.env.INTERCOMSWAP_MIN_REFUND_SAFETY_SEC ??
+    process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC ??
+    '';
+  if (raw === '') return DEFAULT_MIN_REFUND_SAFETY_SEC;
+  const n = Number.parseInt(String(raw), 10);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    return DEFAULT_MIN_REFUND_SAFETY_SEC;
+  }
+  return n;
 }
 
 function parseAmountAtomic(value) {
@@ -222,14 +244,21 @@ export class TaoEvmSettlementProvider {
 
     const signerAddress = await this.wallet.getAddress();
     const receiver = normalizeAddress(input?.recipient, 'recipient');
+    if (receiver === ZeroAddress) throw new Error('recipient must not be zero address');
     const refundAddress = normalizeAddress(input?.refundAddress, 'refundAddress');
+    if (refundAddress === ZeroAddress) throw new Error('refundAddress must not be zero address');
     if (refundAddress !== getAddress(signerAddress)) {
       throw new Error(`refundAddress must match signer address (${signerAddress})`);
     }
 
-    const hashlock = normalizeHex32(input?.paymentHashHex, 'paymentHashHex');
+    const hashlock = normalizePaymentHashHex(input?.paymentHashHex);
     const amount = parseAmountAtomic(input?.amountAtomic);
     const refundAfter = parseRefundAfterUnix(input?.refundAfterUnix);
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const minRefundSafetySec = parseMinRefundSafetySec();
+    if (Number(refundAfter) < nowUnix + minRefundSafetySec) {
+      throw new Error(`refundAfterUnix too soon (need >= now + ${minRefundSafetySec}s)`);
+    }
     const clientSalt = this._resolveClientSalt(input?.terms);
 
     const swapId = await htlc.lock.staticCall(receiver, hashlock, refundAfter, clientSalt, {
@@ -253,6 +282,9 @@ export class TaoEvmSettlementProvider {
       amount_atomic: amount.toString(),
       refund_after_unix: Number(refundAfter),
       contract_address: this.htlcAddress,
+      htlc_address: this.htlcAddress,
+      recipient: receiver,
+      refund: refundAddress,
       client_salt: clientSalt,
     });
 
@@ -326,10 +358,13 @@ export class TaoEvmSettlementProvider {
 
     const settlementId = String(escrowBody?.settlement_id || '').trim();
     if (!settlementId) return { ok: false, error: 'escrowBody.settlement_id is required' };
+    if (!/^0x[0-9a-fA-F]{64}$/.test(settlementId)) {
+      return { ok: false, error: 'escrowBody.settlement_id must be a 0x-prefixed 32-byte hex string' };
+    }
 
     const paymentHashHex = String(invoiceBody?.payment_hash_hex || escrowBody?.payment_hash_hex || '').trim().toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(paymentHashHex)) {
-      return { ok: false, error: 'payment_hash_hex is required' };
+      return { ok: false, error: 'payment_hash_hex is required (32-byte hex without 0x)' };
     }
 
     if (String(escrowBody?.payment_hash_hex || '').trim().toLowerCase() !== paymentHashHex) {
@@ -363,6 +398,15 @@ export class TaoEvmSettlementProvider {
     }
 
     const md = parseMetadataObject(verify.metadata);
+    if (String(md.sender || '').trim().toLowerCase() === ZeroAddress.toLowerCase()) {
+      return { ok: false, error: 'swap not active on-chain (sender is zero address)' };
+    }
+    if (Boolean(md.claimed) || Boolean(md.refunded)) {
+      return {
+        ok: false,
+        error: `swap not active on-chain (claimed=${Boolean(md.claimed)} refunded=${Boolean(md.refunded)})`,
+      };
+    }
     const expectedHashlock = `0x${paymentHashHex}`;
     const onchainHashlock = String(md.hashlock || '').trim().toLowerCase();
     if (!onchainHashlock) {

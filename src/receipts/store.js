@@ -15,6 +15,28 @@ import { stableStringify } from '../util/stableStringify.js';
 const SCHEMA_VERSION = 4;
 
 const LEGACY_RFV_CHANNEL_COL = ['o', 't', 'c'].join('') + '_channel';
+const SETTLEMENT_KIND_SOLANA = 'solana';
+const SETTLEMENT_KIND_TAO_EVM = 'tao-evm';
+const SOLANA_SETTLEMENT_FIELDS = Object.freeze([
+  'sol_mint',
+  'sol_program_id',
+  'sol_recipient',
+  'sol_refund',
+  'sol_escrow_pda',
+  'sol_vault_ata',
+  'sol_refund_after_unix',
+]);
+const TAO_SETTLEMENT_FIELDS = Object.freeze([
+  'tao_settlement_id',
+  'tao_htlc_address',
+  'tao_amount_atomic',
+  'tao_recipient',
+  'tao_refund',
+  'tao_refund_after_unix',
+  'tao_lock_tx_id',
+  'tao_claim_tx_id',
+  'tao_refund_tx_id',
+]);
 
 function readSchemaVersion(db) {
   try {
@@ -184,6 +206,29 @@ function coerceJson(v) {
   if (v === null) return null;
   if (typeof v === 'string') return v;
   return stableStringify(v);
+}
+
+function normalizeSettlementKind(v, { allowUndefined = true } = {}) {
+  if (v === undefined) return allowUndefined ? undefined : null;
+  if (v === null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s) return null;
+  if (s === SETTLEMENT_KIND_SOLANA || s === SETTLEMENT_KIND_TAO_EVM) return s;
+  throw new Error(`Invalid settlement_kind: ${String(v)}`);
+}
+
+function normalizeGuardValue(field, value) {
+  if (value === undefined || value === null) return null;
+  if (field.endsWith('_unix')) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.trunc(n) : String(value);
+  }
+  return String(value).trim();
+}
+
+function hasPatchedFieldChange(existing, patch, field) {
+  if (!Object.prototype.hasOwnProperty.call(patch, field) || patch[field] === undefined) return false;
+  return normalizeGuardValue(field, patch[field]) !== normalizeGuardValue(field, existing?.[field]);
 }
 
 function mapRow(row) {
@@ -474,6 +519,36 @@ export class TradeReceiptsStore {
     const existing = this.getTrade(id);
     const base = existing || { trade_id: id, created_at: nowMs(), updated_at: nowMs() };
 
+    const existingKind = normalizeSettlementKind(existing?.settlement_kind);
+    const patchedKind = normalizeSettlementKind(patch?.settlement_kind);
+    if (existingKind && patchedKind === null) {
+      throw new Error(`trade ${id}: settlement_kind is already ${existingKind} and cannot be cleared`);
+    }
+    if (existingKind && patchedKind && patchedKind !== existingKind) {
+      throw new Error(`trade ${id}: settlement_kind mismatch (existing=${existingKind} patch=${patchedKind})`);
+    }
+    let effectiveKind = patchedKind || existingKind || null;
+    if (!effectiveKind) {
+      const touchesSolana = SOLANA_SETTLEMENT_FIELDS.some((field) => hasPatchedFieldChange(existing, patch, field));
+      const touchesTao = TAO_SETTLEMENT_FIELDS.some((field) => hasPatchedFieldChange(existing, patch, field));
+      if (touchesSolana && !touchesTao) effectiveKind = SETTLEMENT_KIND_SOLANA;
+      if (touchesTao && !touchesSolana) effectiveKind = SETTLEMENT_KIND_TAO_EVM;
+    }
+    if (effectiveKind === SETTLEMENT_KIND_TAO_EVM) {
+      for (const field of SOLANA_SETTLEMENT_FIELDS) {
+        if (hasPatchedFieldChange(existing, patch, field)) {
+          throw new Error(`trade ${id}: settlement_kind=tao-evm cannot update ${field}`);
+        }
+      }
+    }
+    if (effectiveKind === SETTLEMENT_KIND_SOLANA) {
+      for (const field of TAO_SETTLEMENT_FIELDS) {
+        if (hasPatchedFieldChange(existing, patch, field)) {
+          throw new Error(`trade ${id}: settlement_kind=solana cannot update ${field}`);
+        }
+      }
+    }
+
     // Apply patch only for provided keys (undefined means "no change").
     const next = { ...base, updated_at: nowMs() };
     for (const [k, v] of Object.entries(patch || {})) {
@@ -499,7 +574,7 @@ export class TradeReceiptsStore {
       sol_vault_ata: coerceText(next.sol_vault_ata),
       sol_refund_after_unix:
         next.sol_refund_after_unix === undefined ? undefined : coerceInt(next.sol_refund_after_unix),
-      settlement_kind: coerceText(next.settlement_kind),
+      settlement_kind: normalizeSettlementKind(next.settlement_kind),
       tao_settlement_id: coerceText(next.tao_settlement_id),
       tao_htlc_address: coerceText(next.tao_htlc_address),
       tao_amount_atomic: coerceText(next.tao_amount_atomic),

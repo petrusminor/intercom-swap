@@ -1181,20 +1181,24 @@ export const INTERCOMSWAP_TOOLS = [
       required: ['channel', 'terms_envelope', 'invoice_envelope'],
     }
   ),
-  tool('intercomswap_swap_ln_pay_and_post', 'Taker: pay the LN invoice and post LN_PAID into swap:<id>.', {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      channel: channelParam,
-      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
-      bolt11: { type: 'string', minLength: 20, maxLength: 8000 },
-      payment_hash_hex: hex32Param,
-    },
-    required: ['channel', 'trade_id', 'bolt11', 'payment_hash_hex'],
-  }),
+  tool(
+    'intercomswap_swap_ln_pay_and_post',
+    'Deprecated/disabled for safety; use intercomswap_swap_ln_pay_and_post_verified.',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        channel: channelParam,
+        trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+        bolt11: { type: 'string', minLength: 20, maxLength: 8000 },
+        payment_hash_hex: hex32Param,
+      },
+      required: ['channel', 'trade_id', 'bolt11', 'payment_hash_hex'],
+    }
+  ),
   tool(
     'intercomswap_swap_ln_pay_and_post_from_invoice',
-    'Taker: pay an LN invoice from an LN_INVOICE envelope and post LN_PAID into swap:<id> (no manual bolt11/payment_hash copying).',
+    'Deprecated/disabled for safety; use intercomswap_swap_ln_pay_and_post_verified.',
     {
       type: 'object',
       additionalProperties: false,

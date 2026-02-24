@@ -513,11 +513,15 @@ async function main() {
         taker_peer: ctx.inviteePubKey,
         btc_sats: ctx.btcSats,
         usdt_amount: ctx.usdtAmount,
-        sol_mint: signed.body.sol_mint,
-        sol_program_id: sol?.programId ?? null,
-        sol_recipient: signed.body.sol_recipient,
-        sol_refund: signed.body.sol_refund,
-        sol_refund_after_unix: signed.body.sol_refund_after_unix,
+        ...(isSolanaSettlement
+          ? {
+              sol_mint: signed.body.sol_mint,
+              sol_program_id: sol?.programId ?? null,
+              sol_recipient: signed.body.sol_recipient,
+              sol_refund: signed.body.sol_refund,
+              sol_refund_after_unix: signed.body.sol_refund_after_unix,
+            }
+          : {}),
         state: ctx.trade.state,
       },
       'terms_sent',
@@ -1159,8 +1163,12 @@ async function main() {
               taker_peer: inviteePubKey,
               btc_sats: ctx.btcSats,
               usdt_amount: ctx.usdtAmount,
-              sol_mint: runSwap ? sol.mint : null,
-              sol_recipient: ctx.solRecipient,
+              ...(isSolanaSettlement
+                ? {
+                    sol_mint: runSwap ? sol.mint : null,
+                    sol_recipient: ctx.solRecipient,
+                  }
+                : {}),
               state: ctx.trade.state,
             },
             'swap_started',

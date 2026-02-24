@@ -149,3 +149,37 @@ test('receipts store: listing lock lifecycle supports in_flight -> filled and de
     store.close();
   }
 });
+
+test('receipts store: settlement kind mismatch protection blocks cross-settlement writes', () => {
+  const dbPath = tmpDbPath('settlement-mismatch-guard');
+  const store = TradeReceiptsStore.open({ dbPath });
+  try {
+    store.upsertTrade('tao-guard', {
+      settlement_kind: 'tao-evm',
+      state: 'escrow',
+      ln_payment_hash_hex: 'a'.repeat(64),
+      tao_settlement_id: '0x' + '1'.repeat(64),
+    });
+    assert.throws(
+      () => store.upsertTrade('tao-guard', { sol_escrow_pda: 'EscrowPdaShouldReject11111111111111111111111' }),
+      /settlement_kind=tao-evm cannot update sol_escrow_pda/i
+    );
+    assert.throws(
+      () => store.upsertTrade('tao-guard', { settlement_kind: 'solana' }),
+      /settlement_kind mismatch/i
+    );
+
+    store.upsertTrade('sol-guard', {
+      settlement_kind: 'solana',
+      state: 'escrow',
+      ln_payment_hash_hex: 'b'.repeat(64),
+      sol_escrow_pda: 'EscrowPdaExample111111111111111111111111111111',
+    });
+    assert.throws(
+      () => store.upsertTrade('sol-guard', { tao_settlement_id: '0x' + '2'.repeat(64) }),
+      /settlement_kind=solana cannot update tao_settlement_id/i
+    );
+  } finally {
+    store.close();
+  }
+});

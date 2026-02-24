@@ -81,6 +81,14 @@ function parseBps(value, label, fallback) {
   return Math.max(0, Math.min(10_000, n));
 }
 
+function parsePositiveIntEnv(name, fallback) {
+  const raw = String(process.env[name] || '').trim();
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return fallback;
+  return n;
+}
+
 function splitCsv(value) {
   const s = String(value ?? '').trim();
   if (!s) return [];
@@ -196,6 +204,8 @@ async function main() {
   let maxPlatformFeeBps = maxPlatformFeeBpsCfg;
   let maxTradeFeeBps = maxTradeFeeBpsCfg;
   let maxTotalFeeBps = maxTotalFeeBpsCfg;
+  const minTimelockRemainingSec = parsePositiveIntEnv('INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC', 3600);
+  const invoiceExpirySafetyMarginSec = parsePositiveIntEnv('INTERCOMSWAP_INVOICE_EXPIRY_SAFETY_MARGIN_SEC', 900);
 
   const solRpcUrl = (flags.get('solana-rpc-url') && String(flags.get('solana-rpc-url')).trim()) || 'http://127.0.0.1:8899';
   const solKeypairPath = flags.get('solana-keypair') ? String(flags.get('solana-keypair')).trim() : '';
@@ -488,8 +498,12 @@ async function main() {
       taker_peer: takerPubkey,
       btc_sats: btcSats,
       usdt_amount: usdtAmount,
-      sol_mint: runSwap && solMintStr ? solMintStr : null,
-      sol_recipient: runSwap ? sol.recipientAddress : null,
+      ...(isSolanaSettlement
+        ? {
+            sol_mint: runSwap && solMintStr ? solMintStr : null,
+            sol_recipient: runSwap ? sol.recipientAddress : null,
+          }
+        : {}),
       state: STATE.INIT,
     },
     'rfq_sent',
@@ -894,6 +908,25 @@ async function main() {
       nowUnix: Math.floor(Date.now() / 1000),
     });
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const refundAfterUnix = Number(swapCtx.trade.escrow?.refund_after_unix || 0);
+    if (!Number.isFinite(refundAfterUnix) || !Number.isInteger(refundAfterUnix) || refundAfterUnix <= 0) {
+      throw new Error('verify-prepay failed: escrow refund_after_unix missing/invalid');
+    }
+    const remainingSec = refundAfterUnix - nowUnix;
+    if (remainingSec < minTimelockRemainingSec) {
+      throw new Error(
+        `verify-prepay failed: refund_after_unix too soon for safe pay (remaining=${remainingSec}s min=${minTimelockRemainingSec}s)`
+      );
+    }
+    const invoiceExpiryUnix = Number(swapCtx.trade.invoice?.expires_at_unix || 0);
+    if (Number.isFinite(invoiceExpiryUnix) && Number.isInteger(invoiceExpiryUnix) && invoiceExpiryUnix > 0) {
+      if (refundAfterUnix < invoiceExpiryUnix + invoiceExpirySafetyMarginSec) {
+        throw new Error(
+          `verify-prepay failed: refund_after_unix must be >= invoice_expiry_unix + ${invoiceExpirySafetyMarginSec}s (refund_after_unix=${refundAfterUnix} invoice_expiry_unix=${invoiceExpiryUnix})`
+        );
+      }
+    }
     // Defense-in-depth: ensure the on-chain escrow fee receiver settings match the negotiated TERMS, otherwise
     // claim could fail (wrong trade fee vault PDA) or fees could be misrepresented.
     if (isSolanaSettlement && prepay?.onchain?.state?.v === 3) {

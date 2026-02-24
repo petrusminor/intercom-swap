@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { verifySwapPrePay } from '../src/swap/verify.js';
+import { TaoEvmSettlementProvider } from '../settlement/tao-evm/TaoEvmSettlementProvider.js';
 
 test('swap verify: payer pre-pay checks (invoice + escrow + terms)', () => {
   const bolt11 =
@@ -87,4 +88,50 @@ test('swap verify: payer pre-pay checks (invoice + escrow + terms)', () => {
   });
   assert.equal(badInvoice.ok, false);
   assert.match(badInvoice.error, /invoice invalid/i);
+});
+
+test('tao provider lock: rejects malformed hash, zero amount, and unsafe refund window before chain calls', async () => {
+  let chainCalls = 0;
+  const lockFn = async () => {
+    chainCalls += 1;
+    return { hash: `0x${'ab'.repeat(32)}`, wait: async () => {} };
+  };
+  lockFn.staticCall = async () => {
+    chainCalls += 1;
+    return `0x${'cd'.repeat(32)}`;
+  };
+  const mock = {
+    _ensureReady: async () => {},
+    _requireHtlc: () => ({ lock: lockFn }),
+    wallet: { getAddress: async () => '0x1111111111111111111111111111111111111111' },
+    _resolveClientSalt: () => `0x${'ef'.repeat(32)}`,
+    _setMetadata: () => {},
+    _getMetadata: () => ({}),
+    confirmations: 1,
+    htlcAddress: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+  };
+  const lock = TaoEvmSettlementProvider.prototype.lock;
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const common = {
+    recipient: '0x2222222222222222222222222222222222222222',
+    refundAddress: '0x1111111111111111111111111111111111111111',
+    paymentHashHex: '11'.repeat(32),
+    amountAtomic: '1000',
+    refundAfterUnix: nowUnix + 7200,
+    terms: {},
+  };
+
+  await assert.rejects(
+    () => lock.call(mock, { ...common, paymentHashHex: `0x${'11'.repeat(32)}` }),
+    /without 0x prefix/i
+  );
+  await assert.rejects(
+    () => lock.call(mock, { ...common, amountAtomic: '0' }),
+    /amountAtomic must be > 0/i
+  );
+  await assert.rejects(
+    () => lock.call(mock, { ...common, refundAfterUnix: nowUnix + 120 }),
+    /refundAfterUnix too soon/i
+  );
+  assert.equal(chainCalls, 0, 'validation failures should happen before any on-chain call');
 });

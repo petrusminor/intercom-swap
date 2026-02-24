@@ -398,10 +398,12 @@ test('e2e: deterministic TAO settlement swap flow through prompt executor', asyn
   assert.equal(verifyCall.input.escrowBody.settlement_id, mockSettlementId);
 
   const lnPayRes = await executor.execute(
-    'intercomswap_swap_ln_pay_and_post_from_invoice',
+    'intercomswap_swap_ln_pay_and_post_verified',
     {
       channel,
+      terms_envelope: termsEnvelope,
       invoice_envelope: invoiceEnvelope,
+      escrow_envelope: escrowRes.envelope,
     },
     { autoApprove: true }
   );
