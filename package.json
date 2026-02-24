@@ -4,6 +4,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
+    "tao:smoke": "node scripts/tao-smoke.mjs",
     "test": "node --test test/*.test.js",
     "test:e2e": "node --test --test-concurrency=1 test-e2e/*.test.js"
   },
@@ -19,6 +20,7 @@
     "bech32": "^2.0.0",
     "compact-encoding": "^2.18.0",
     "crypto": "npm:bare-node-crypto",
+    "ethers": "^6.15.0",
     "fs": "npm:bare-node-fs",
     "path": "npm:bare-node-path",
     "protomux": "^3.10.1",
