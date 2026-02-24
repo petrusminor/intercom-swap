@@ -3,14 +3,6 @@ import process from 'node:process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { PublicKey } from '@solana/web3.js';
-import {
-  createAssociatedTokenAccount,
-  getAccount,
-  getAssociatedTokenAddress,
-} from '@solana/spl-token';
-
-import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from '../src/protocol/signedMessage.js';
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
@@ -23,15 +15,12 @@ import { normalizeClnNetwork } from '../src/ln/cln.js';
 import { normalizeLndNetwork } from '../src/ln/lnd.js';
 import { decodeBolt11 } from '../src/ln/bolt11.js';
 import { lnInvoice } from '../src/ln/client.js';
-import {
-  createEscrowTx,
-  getConfigState,
-  getTradeConfigState,
-  LN_USDT_ESCROW_PROGRAM_ID,
-} from '../src/solana/lnUsdtEscrowClient.js';
-import { readSolanaKeypair } from '../src/solana/keypair.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
+import {
+  SolanaSettlementProvider,
+  SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
+} from '../settlement/solana/SolanaSettlementProvider.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -132,15 +121,6 @@ function buildRfqLockKey(msg) {
   ].join('|');
 }
 
-async function sendAndConfirm(connection, tx) {
-  const sig = await connection.sendRawTransaction(tx.serialize());
-  const conf = await connection.confirmTransaction(sig, 'confirmed');
-  if (conf?.value?.err) {
-    throw new Error(`Tx failed: ${JSON.stringify(conf.value.err)}`);
-  }
-  return sig;
-}
-
 async function main() {
   const { flags } = parseArgs(process.argv.slice(2));
 
@@ -208,8 +188,8 @@ async function main() {
   const lndMacaroon = flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '';
   const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
 
-  const expectedProgramId = solProgramIdStr ? new PublicKey(solProgramIdStr) : LN_USDT_ESCROW_PROGRAM_ID;
-  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: expectedProgramId.toBase58() });
+  const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
+  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: expectedProgramId });
 
   const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
 
@@ -304,23 +284,27 @@ async function main() {
   };
 
   const sol = runSwap
-		    ? (() => {
-		        const payer = readSolanaKeypair(solKeypairPath);
-		        const pool = new SolanaRpcPool({ rpcUrls: solRpcUrl, commitment: 'confirmed' });
-		        const mint = new PublicKey(solMintStr);
-		        const programId = expectedProgramId;
-		        const tradeFeeCollector = solTradeFeeCollectorStr ? new PublicKey(solTradeFeeCollectorStr) : null;
-		        return {
-		          payer,
-		          pool,
-	          mint,
-	          programId,
-	          tradeFeeCollector,
-	          computeUnitLimit: solComputeUnitLimit,
-	          computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
-	        };
-	      })()
-	    : null;
+    ? await (async () => {
+        /** @type {import('../settlement/SettlementProvider').SettlementProvider} */
+        const settlement = new SolanaSettlementProvider({
+          rpcUrls: solRpcUrl,
+          commitment: 'confirmed',
+          keypairPath: solKeypairPath,
+          mint: solMintStr,
+          programId: expectedProgramId,
+          tradeFeeCollector: solTradeFeeCollectorStr || '',
+          computeUnitLimit: solComputeUnitLimit,
+          computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
+        });
+        return {
+          settlement,
+          mint: solMintStr,
+          programId: expectedProgramId,
+          refundAddress: await settlement.getSignerAddress(),
+          tradeFeeCollector: solTradeFeeCollectorStr || null,
+        };
+      })()
+    : null;
 
   let done = false;
   let shuttingDown = false;
@@ -446,24 +430,9 @@ async function main() {
         tradeFeeCollector: null,
       };
     }
-    // Platform fee comes from the program config PDA.
-    // Trade fee comes from a trade-config PDA keyed by trade_fee_collector.
-    const cfg = await sol.pool.call((connection) => getConfigState(connection, sol.programId, 'confirmed'), {
-      label: 'maker:get-config',
+    return sol.settlement.feeSnapshot({
+      ...(sol.tradeFeeCollector ? { tradeFeeCollector: sol.tradeFeeCollector } : {}),
     });
-    if (!cfg) throw new Error('Solana escrow program config is not initialized (run escrowctl config-init first)');
-    const platformFeeBps = Number(cfg.feeBps || 0);
-    const platformFeeCollector = cfg.feeCollector;
-
-    const tradeFeeCollector = sol.tradeFeeCollector || cfg.feeCollector;
-    const tradeCfg = await sol.pool.call((connection) => getTradeConfigState(connection, tradeFeeCollector, sol.programId, 'confirmed'), {
-      label: 'maker:get-trade-config',
-    });
-    if (!tradeCfg) {
-      throw new Error(`Trade fee config not initialized for ${tradeFeeCollector.toBase58()}`);
-    }
-    const tradeFeeBps = Number(tradeCfg.feeBps || 0);
-    return { platformFeeBps, platformFeeCollector, tradeFeeBps, tradeFeeCollector };
   };
 
   const createAndSendTerms = async (ctx) => {
@@ -483,14 +452,14 @@ async function main() {
         btc_sats: ctx.btcSats,
         usdt_amount: ctx.usdtAmount,
         usdt_decimals: solDecimals,
-        sol_mint: sol.mint.toBase58(),
+        sol_mint: sol.mint,
         sol_recipient: ctx.solRecipient,
-        sol_refund: sol.payer.publicKey.toBase58(),
+        sol_refund: sol.refundAddress,
         sol_refund_after_unix: nowSec + solRefundAfterSec,
         platform_fee_bps: fees.platformFeeBps,
-        platform_fee_collector: fees.platformFeeCollector ? fees.platformFeeCollector.toBase58() : null,
+        platform_fee_collector: fees.platformFeeCollector || null,
         trade_fee_bps: fees.tradeFeeBps,
-        trade_fee_collector: fees.tradeFeeCollector ? fees.tradeFeeCollector.toBase58() : null,
+        trade_fee_collector: fees.tradeFeeCollector || null,
         ln_receiver_peer: makerPubkey,
         ln_payer_peer: ctx.inviteePubKey,
         terms_valid_until_unix: nowSec + termsValidSec,
@@ -516,7 +485,7 @@ async function main() {
         btc_sats: ctx.btcSats,
         usdt_amount: ctx.usdtAmount,
         sol_mint: signed.body.sol_mint,
-        sol_program_id: sol?.programId?.toBase58?.() ?? null,
+        sol_program_id: sol?.programId ?? null,
         sol_recipient: signed.body.sol_recipient,
         sol_refund: signed.body.sol_refund,
         sol_refund_after_unix: signed.body.sol_refund_after_unix,
@@ -525,17 +494,6 @@ async function main() {
       'terms_sent',
       signed
     );
-  };
-
-  const ensureAta = async ({ connection, payer, mint, owner }) => {
-    const ata = await getAssociatedTokenAddress(mint, owner);
-    try {
-      await getAccount(connection, ata, 'confirmed');
-      return ata;
-    } catch (_e) {
-      // Create ATA if missing (payer funds rent).
-      return createAssociatedTokenAccount(connection, payer, mint, owner);
-    }
   };
 
   const createInvoiceAndEscrow = async (ctx) => {
@@ -595,34 +553,23 @@ async function main() {
     const refundAfterUnix = Number(ctx.trade.terms.sol_refund_after_unix);
     if (!Number.isFinite(refundAfterUnix) || refundAfterUnix <= 0) throw new Error('Invalid sol_refund_after_unix');
 
-    const solRecipient = new PublicKey(ctx.solRecipient);
-    const payerToken = await sol.pool.call(
-      (connection) => ensureAta({ connection, payer: sol.payer, mint: sol.mint, owner: sol.payer.publicKey }),
-      { label: 'maker:ensure-ata' }
-    );
-
-	    const { tx: escrowTx, escrowPda, vault } = await sol.pool.call(
-	      (connection) =>
-	        createEscrowTx({
-	          connection,
-	          payer: sol.payer,
-	          payerTokenAccount: payerToken,
-	          mint: sol.mint,
-	          paymentHashHex,
-	          recipient: solRecipient,
-	          refund: sol.payer.publicKey,
-	          refundAfterUnix,
-	          amount: BigInt(String(ctx.usdtAmount)),
-	          expectedPlatformFeeBps: Number(ctx.trade.terms.platform_fee_bps || 0),
-	          expectedTradeFeeBps: Number(ctx.trade.terms.trade_fee_bps || 0),
-	          tradeFeeCollector: new PublicKey(String(ctx.trade.terms.trade_fee_collector)),
-	          computeUnitLimit: sol.computeUnitLimit,
-	          computeUnitPriceMicroLamports: sol.computeUnitPriceMicroLamports,
-	          programId: sol.programId,
-	        }),
-	      { label: 'maker:build-escrow-tx' }
-	    );
-    const escrowSig = await sol.pool.call((connection) => sendAndConfirm(connection, escrowTx), { label: 'maker:send-escrow-tx' });
+    const lock = await sol.settlement.lock({
+      paymentHashHex,
+      amountAtomic: String(ctx.usdtAmount),
+      recipient: ctx.solRecipient,
+      refundAddress: sol.refundAddress,
+      refundAfterUnix,
+      terms: ctx.trade.terms,
+    });
+    const escrowPda = lock.settlementId;
+    const escrowSig = lock.txId;
+    const lockMeta = lock?.metadata && typeof lock.metadata === 'object' ? lock.metadata : {};
+    const vaultAta = String(lockMeta.vault_ata || '').trim();
+    if (!vaultAta) throw new Error('settlement metadata missing vault_ata');
+    const programId = String(lockMeta.program_id || sol.programId).trim();
+    const mint = String(lockMeta.mint || sol.mint).trim();
+    const recipient = String(lockMeta.recipient || ctx.solRecipient).trim();
+    const refund = String(lockMeta.refund || sol.refundAddress).trim();
 
     const solEscrowUnsigned = createUnsignedEnvelope({
       v: 1,
@@ -630,14 +577,14 @@ async function main() {
       tradeId: ctx.tradeId,
       body: {
         payment_hash_hex: paymentHashHex,
-        program_id: sol.programId.toBase58(),
-        escrow_pda: escrowPda.toBase58(),
-        vault_ata: vault.toBase58(),
-        mint: sol.mint.toBase58(),
+        program_id: programId,
+        escrow_pda: escrowPda,
+        vault_ata: vaultAta,
+        mint,
         amount: String(ctx.usdtAmount),
         refund_after_unix: refundAfterUnix,
-        recipient: solRecipient.toBase58(),
-        refund: sol.payer.publicKey.toBase58(),
+        recipient,
+        refund,
         tx_sig: escrowSig,
       },
     });
@@ -901,11 +848,11 @@ async function main() {
             usdt_amount: quoteUsdtAmount,
             // Pre-filtering: fee preview (binding fees are still in TERMS).
             platform_fee_bps: fees.platformFeeBps,
-            platform_fee_collector: fees.platformFeeCollector ? fees.platformFeeCollector.toBase58() : null,
+            platform_fee_collector: fees.platformFeeCollector || null,
             trade_fee_bps: fees.tradeFeeBps,
-            trade_fee_collector: fees.tradeFeeCollector ? fees.tradeFeeCollector.toBase58() : null,
+            trade_fee_collector: fees.tradeFeeCollector || null,
             sol_refund_window_sec: solRefundAfterSec,
-            ...(runSwap ? { sol_mint: sol.mint.toBase58(), sol_recipient: solRecipient } : {}),
+            ...(runSwap ? { sol_mint: sol.mint, sol_recipient: solRecipient } : {}),
             valid_until_unix: quoteValidUntilUnix,
           },
         });
@@ -920,12 +867,12 @@ async function main() {
           btc_sats: msg.body.btc_sats,
           usdt_amount: quoteUsdtAmount,
           platform_fee_bps: fees.platformFeeBps,
-          platform_fee_collector: fees.platformFeeCollector ? fees.platformFeeCollector.toBase58() : null,
+          platform_fee_collector: fees.platformFeeCollector || null,
           trade_fee_bps: fees.tradeFeeBps,
-          trade_fee_collector: fees.tradeFeeCollector ? fees.tradeFeeCollector.toBase58() : null,
+          trade_fee_collector: fees.tradeFeeCollector || null,
           sol_refund_window_sec: solRefundAfterSec,
           sol_recipient: solRecipient,
-          sol_mint: runSwap ? sol.mint.toBase58() : (msg.body?.sol_mint ? String(msg.body.sol_mint).trim() : ''),
+          sol_mint: runSwap ? sol.mint : (msg.body?.sol_mint ? String(msg.body.sol_mint).trim() : ''),
           lock_key: lockKey,
         });
         rfqLocks.set(lockKey, {
@@ -1118,7 +1065,7 @@ async function main() {
               taker_peer: inviteePubKey,
               btc_sats: ctx.btcSats,
               usdt_amount: ctx.usdtAmount,
-              sol_mint: runSwap ? sol.mint.toBase58() : null,
+              sol_mint: runSwap ? sol.mint : null,
               sol_recipient: ctx.solRecipient,
               state: ctx.trade.state,
             },

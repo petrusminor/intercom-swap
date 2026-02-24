@@ -26,3 +26,10 @@ target/
 .codex
 training/
 llama.cpp/
+
+# local junk
+.npm-cache/
+.tools/
+.venv-vllm/
+ui/**/.npm-cache/
+RUN.md

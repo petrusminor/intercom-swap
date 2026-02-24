@@ -4,15 +4,6 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { PublicKey } from '@solana/web3.js';
-import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
-  createAssociatedTokenAccount,
-  getAccount,
-  getAssociatedTokenAddress,
-} from '@solana/spl-token';
-
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from '../src/protocol/signedMessage.js';
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
@@ -20,15 +11,15 @@ import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { deriveIntercomswapAppHash } from '../src/swap/app.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
-import { verifySwapPrePayOnchain } from '../src/swap/verify.js';
 import { normalizeClnNetwork } from '../src/ln/cln.js';
 import { normalizeLndNetwork } from '../src/ln/lnd.js';
 import { lnPay } from '../src/ln/client.js';
-import { claimEscrowTx, LN_USDT_ESCROW_PROGRAM_ID } from '../src/solana/lnUsdtEscrowClient.js';
-import { readSolanaKeypair } from '../src/solana/keypair.js';
-import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
+import {
+  SolanaSettlementProvider,
+  SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
+} from '../settlement/solana/SolanaSettlementProvider.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -124,15 +115,6 @@ function asBigIntAmount(value) {
   } catch (_e) {
     return null;
   }
-}
-
-async function sendAndConfirm(connection, tx) {
-  const sig = await connection.sendRawTransaction(tx.serialize());
-  const conf = await connection.confirmTransaction(sig, 'confirmed');
-  if (conf?.value?.err) {
-    throw new Error(`Tx failed: ${JSON.stringify(conf.value.err)}`);
-  }
-  return sig;
 }
 
 async function main() {
@@ -234,8 +216,8 @@ async function main() {
   const lndMacaroon = flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '';
   const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
 
-  const expectedProgramId = solProgramIdStr ? new PublicKey(solProgramIdStr) : LN_USDT_ESCROW_PROGRAM_ID;
-  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: expectedProgramId.toBase58() });
+  const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
+  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: expectedProgramId });
 
   const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
 
@@ -290,15 +272,21 @@ async function main() {
   };
 
   const sol = runSwap
-    ? (() => {
-        const payer = readSolanaKeypair(solKeypairPath);
-        const pool = new SolanaRpcPool({ rpcUrls: solRpcUrl, commitment: 'confirmed' });
-        return {
-          payer,
-          pool,
-          expectedProgramId,
+    ? await (async () => {
+        /** @type {import('../settlement/SettlementProvider').SettlementProvider} */
+        const settlement = new SolanaSettlementProvider({
+          rpcUrls: solRpcUrl,
+          commitment: 'confirmed',
+          keypairPath: solKeypairPath,
+          mint: solMintStr,
+          programId: expectedProgramId,
           computeUnitLimit: solComputeUnitLimit,
           computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
+        });
+        return {
+          settlement,
+          recipientAddress: await settlement.getSignerAddress(),
+          expectedProgramId,
         };
       })()
     : null;
@@ -454,7 +442,7 @@ async function main() {
       // Maker will advertise its offered value in QUOTE.sol_refund_window_sec.
       min_sol_refund_window_sec: minSolRefundWindowSec,
       max_sol_refund_window_sec: maxSolRefundWindowSec,
-      ...(runSwap ? { sol_recipient: sol.payer.publicKey.toBase58() } : {}),
+      ...(runSwap ? { sol_recipient: sol.recipientAddress } : {}),
       ...(runSwap && solMintStr ? { sol_mint: solMintStr } : {}),
       valid_until_unix: rfqValidUntil,
     },
@@ -472,7 +460,7 @@ async function main() {
       btc_sats: btcSats,
       usdt_amount: usdtAmount,
       sol_mint: runSwap && solMintStr ? solMintStr : null,
-      sol_recipient: runSwap ? sol.payer.publicKey.toBase58() : null,
+      sol_recipient: runSwap ? sol.recipientAddress : null,
       state: STATE.INIT,
     },
     'rfq_sent',
@@ -566,16 +554,6 @@ async function main() {
       swapCtx.waiters.add(waiter);
     });
 
-  const ensureAta = async ({ connection, payer, mint, owner }) => {
-    const ata = await getAssociatedTokenAddress(mint, owner);
-    try {
-      await getAccount(connection, ata, 'confirmed');
-      return ata;
-    } catch (_e) {
-      return createAssociatedTokenAccount(connection, payer, mint, owner);
-    }
-  };
-
   const startSwap = async ({ swapChannel, invite }) => {
     ensureOk(await sc.subscribe([swapChannel]), `subscribe ${swapChannel}`);
 
@@ -660,7 +638,7 @@ async function main() {
     }
 
     // Verify Solana recipient matches our keypair before proceeding.
-    const wantRecipient = sol.payer.publicKey.toBase58();
+    const wantRecipient = sol.recipientAddress;
     const gotRecipient = String(termsMsg.body?.sol_recipient || '');
     if (gotRecipient !== wantRecipient) {
       throw new Error(`terms.sol_recipient mismatch (got=${gotRecipient} want=${wantRecipient})`);
@@ -829,7 +807,7 @@ async function main() {
     if (swapCtx.trade.escrow) {
       if (sol?.expectedProgramId) {
         const gotProgram = String(swapCtx.trade.escrow.program_id || '').trim();
-        const wantProgram = sol.expectedProgramId.toBase58();
+        const wantProgram = String(sol.expectedProgramId || '').trim();
         if (!gotProgram) throw new Error('escrow.program_id missing');
         if (gotProgram !== wantProgram) {
           throw new Error(`escrow.program_id mismatch (got=${gotProgram} want=${wantProgram})`);
@@ -852,26 +830,22 @@ async function main() {
     }
 
     // Hard rule: verify escrow on-chain before paying.
-    const prepay = await sol.pool.call(
-      (connection) =>
-        verifySwapPrePayOnchain({
-          terms: swapCtx.trade.terms,
-          invoiceBody: swapCtx.trade.invoice,
-          escrowBody: swapCtx.trade.escrow,
-          connection,
-          now_unix: Math.floor(Date.now() / 1000),
-        }),
-      { label: 'taker:verify-prepay' }
-    );
+    const prepay = await sol.settlement.verifySwapPrePayOnchain({
+      terms: swapCtx.trade.terms,
+      invoiceBody: swapCtx.trade.invoice,
+      escrowBody: swapCtx.trade.escrow,
+      nowUnix: Math.floor(Date.now() / 1000),
+    });
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
     // Defense-in-depth: ensure the on-chain escrow fee receiver settings match the negotiated TERMS, otherwise
     // claim could fail (wrong trade fee vault PDA) or fees could be misrepresented.
     if (prepay?.onchain?.state?.v === 3) {
       const st = prepay.onchain.state;
       const wantTradeFeeCollector = String(swapCtx.trade.terms?.trade_fee_collector || '').trim();
-      if (wantTradeFeeCollector && st.tradeFeeCollector?.toBase58?.() !== wantTradeFeeCollector) {
+      const gotTradeFeeCollector = String(st.tradeFeeCollector || '').trim();
+      if (wantTradeFeeCollector && gotTradeFeeCollector !== wantTradeFeeCollector) {
         throw new Error(
-          `onchain tradeFeeCollector mismatch vs terms (state=${st.tradeFeeCollector.toBase58()} terms=${wantTradeFeeCollector})`
+          `onchain tradeFeeCollector mismatch vs terms (state=${gotTradeFeeCollector} terms=${wantTradeFeeCollector})`
         );
       }
       const wantTradeFeeBps = Number(swapCtx.trade.terms?.trade_fee_bps || 0);
@@ -879,9 +853,10 @@ async function main() {
         throw new Error(`onchain tradeFeeBps mismatch vs terms (state=${st.tradeFeeBps} terms=${wantTradeFeeBps})`);
       }
       const wantPlatformFeeCollector = String(swapCtx.trade.terms?.platform_fee_collector || '').trim();
-      if (wantPlatformFeeCollector && st.platformFeeCollector?.toBase58?.() !== wantPlatformFeeCollector) {
+      const gotPlatformFeeCollector = String(st.platformFeeCollector || '').trim();
+      if (wantPlatformFeeCollector && gotPlatformFeeCollector !== wantPlatformFeeCollector) {
         throw new Error(
-          `onchain platformFeeCollector mismatch vs terms (state=${st.platformFeeCollector.toBase58()} terms=${wantPlatformFeeCollector})`
+          `onchain platformFeeCollector mismatch vs terms (state=${gotPlatformFeeCollector} terms=${wantPlatformFeeCollector})`
         );
       }
       const wantPlatformFeeBps = Number(swapCtx.trade.terms?.platform_fee_bps || 0);
@@ -938,37 +913,11 @@ async function main() {
     }
 
     // Claim escrow on Solana.
-    const mint = new PublicKey(swapCtx.trade.terms.sol_mint);
-    const recipientToken = await sol.pool.call(
-      (connection) =>
-        ensureAta({
-          connection,
-          payer: sol.payer,
-          mint,
-          owner: sol.payer.publicKey,
-        }),
-      { label: 'taker:ensure-ata' }
-    );
-    const programId = swapCtx.trade.escrow?.program_id ? new PublicKey(swapCtx.trade.escrow.program_id) : undefined;
-    const tradeFeeCollectorStr = swapCtx.trade.terms?.trade_fee_collector;
-    if (!tradeFeeCollectorStr) throw new Error('Missing terms.trade_fee_collector');
-    const { tx: claimTx } = await sol.pool.call(
-      (connection) =>
-        claimEscrowTx({
-          connection,
-          recipient: sol.payer,
-          recipientTokenAccount: recipientToken,
-          mint,
-          paymentHashHex,
-          preimageHex,
-          tradeFeeCollector: new PublicKey(String(tradeFeeCollectorStr)),
-          computeUnitLimit: sol.computeUnitLimit,
-          computeUnitPriceMicroLamports: sol.computeUnitPriceMicroLamports,
-          ...(programId ? { programId } : {}),
-        }),
-      { label: 'taker:build-claim-tx' }
-    );
-    const claimSig = await sol.pool.call((connection) => sendAndConfirm(connection, claimTx), { label: 'taker:send-claim-tx' });
+    const settlementId = String(swapCtx.trade.escrow?.escrow_pda || '').trim();
+    if (!settlementId) throw new Error('Missing escrow settlementId');
+    const claimRes = await sol.settlement.claim({ settlementId, preimageHex });
+    const claimSig = String(claimRes?.txId || '').trim();
+    if (!claimSig) throw new Error('Missing claim txId from settlement provider');
 
   const solClaimedUnsigned = createUnsignedEnvelope({
     v: 1,
