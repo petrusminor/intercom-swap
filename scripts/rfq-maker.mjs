@@ -289,7 +289,10 @@ async function main() {
   const persistTrade = (tradeId, patch, eventKind = null, eventPayload = null) => {
     if (!receipts) return;
     try {
-      receipts.upsertTrade(tradeId, patch);
+      receipts.upsertTrade(tradeId, {
+        settlement_kind: settlementKind,
+        ...patch,
+      });
       if (eventKind) receipts.appendEvent(tradeId, eventKind, eventPayload);
     } catch (err) {
       try {
@@ -664,9 +667,11 @@ async function main() {
         {
           tao_htlc_address: solEscrowSigned.body.htlc_address,
           tao_settlement_id: solEscrowSigned.body.settlement_id,
+          tao_amount_atomic: solEscrowSigned.body.amount_atomic,
           tao_refund_after_unix: solEscrowSigned.body.refund_after_unix,
           tao_recipient: solEscrowSigned.body.recipient,
           tao_refund: solEscrowSigned.body.refund,
+          tao_lock_tx_id: solEscrowSigned.body.tx_id,
           state: ctx.trade.state,
         },
         'tao_htlc_locked_sent',
@@ -779,7 +784,21 @@ async function main() {
           process.stdout.write(
             `${JSON.stringify({ type: evtType, trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, state: ctx.trade.state })}\n`
           );
-          persistTrade(ctx.tradeId, { state: ctx.trade.state }, evtType, { trade_id: ctx.tradeId, state: ctx.trade.state });
+          const terminalPatch = { state: ctx.trade.state };
+          if (isTaoSettlement && msg?.kind === KIND.TAO_CLAIMED) {
+            terminalPatch.tao_settlement_id = msg.body?.settlement_id || null;
+            terminalPatch.tao_claim_tx_id = msg.body?.tx_id || null;
+            terminalPatch.ln_payment_hash_hex = msg.body?.payment_hash_hex || null;
+          }
+          if (isTaoSettlement && msg?.kind === KIND.TAO_REFUNDED) {
+            terminalPatch.tao_settlement_id = msg.body?.settlement_id || null;
+            terminalPatch.tao_refund_tx_id = msg.body?.tx_id || null;
+            terminalPatch.ln_payment_hash_hex = msg.body?.payment_hash_hex || null;
+          }
+          persistTrade(ctx.tradeId, terminalPatch, evtType, {
+            trade_id: ctx.tradeId,
+            state: ctx.trade.state,
+          });
           await cleanupSwap(ctx, { reason: ctx.trade.state === STATE.CLAIMED ? 'swap_done' : String(ctx.trade.state).toLowerCase() });
           maybeExit();
         }

@@ -59,6 +59,59 @@ test('receipts store: listOpenRefunds filters escrow by refund_after', () => {
   }
 });
 
+test('receipts store: solana + tao settlement fields roundtrip and refund selection', () => {
+  const dbPath = tmpDbPath('settlement-parity');
+  const store = TradeReceiptsStore.open({ dbPath });
+  try {
+    const solHash = 'c'.repeat(64);
+    const taoHash = 'd'.repeat(64);
+    store.upsertTrade('sol1', {
+      settlement_kind: 'solana',
+      state: 'escrow',
+      ln_payment_hash_hex: solHash,
+      sol_refund_after_unix: 1000,
+      sol_escrow_pda: 'sol-escrow-1',
+      updated_at: 100,
+    });
+    store.upsertTrade('tao1', {
+      settlement_kind: 'tao-evm',
+      state: 'escrow',
+      ln_payment_hash_hex: taoHash,
+      tao_settlement_id: '0x' + '1'.repeat(64),
+      tao_htlc_address: '0x' + '2'.repeat(40),
+      tao_amount_atomic: '1000000000000000',
+      tao_recipient: '0x' + '3'.repeat(40),
+      tao_refund: '0x' + '4'.repeat(40),
+      tao_refund_after_unix: 1200,
+      tao_lock_tx_id: '0x' + '5'.repeat(64),
+      updated_at: 200,
+    });
+    store.upsertTrade('tao-future', {
+      settlement_kind: 'tao-evm',
+      state: 'escrow',
+      ln_payment_hash_hex: 'e'.repeat(64),
+      tao_settlement_id: '0x' + '6'.repeat(64),
+      tao_refund_after_unix: 2200,
+      updated_at: 300,
+    });
+
+    const tao = store.getTrade('tao1');
+    assert.equal(tao.settlement_kind, 'tao-evm');
+    assert.equal(tao.tao_settlement_id, '0x' + '1'.repeat(64));
+    assert.equal(tao.tao_htlc_address, '0x' + '2'.repeat(40));
+    assert.equal(tao.tao_lock_tx_id, '0x' + '5'.repeat(64));
+    assert.equal(tao.ln_payment_hash_hex, taoHash);
+
+    const refunds = store.listOpenRefunds({ nowUnix: 1500, limit: 10, offset: 0, state: 'escrow' });
+    assert.deepEqual(
+      refunds.map((t) => t.trade_id),
+      ['tao1', 'sol1']
+    );
+  } finally {
+    store.close();
+  }
+});
+
 test('receipts store: listing lock lifecycle supports in_flight -> filled and delete', () => {
   const dbPath = tmpDbPath('listing-locks');
   const store = TradeReceiptsStore.open({ dbPath });

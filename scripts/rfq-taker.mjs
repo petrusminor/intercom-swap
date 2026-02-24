@@ -277,7 +277,10 @@ async function main() {
   const persistTrade = (patch, eventKind = null, eventPayload = null) => {
     if (!receipts) return;
     try {
-      receipts.upsertTrade(tradeId, patch);
+      receipts.upsertTrade(tradeId, {
+        settlement_kind: settlementKind,
+        ...patch,
+      });
       if (eventKind) receipts.appendEvent(tradeId, eventKind, eventPayload);
     } catch (err) {
       try {
@@ -855,9 +858,11 @@ async function main() {
           {
             tao_htlc_address: swapCtx.trade.escrow.htlc_address,
             tao_settlement_id: swapCtx.trade.escrow.settlement_id,
+            tao_amount_atomic: swapCtx.trade.escrow.amount_atomic,
             tao_recipient: swapCtx.trade.escrow.recipient,
             tao_refund: swapCtx.trade.escrow.refund,
             tao_refund_after_unix: swapCtx.trade.escrow.refund_after_unix,
+            tao_lock_tx_id: swapCtx.trade.escrow.tx_id,
             state: swapCtx.trade.state,
           },
           'tao_htlc_locked_recv',
@@ -1006,7 +1011,19 @@ async function main() {
         tx_sig: isTaoSettlement ? undefined : claimSig,
       })}\n`
     );
-    persistTrade({ state: swapCtx.trade.state }, isTaoSettlement ? 'tao_claimed' : 'sol_claimed', solClaimedSigned);
+    persistTrade(
+      {
+        ...(isTaoSettlement
+          ? {
+              tao_settlement_id: settlementId,
+              tao_claim_tx_id: claimSig,
+            }
+          : {}),
+        state: swapCtx.trade.state,
+      },
+      isTaoSettlement ? 'tao_claimed' : 'sol_claimed',
+      solClaimedSigned
+    );
 
     // Best-effort: resend final proofs a few times to reduce "sent but peer exited" flakiness.
     for (let i = 0; i < 3; i += 1) {

@@ -1792,10 +1792,27 @@ export class ToolExecutor {
     if (!store) return;
 
     try {
-      store.upsertTrade(tradeId, {
+      const terminalPatch = {
+        settlement_kind:
+          kind === KIND.TAO_CLAIMED || kind === KIND.TAO_REFUNDED
+            ? SETTLEMENT_KIND.TAO_EVM
+            : SETTLEMENT_KIND.SOLANA,
         swap_channel: swapChannel,
         state,
         last_error: null,
+      };
+      if (kind === KIND.TAO_CLAIMED) {
+        terminalPatch.tao_settlement_id = env?.body?.settlement_id || null;
+        terminalPatch.tao_claim_tx_id = env?.body?.tx_id || null;
+        terminalPatch.ln_payment_hash_hex = env?.body?.payment_hash_hex || null;
+      }
+      if (kind === KIND.TAO_REFUNDED) {
+        terminalPatch.tao_settlement_id = env?.body?.settlement_id || null;
+        terminalPatch.tao_refund_tx_id = env?.body?.tx_id || null;
+        terminalPatch.ln_payment_hash_hex = env?.body?.payment_hash_hex || null;
+      }
+      store.upsertTrade(tradeId, {
+        ...terminalPatch,
       });
       try {
         store.appendEvent(tradeId, `terminal_seen_${state}`, { channel: swapChannel, kind });
@@ -6294,6 +6311,7 @@ export class ToolExecutor {
         store.upsertTrade(tradeId, {
           role: 'maker',
           swap_channel: channel,
+          settlement_kind: isTao ? SETTLEMENT_KIND.TAO_EVM : SETTLEMENT_KIND.SOLANA,
           ln_payment_hash_hex: paymentHashHex,
           sol_mint: String(envelopeBody.mint || mint).trim(),
           sol_program_id: this._settlementAppBinding(),
@@ -6302,6 +6320,17 @@ export class ToolExecutor {
           sol_escrow_pda: settlementId,
           ...(envelopeBody.vault_ata ? { sol_vault_ata: String(envelopeBody.vault_ata).trim() } : {}),
           sol_refund_after_unix: Number(envelopeBody.refund_after_unix || refundAfterUnix),
+          ...(isTao
+            ? {
+                tao_settlement_id: settlementId,
+                tao_htlc_address: String(envelopeBody.htlc_address || '').trim(),
+                tao_amount_atomic: String(envelopeBody.amount_atomic || '').trim(),
+                tao_recipient: String(envelopeBody.recipient || '').trim(),
+                tao_refund: String(envelopeBody.refund || '').trim(),
+                tao_refund_after_unix: Number(envelopeBody.refund_after_unix || 0),
+                tao_lock_tx_id: String(envelopeBody.tx_id || settlementTxId).trim(),
+              }
+            : {}),
           state: 'escrow',
           last_error: null,
         });
@@ -6927,12 +6956,19 @@ export class ToolExecutor {
         store.upsertTrade(tradeId, {
           role: 'taker',
           swap_channel: channel,
+          settlement_kind: isTao ? SETTLEMENT_KIND.TAO_EVM : SETTLEMENT_KIND.SOLANA,
           ln_payment_hash_hex: paymentHashHex,
           ln_preimage_hex: preimageHex,
           sol_mint: mint,
           sol_program_id: this._settlementAppBinding(),
           sol_escrow_pda: settlementId,
           ...(escrowBody?.vault_ata ? { sol_vault_ata: String(escrowBody.vault_ata).trim() } : {}),
+          ...(isTao
+            ? {
+                tao_settlement_id: settlementId,
+                tao_claim_tx_id: claimTxId,
+              }
+            : {}),
           state: 'claimed',
           last_error: null,
         });
@@ -7072,10 +7108,17 @@ export class ToolExecutor {
         store.upsertTrade(tradeId, {
           role: 'maker',
           swap_channel: channel,
+          settlement_kind: isTao ? SETTLEMENT_KIND.TAO_EVM : SETTLEMENT_KIND.SOLANA,
           ln_payment_hash_hex: paymentHashHex,
           sol_mint: mint,
           sol_program_id: this._settlementAppBinding(),
           sol_escrow_pda: settlementId,
+          ...(isTao
+            ? {
+                tao_settlement_id: settlementId,
+                tao_refund_tx_id: refundTxId,
+              }
+            : {}),
           state: 'refunded',
           last_error: null,
         });

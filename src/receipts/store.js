@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { stableStringify } from '../util/stableStringify.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const LEGACY_RFV_CHANNEL_COL = ['o', 't', 'c'].join('') + '_channel';
 
@@ -73,6 +73,30 @@ function ensureListingLocksTable(db) {
   `);
 }
 
+function ensureTradeSettlementColumns(db) {
+  const cols = listTradeColumns(db);
+  const addText = [
+    'settlement_kind',
+    'tao_settlement_id',
+    'tao_htlc_address',
+    'tao_amount_atomic',
+    'tao_recipient',
+    'tao_refund',
+    'tao_lock_tx_id',
+    'tao_claim_tx_id',
+    'tao_refund_tx_id',
+  ];
+  for (const col of addText) {
+    if (cols.has(col)) continue;
+    db.exec(`ALTER TABLE trades ADD COLUMN ${col} TEXT;`);
+    cols.add(col);
+  }
+  if (!cols.has('tao_refund_after_unix')) {
+    db.exec('ALTER TABLE trades ADD COLUMN tao_refund_after_unix INTEGER;');
+    cols.add('tao_refund_after_unix');
+  }
+}
+
 function migrateSchema(db) {
   let current = readSchemaVersion(db);
   if (current === null) {
@@ -97,7 +121,15 @@ function migrateSchema(db) {
     writeSchemaVersion(db, current);
   }
 
+  if (current === 3) {
+    // v3 -> v4: settlement-aware receipt fields for TAO EVM parity.
+    ensureTradeSettlementColumns(db);
+    current = 4;
+    writeSchemaVersion(db, current);
+  }
+
   if (current === SCHEMA_VERSION) {
+    ensureTradeSettlementColumns(db);
     if (!listListingLockColumns(db).has('listing_key')) {
       ensureListingLocksTable(db);
     }
@@ -174,6 +206,16 @@ function mapRow(row) {
     sol_escrow_pda: row.sol_escrow_pda,
     sol_vault_ata: row.sol_vault_ata,
     sol_refund_after_unix: row.sol_refund_after_unix,
+    settlement_kind: row.settlement_kind,
+    tao_settlement_id: row.tao_settlement_id,
+    tao_htlc_address: row.tao_htlc_address,
+    tao_amount_atomic: row.tao_amount_atomic,
+    tao_recipient: row.tao_recipient,
+    tao_refund: row.tao_refund,
+    tao_refund_after_unix: row.tao_refund_after_unix,
+    tao_lock_tx_id: row.tao_lock_tx_id,
+    tao_claim_tx_id: row.tao_claim_tx_id,
+    tao_refund_tx_id: row.tao_refund_tx_id,
 
     ln_invoice_bolt11: row.ln_invoice_bolt11,
     ln_payment_hash_hex: row.ln_payment_hash_hex,
@@ -218,7 +260,18 @@ export class TradeReceiptsStore {
       'SELECT * FROM trades WHERE state = ? AND ln_preimage_hex IS NOT NULL ORDER BY updated_at DESC LIMIT ? OFFSET ?'
     );
     this._stmtListOpenRefunds = db.prepare(
-      'SELECT * FROM trades WHERE state = ? AND sol_refund_after_unix IS NOT NULL AND sol_refund_after_unix <= ? ORDER BY updated_at DESC LIMIT ? OFFSET ?'
+      `SELECT * FROM trades
+       WHERE state = ?
+         AND (
+           ((settlement_kind IS NULL OR settlement_kind = '' OR settlement_kind = 'solana')
+             AND sol_refund_after_unix IS NOT NULL
+             AND sol_refund_after_unix <= ?)
+           OR
+           (settlement_kind = 'tao-evm'
+             AND tao_refund_after_unix IS NOT NULL
+             AND tao_refund_after_unix <= ?)
+         )
+       ORDER BY updated_at DESC LIMIT ? OFFSET ?`
     );
 
     this._stmtInsertEvent = db.prepare(
@@ -253,6 +306,7 @@ export class TradeReceiptsStore {
         trade_id, role, rfq_channel, swap_channel, maker_peer, taker_peer,
         btc_sats, usdt_amount,
         sol_mint, sol_program_id, sol_recipient, sol_refund, sol_escrow_pda, sol_vault_ata, sol_refund_after_unix,
+        settlement_kind, tao_settlement_id, tao_htlc_address, tao_amount_atomic, tao_recipient, tao_refund, tao_refund_after_unix, tao_lock_tx_id, tao_claim_tx_id, tao_refund_tx_id,
         ln_invoice_bolt11, ln_payment_hash_hex, ln_preimage_hex,
         state, created_at, updated_at, last_error
       )
@@ -260,6 +314,7 @@ export class TradeReceiptsStore {
         ?, ?, ?, ?, ?, ?,
         ?, ?,
         ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?, ?
       )
@@ -278,6 +333,16 @@ export class TradeReceiptsStore {
         sol_escrow_pda=excluded.sol_escrow_pda,
         sol_vault_ata=excluded.sol_vault_ata,
         sol_refund_after_unix=excluded.sol_refund_after_unix,
+        settlement_kind=excluded.settlement_kind,
+        tao_settlement_id=excluded.tao_settlement_id,
+        tao_htlc_address=excluded.tao_htlc_address,
+        tao_amount_atomic=excluded.tao_amount_atomic,
+        tao_recipient=excluded.tao_recipient,
+        tao_refund=excluded.tao_refund,
+        tao_refund_after_unix=excluded.tao_refund_after_unix,
+        tao_lock_tx_id=excluded.tao_lock_tx_id,
+        tao_claim_tx_id=excluded.tao_claim_tx_id,
+        tao_refund_tx_id=excluded.tao_refund_tx_id,
         ln_invoice_bolt11=excluded.ln_invoice_bolt11,
         ln_payment_hash_hex=excluded.ln_payment_hash_hex,
         ln_preimage_hex=excluded.ln_preimage_hex,
@@ -320,6 +385,16 @@ export class TradeReceiptsStore {
         sol_escrow_pda TEXT,
         sol_vault_ata TEXT,
         sol_refund_after_unix INTEGER,
+        settlement_kind TEXT,
+        tao_settlement_id TEXT,
+        tao_htlc_address TEXT,
+        tao_amount_atomic TEXT,
+        tao_recipient TEXT,
+        tao_refund TEXT,
+        tao_refund_after_unix INTEGER,
+        tao_lock_tx_id TEXT,
+        tao_claim_tx_id TEXT,
+        tao_refund_tx_id TEXT,
 
         ln_invoice_bolt11 TEXT,
         ln_payment_hash_hex TEXT,
@@ -390,7 +465,7 @@ export class TradeReceiptsStore {
     const off = Number.isFinite(offset) ? Math.max(0, Math.trunc(offset)) : 0;
     const st = String(state || '').trim() || 'escrow';
     const now = nowUnix === null || nowUnix === undefined ? Math.floor(Date.now() / 1000) : coerceInt(nowUnix);
-    return this._stmtListOpenRefunds.all(st, now, n, off).map(mapRow);
+    return this._stmtListOpenRefunds.all(st, now, now, n, off).map(mapRow);
   }
 
   upsertTrade(tradeId, patch = {}) {
@@ -424,6 +499,17 @@ export class TradeReceiptsStore {
       sol_vault_ata: coerceText(next.sol_vault_ata),
       sol_refund_after_unix:
         next.sol_refund_after_unix === undefined ? undefined : coerceInt(next.sol_refund_after_unix),
+      settlement_kind: coerceText(next.settlement_kind),
+      tao_settlement_id: coerceText(next.tao_settlement_id),
+      tao_htlc_address: coerceText(next.tao_htlc_address),
+      tao_amount_atomic: coerceText(next.tao_amount_atomic),
+      tao_recipient: coerceText(next.tao_recipient),
+      tao_refund: coerceText(next.tao_refund),
+      tao_refund_after_unix:
+        next.tao_refund_after_unix === undefined ? undefined : coerceInt(next.tao_refund_after_unix),
+      tao_lock_tx_id: coerceText(next.tao_lock_tx_id),
+      tao_claim_tx_id: coerceText(next.tao_claim_tx_id),
+      tao_refund_tx_id: coerceText(next.tao_refund_tx_id),
       ln_invoice_bolt11: coerceText(next.ln_invoice_bolt11),
       ln_payment_hash_hex:
         next.ln_payment_hash_hex === undefined ? undefined : coerceHex32(next.ln_payment_hash_hex, 'ln_payment_hash_hex'),
@@ -456,6 +542,16 @@ export class TradeReceiptsStore {
       row.sol_escrow_pda,
       row.sol_vault_ata,
       row.sol_refund_after_unix,
+      row.settlement_kind,
+      row.tao_settlement_id,
+      row.tao_htlc_address,
+      row.tao_amount_atomic,
+      row.tao_recipient,
+      row.tao_refund,
+      row.tao_refund_after_unix,
+      row.tao_lock_tx_id,
+      row.tao_claim_tx_id,
+      row.tao_refund_tx_id,
       row.ln_invoice_bolt11,
       row.ln_payment_hash_hex,
       row.ln_preimage_hex,
