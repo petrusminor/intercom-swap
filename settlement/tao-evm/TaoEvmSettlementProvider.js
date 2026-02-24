@@ -363,6 +363,142 @@ export class TaoEvmSettlementProvider {
     }
 
     const md = parseMetadataObject(verify.metadata);
+    const expectedHashlock = `0x${paymentHashHex}`;
+    const onchainHashlock = String(md.hashlock || '').trim().toLowerCase();
+    if (!onchainHashlock) {
+      return { ok: false, error: 'on-chain hashlock is missing' };
+    }
+    if (onchainHashlock !== expectedHashlock) {
+      return {
+        ok: false,
+        error: `payment_hash mismatch vs on-chain hashlock (expected=${expectedHashlock}, got=${onchainHashlock})`,
+      };
+    }
+
+    const escrowAmountAtomic = String(escrowBody?.amount_atomic || '').trim();
+    if (!/^[0-9]+$/.test(escrowAmountAtomic)) {
+      return { ok: false, error: 'escrowBody.amount_atomic is required' };
+    }
+    const onchainAmountAtomic = String(md.amount_atomic || '').trim();
+    if (!/^[0-9]+$/.test(onchainAmountAtomic)) {
+      return { ok: false, error: 'on-chain amount_atomic is missing' };
+    }
+    if (onchainAmountAtomic !== escrowAmountAtomic) {
+      return {
+        ok: false,
+        error: `amount_atomic mismatch vs on-chain (expected=${escrowAmountAtomic}, got=${onchainAmountAtomic})`,
+      };
+    }
+    if (
+      terms?.usdt_amount !== undefined &&
+      terms?.usdt_amount !== null &&
+      String(terms.usdt_amount).trim() !== onchainAmountAtomic
+    ) {
+      return {
+        ok: false,
+        error: `amount_atomic mismatch vs terms (expected=${String(terms.usdt_amount).trim()}, got=${onchainAmountAtomic})`,
+      };
+    }
+
+    const escrowRefundAfterUnix = Number(escrowBody?.refund_after_unix);
+    if (!Number.isFinite(escrowRefundAfterUnix) || !Number.isInteger(escrowRefundAfterUnix) || escrowRefundAfterUnix <= 0) {
+      return { ok: false, error: 'escrowBody.refund_after_unix is required' };
+    }
+    const onchainRefundAfterUnix = Number(md.refund_after_unix);
+    if (!Number.isFinite(onchainRefundAfterUnix) || !Number.isInteger(onchainRefundAfterUnix) || onchainRefundAfterUnix <= 0) {
+      return { ok: false, error: 'on-chain refund_after_unix is missing' };
+    }
+    if (onchainRefundAfterUnix !== escrowRefundAfterUnix) {
+      return {
+        ok: false,
+        error: `refund_after_unix mismatch vs on-chain (expected=${escrowRefundAfterUnix}, got=${onchainRefundAfterUnix})`,
+      };
+    }
+    if (terms?.sol_refund_after_unix !== undefined && terms?.sol_refund_after_unix !== null) {
+      const termsRefundAfterUnix = Number(terms.sol_refund_after_unix);
+      if (
+        !Number.isFinite(termsRefundAfterUnix) ||
+        !Number.isInteger(termsRefundAfterUnix) ||
+        termsRefundAfterUnix <= 0
+      ) {
+        return { ok: false, error: 'terms.sol_refund_after_unix is invalid' };
+      }
+      if (termsRefundAfterUnix !== onchainRefundAfterUnix) {
+        return {
+          ok: false,
+          error: `refund_after_unix mismatch vs terms (expected=${termsRefundAfterUnix}, got=${onchainRefundAfterUnix})`,
+        };
+      }
+    }
+
+    let expectedHtlcAddress = '';
+    let escrowHtlcAddress = '';
+    let onchainHtlcAddress = '';
+    try {
+      expectedHtlcAddress = normalizeAddress(this.htlcAddress, 'TAO_EVM_HTLC_ADDRESS');
+      escrowHtlcAddress = normalizeAddress(escrowBody?.htlc_address, 'escrowBody.htlc_address');
+      onchainHtlcAddress = normalizeAddress(md.contract_address || this.htlcAddress, 'on-chain contract_address');
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+    if (escrowHtlcAddress !== expectedHtlcAddress) {
+      return {
+        ok: false,
+        error: `htlc_address mismatch vs configured TAO_EVM_HTLC_ADDRESS (expected=${expectedHtlcAddress}, got=${escrowHtlcAddress})`,
+      };
+    }
+    if (onchainHtlcAddress !== expectedHtlcAddress) {
+      return {
+        ok: false,
+        error: `on-chain HTLC address mismatch (expected=${expectedHtlcAddress}, got=${onchainHtlcAddress})`,
+      };
+    }
+
+    let escrowRecipient = '';
+    let onchainRecipient = '';
+    let termsRecipient = '';
+    let escrowRefund = '';
+    let onchainSender = '';
+    let termsRefund = '';
+    try {
+      escrowRecipient = normalizeAddress(escrowBody?.recipient, 'escrowBody.recipient');
+      onchainRecipient = normalizeAddress(md.receiver, 'on-chain receiver');
+      if (terms?.sol_recipient !== undefined && terms?.sol_recipient !== null) {
+        termsRecipient = normalizeAddress(terms.sol_recipient, 'terms.sol_recipient');
+      }
+      escrowRefund = normalizeAddress(escrowBody?.refund, 'escrowBody.refund');
+      onchainSender = normalizeAddress(md.sender, 'on-chain sender');
+      if (terms?.sol_refund !== undefined && terms?.sol_refund !== null) {
+        termsRefund = normalizeAddress(terms.sol_refund, 'terms.sol_refund');
+      }
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+    if (onchainRecipient !== escrowRecipient) {
+      return {
+        ok: false,
+        error: `recipient mismatch vs on-chain receiver (expected=${escrowRecipient}, got=${onchainRecipient})`,
+      };
+    }
+    if (termsRecipient && onchainRecipient !== termsRecipient) {
+      return {
+        ok: false,
+        error: `recipient mismatch vs terms (expected=${termsRecipient}, got=${onchainRecipient})`,
+      };
+    }
+    if (onchainSender !== escrowRefund) {
+      return {
+        ok: false,
+        error: `refund mismatch vs on-chain sender (expected=${escrowRefund}, got=${onchainSender})`,
+      };
+    }
+    if (termsRefund && onchainSender !== termsRefund) {
+      return {
+        ok: false,
+        error: `refund mismatch vs terms (expected=${termsRefund}, got=${onchainSender})`,
+      };
+    }
+
     return {
       ok: true,
       error: null,

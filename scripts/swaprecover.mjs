@@ -119,26 +119,38 @@ function getSettlementIdForTrade(trade, settlementKind) {
   return id;
 }
 
-function buildSettlementProvider({ settlementKind, flags, trade }) {
+function buildSettlementProvider({ settlementKind, flags, trade, command = '' }) {
+  const cmd = String(command || '').trim().toLowerCase();
+  const statusHint =
+    cmd === 'status' || cmd === 'inspect'
+      ? ' (status/inspect currently use the same provider path and require signer config)'
+      : '';
+
   if (settlementKind === SETTLEMENT_KIND.TAO_EVM) {
     const taoChainId = parsePosIntOrNull(process.env.TAO_EVM_CHAIN_ID, 'TAO_EVM_CHAIN_ID') || 964;
     const taoConfirmations =
       parsePosIntOrNull(process.env.TAO_EVM_CONFIRMATIONS, 'TAO_EVM_CONFIRMATIONS') || 1;
     const taoHtlcAddress =
       String(trade?.tao_htlc_address || process.env.TAO_EVM_HTLC_ADDRESS || '').trim();
+    const taoPrivateKey = String(process.env.TAO_EVM_PRIVATE_KEY || '').trim();
+    if (!taoPrivateKey) {
+      die(`Missing TAO_EVM_PRIVATE_KEY${statusHint}`);
+    }
     return getSettlementProvider(settlementKind, {
       taoEvm: {
         rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
         chainId: taoChainId,
-        privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
+        privateKey: taoPrivateKey,
         confirmations: taoConfirmations,
         htlcAddress: taoHtlcAddress,
       },
     });
   }
 
-  const rpcUrl = requireFlag(flags, 'solana-rpc-url');
-  const keyPath = requireFlag(flags, 'solana-keypair');
+  const rpcUrl = flags.get('solana-rpc-url');
+  if (!rpcUrl || rpcUrl === true) die(`Missing --solana-rpc-url${statusHint}`);
+  const keyPath = flags.get('solana-keypair');
+  if (!keyPath || keyPath === true) die(`Missing --solana-keypair${statusHint}`);
   const commitment = flags.get('commitment') ? String(flags.get('commitment')).trim() : 'confirmed';
   const computeUnitLimit = parsePosIntOrNull(flags.get('solana-cu-limit'), 'solana-cu-limit');
   const computeUnitPriceMicroLamports = parsePosIntOrNull(flags.get('solana-cu-price'), 'solana-cu-price');
@@ -149,9 +161,9 @@ function buildSettlementProvider({ settlementKind, flags, trade }) {
 
   return getSettlementProvider(settlementKind, {
     solana: {
-      rpcUrls: rpcUrl,
+      rpcUrls: String(rpcUrl),
       commitment,
-      keypairPath: keyPath,
+      keypairPath: String(keyPath),
       mint,
       programId,
       computeUnitLimit,
@@ -314,7 +326,7 @@ async function main() {
       const settlementKind = resolveEffectiveSettlementKind(trade, requestedSettlementKind);
       const hash = normalizeHex32(trade.ln_payment_hash_hex, 'ln_payment_hash_hex');
       const settlementId = getSettlementIdForTrade(trade, settlementKind);
-      const settlement = buildSettlementProvider({ settlementKind, flags, trade });
+      const settlement = buildSettlementProvider({ settlementKind, flags, trade, command: cmd });
 
       const out = await runStatus({ settlement, settlementKind, trade, settlementId, paymentHashHex: hash });
       process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
@@ -333,7 +345,7 @@ async function main() {
       const hash = normalizeHex32(trade.ln_payment_hash_hex, 'ln_payment_hash_hex');
       const preimageHex = normalizeHex32(trade.ln_preimage_hex, 'ln_preimage_hex');
       const settlementId = getSettlementIdForTrade(trade, settlementKind);
-      const settlement = buildSettlementProvider({ settlementKind, flags, trade });
+      const settlement = buildSettlementProvider({ settlementKind, flags, trade, command: cmd });
 
       if (settlementKind === SETTLEMENT_KIND.SOLANA) {
         const signerAddress = await settlement.getSignerAddress();
@@ -401,7 +413,7 @@ async function main() {
       const settlementKind = resolveEffectiveSettlementKind(trade, requestedSettlementKind);
       const hash = normalizeHex32(trade.ln_payment_hash_hex, 'ln_payment_hash_hex');
       const settlementId = getSettlementIdForTrade(trade, settlementKind);
-      const settlement = buildSettlementProvider({ settlementKind, flags, trade });
+      const settlement = buildSettlementProvider({ settlementKind, flags, trade, command: cmd });
 
       if (settlementKind === SETTLEMENT_KIND.SOLANA) {
         const signerAddress = await settlement.getSignerAddress();
