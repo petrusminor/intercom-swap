@@ -18,9 +18,12 @@ import { lnInvoice } from '../src/ln/client.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
 import {
-  SolanaSettlementProvider,
+  getSettlementProvider,
+  getSettlementAppBinding,
+  normalizeSettlementKind,
+  SETTLEMENT_KIND,
   SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
-} from '../settlement/solana/SolanaSettlementProvider.js';
+} from '../settlement/providerFactory.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -135,6 +138,9 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 750);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
+  const settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
+  const isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
+  const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
 
   const receiptsDbPath = flags.get('receipts-db') ? String(flags.get('receipts-db')).trim() : '';
 
@@ -189,13 +195,23 @@ async function main() {
   const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
 
   const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
-  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: expectedProgramId });
+  const settlementProgramId = getSettlementAppBinding(settlementKind, {
+    solanaProgramId: expectedProgramId,
+    taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
+  });
+  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: settlementProgramId });
 
   const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
 
   if (runSwap) {
-    if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1)');
-    if (!solMintStr) die('Missing --solana-mint (required when --run-swap 1)');
+    if (isSolanaSettlement) {
+      if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1 and --settlement solana)');
+      if (!solMintStr) die('Missing --solana-mint (required when --run-swap 1 and --settlement solana)');
+    }
+    if (isTaoSettlement) {
+      if (!process.env.TAO_EVM_PRIVATE_KEY) die('Missing TAO_EVM_PRIVATE_KEY (required when --settlement tao-evm)');
+      if (!process.env.TAO_EVM_HTLC_ADDRESS) die('Missing TAO_EVM_HTLC_ADDRESS (required when --settlement tao-evm)');
+    }
     if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
   }
 
@@ -286,22 +302,32 @@ async function main() {
   const sol = runSwap
     ? await (async () => {
         /** @type {import('../settlement/SettlementProvider').SettlementProvider} */
-        const settlement = new SolanaSettlementProvider({
-          rpcUrls: solRpcUrl,
-          commitment: 'confirmed',
-          keypairPath: solKeypairPath,
-          mint: solMintStr,
-          programId: expectedProgramId,
-          tradeFeeCollector: solTradeFeeCollectorStr || '',
-          computeUnitLimit: solComputeUnitLimit,
-          computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
+        const settlement = getSettlementProvider(settlementKind, {
+          solana: {
+            rpcUrls: solRpcUrl,
+            commitment: 'confirmed',
+            keypairPath: solKeypairPath,
+            mint: solMintStr,
+            programId: expectedProgramId,
+            tradeFeeCollector: solTradeFeeCollectorStr || '',
+            computeUnitLimit: solComputeUnitLimit,
+            computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
+          },
+          taoEvm: {
+            rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
+            chainId: 964,
+            privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
+            confirmations: 1,
+            htlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
+          },
         });
         return {
           settlement,
-          mint: solMintStr,
-          programId: expectedProgramId,
+          kind: settlementKind,
+          mint: isSolanaSettlement ? solMintStr : settlementProgramId,
+          programId: settlementProgramId,
           refundAddress: await settlement.getSignerAddress(),
-          tradeFeeCollector: solTradeFeeCollectorStr || null,
+          tradeFeeCollector: isSolanaSettlement ? (solTradeFeeCollectorStr || null) : null,
         };
       })()
     : null;
@@ -561,34 +587,59 @@ async function main() {
       refundAfterUnix,
       terms: ctx.trade.terms,
     });
-    const escrowPda = lock.settlementId;
-    const escrowSig = lock.txId;
+    const settlementId = lock.settlementId;
+    const settlementTxId = lock.txId;
     const lockMeta = lock?.metadata && typeof lock.metadata === 'object' ? lock.metadata : {};
-    const vaultAta = String(lockMeta.vault_ata || '').trim();
-    if (!vaultAta) throw new Error('settlement metadata missing vault_ata');
-    const programId = String(lockMeta.program_id || sol.programId).trim();
-    const mint = String(lockMeta.mint || sol.mint).trim();
-    const recipient = String(lockMeta.recipient || ctx.solRecipient).trim();
-    const refund = String(lockMeta.refund || sol.refundAddress).trim();
 
-    const solEscrowUnsigned = createUnsignedEnvelope({
-      v: 1,
-      kind: KIND.SOL_ESCROW_CREATED,
-      tradeId: ctx.tradeId,
-      body: {
-        payment_hash_hex: paymentHashHex,
-        program_id: programId,
-        escrow_pda: escrowPda,
-        vault_ata: vaultAta,
-        mint,
-        amount: String(ctx.usdtAmount),
-        refund_after_unix: refundAfterUnix,
-        recipient,
-        refund,
-        tx_sig: escrowSig,
-      },
-    });
-    const solEscrowSigned = signSwapEnvelope(solEscrowUnsigned, signing);
+    const escrowUnsigned = isTaoSettlement
+      ? createUnsignedEnvelope({
+          v: 1,
+          kind: KIND.TAO_HTLC_LOCKED,
+          tradeId: ctx.tradeId,
+          body: {
+            payment_hash_hex: paymentHashHex,
+            settlement_id: settlementId,
+            htlc_address: String(lockMeta.contract_address || sol.programId).trim(),
+            amount_atomic: String(lockMeta.amount_atomic || ctx.usdtAmount),
+            refund_after_unix: Number(lockMeta.refund_after_unix || refundAfterUnix),
+            recipient: String(lockMeta.receiver || ctx.solRecipient).trim(),
+            refund: String(lockMeta.sender || sol.refundAddress).trim(),
+            tx_id: settlementTxId,
+            fee_snapshot: {
+              platform_fee_bps: Number(ctx.trade.terms?.platform_fee_bps || 0),
+              platform_fee_collector: ctx.trade.terms?.platform_fee_collector || null,
+              trade_fee_bps: Number(ctx.trade.terms?.trade_fee_bps || 0),
+              trade_fee_collector: ctx.trade.terms?.trade_fee_collector || null,
+            },
+          },
+        })
+      : (() => {
+          const vaultAta = String(lockMeta.vault_ata || '').trim();
+          if (!vaultAta) throw new Error('settlement metadata missing vault_ata');
+          const programId = String(lockMeta.program_id || sol.programId).trim();
+          const mint = String(lockMeta.mint || sol.mint).trim();
+          const recipient = String(lockMeta.recipient || ctx.solRecipient).trim();
+          const refund = String(lockMeta.refund || sol.refundAddress).trim();
+          return createUnsignedEnvelope({
+            v: 1,
+            kind: KIND.SOL_ESCROW_CREATED,
+            tradeId: ctx.tradeId,
+            body: {
+              payment_hash_hex: paymentHashHex,
+              program_id: programId,
+              escrow_pda: settlementId,
+              vault_ata: vaultAta,
+              mint,
+              amount: String(ctx.usdtAmount),
+              refund_after_unix: refundAfterUnix,
+              recipient,
+              refund,
+              tx_sig: settlementTxId,
+            },
+          });
+        })();
+
+    const solEscrowSigned = signSwapEnvelope(escrowUnsigned, signing);
     {
       const r = applySwapEnvelope(ctx.trade, solEscrowSigned);
       if (!r.ok) throw new Error(r.error);
@@ -597,23 +648,47 @@ async function main() {
     ctx.sent.escrow = solEscrowSigned;
     await sc.send(ctx.swapChannel, solEscrowSigned, { invite: ctx.invite || null });
     ctx.lastEscrowSendAtMs = Date.now();
-    process.stdout.write(`${JSON.stringify({ type: 'sol_escrow_sent', trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, tx_sig: escrowSig })}\n`);
-
-    persistTrade(
-      ctx.tradeId,
-      {
-        sol_program_id: solEscrowSigned.body.program_id,
-        sol_mint: solEscrowSigned.body.mint,
-        sol_escrow_pda: solEscrowSigned.body.escrow_pda,
-        sol_vault_ata: solEscrowSigned.body.vault_ata,
-        sol_refund_after_unix: solEscrowSigned.body.refund_after_unix,
-        sol_recipient: solEscrowSigned.body.recipient,
-        sol_refund: solEscrowSigned.body.refund,
-        state: ctx.trade.state,
-      },
-      'sol_escrow_sent',
-      solEscrowSigned
+    process.stdout.write(
+      `${JSON.stringify({
+        type: isTaoSettlement ? 'tao_htlc_locked_sent' : 'sol_escrow_sent',
+        trade_id: ctx.tradeId,
+        swap_channel: ctx.swapChannel,
+        tx_id: isTaoSettlement ? settlementTxId : undefined,
+        tx_sig: isTaoSettlement ? undefined : settlementTxId,
+      })}\n`
     );
+
+    if (isTaoSettlement) {
+      persistTrade(
+        ctx.tradeId,
+        {
+          tao_htlc_address: solEscrowSigned.body.htlc_address,
+          tao_settlement_id: solEscrowSigned.body.settlement_id,
+          tao_refund_after_unix: solEscrowSigned.body.refund_after_unix,
+          tao_recipient: solEscrowSigned.body.recipient,
+          tao_refund: solEscrowSigned.body.refund,
+          state: ctx.trade.state,
+        },
+        'tao_htlc_locked_sent',
+        solEscrowSigned
+      );
+    } else {
+      persistTrade(
+        ctx.tradeId,
+        {
+          sol_program_id: solEscrowSigned.body.program_id,
+          sol_mint: solEscrowSigned.body.mint,
+          sol_escrow_pda: solEscrowSigned.body.escrow_pda,
+          sol_vault_ata: solEscrowSigned.body.vault_ata,
+          sol_refund_after_unix: solEscrowSigned.body.refund_after_unix,
+          sol_recipient: solEscrowSigned.body.recipient,
+          sol_refund: solEscrowSigned.body.refund,
+          state: ctx.trade.state,
+        },
+        'sol_escrow_sent',
+        solEscrowSigned
+      );
+    }
   };
 
   const startSwapResender = (ctx) => {

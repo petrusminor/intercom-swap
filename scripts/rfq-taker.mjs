@@ -17,9 +17,12 @@ import { lnPay } from '../src/ln/client.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
 import {
-  SolanaSettlementProvider,
+  getSettlementProvider,
+  getSettlementAppBinding,
+  normalizeSettlementKind,
+  SETTLEMENT_KIND,
   SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
-} from '../settlement/solana/SolanaSettlementProvider.js';
+} from '../settlement/providerFactory.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -148,6 +151,9 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 200);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
+  const settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
+  const isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
+  const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
 
   const runSwap = parseBool(flags.get('run-swap'), false);
   const swapTimeoutSec = parseIntFlag(flags.get('swap-timeout-sec'), 'swap-timeout-sec', 300);
@@ -217,12 +223,22 @@ async function main() {
   const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
 
   const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
-  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: expectedProgramId });
+  const settlementProgramId = getSettlementAppBinding(settlementKind, {
+    solanaProgramId: expectedProgramId,
+    taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
+  });
+  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: settlementProgramId });
 
   const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
 
   if (runSwap) {
-    if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1)');
+    if (isSolanaSettlement) {
+      if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1 and --settlement solana)');
+    }
+    if (isTaoSettlement) {
+      if (!process.env.TAO_EVM_PRIVATE_KEY) die('Missing TAO_EVM_PRIVATE_KEY (required when --settlement tao-evm)');
+      if (!process.env.TAO_EVM_HTLC_ADDRESS) die('Missing TAO_EVM_HTLC_ADDRESS (required when --settlement tao-evm)');
+    }
     if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
   }
 
@@ -274,19 +290,29 @@ async function main() {
   const sol = runSwap
     ? await (async () => {
         /** @type {import('../settlement/SettlementProvider').SettlementProvider} */
-        const settlement = new SolanaSettlementProvider({
-          rpcUrls: solRpcUrl,
-          commitment: 'confirmed',
-          keypairPath: solKeypairPath,
-          mint: solMintStr,
-          programId: expectedProgramId,
-          computeUnitLimit: solComputeUnitLimit,
-          computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
+        const settlement = getSettlementProvider(settlementKind, {
+          solana: {
+            rpcUrls: solRpcUrl,
+            commitment: 'confirmed',
+            keypairPath: solKeypairPath,
+            mint: solMintStr,
+            programId: expectedProgramId,
+            computeUnitLimit: solComputeUnitLimit,
+            computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
+          },
+          taoEvm: {
+            rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
+            chainId: 964,
+            privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
+            confirmations: 1,
+            htlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
+          },
         });
         return {
           settlement,
+          kind: settlementKind,
           recipientAddress: await settlement.getSignerAddress(),
-          expectedProgramId,
+          expectedProgramId: settlementProgramId,
         };
       })()
     : null;
@@ -783,14 +809,17 @@ async function main() {
     }, Math.max(swapResendMs, 200));
     swapCtx.timers.add(acceptTimer);
 
-    // Wait for invoice + escrow proof.
+    // Wait for invoice + settlement lock proof.
     await waitForSwapMessage((m) => m?.kind === KIND.LN_INVOICE && m?.trade_id === tradeId, {
       timeoutMs: swapTimeoutSec * 1000,
       label: 'LN_INVOICE',
     });
-    await waitForSwapMessage((m) => m?.kind === KIND.SOL_ESCROW_CREATED && m?.trade_id === tradeId, {
+    await waitForSwapMessage((m) => {
+      if (!m || m?.trade_id !== tradeId) return false;
+      return isTaoSettlement ? m?.kind === KIND.TAO_HTLC_LOCKED : m?.kind === KIND.SOL_ESCROW_CREATED;
+    }, {
       timeoutMs: swapTimeoutSec * 1000,
-      label: 'SOL_ESCROW_CREATED',
+      label: isTaoSettlement ? 'TAO_HTLC_LOCKED' : 'SOL_ESCROW_CREATED',
     });
 
     if (swapCtx.trade.invoice) {
@@ -805,7 +834,7 @@ async function main() {
       );
     }
     if (swapCtx.trade.escrow) {
-      if (sol?.expectedProgramId) {
+      if (sol?.expectedProgramId && isSolanaSettlement) {
         const gotProgram = String(swapCtx.trade.escrow.program_id || '').trim();
         const wantProgram = String(sol.expectedProgramId || '').trim();
         if (!gotProgram) throw new Error('escrow.program_id missing');
@@ -813,23 +842,46 @@ async function main() {
           throw new Error(`escrow.program_id mismatch (got=${gotProgram} want=${wantProgram})`);
         }
       }
-      persistTrade(
-        {
-          sol_program_id: swapCtx.trade.escrow.program_id,
-          sol_mint: swapCtx.trade.escrow.mint,
-          sol_recipient: swapCtx.trade.escrow.recipient,
-          sol_refund: swapCtx.trade.escrow.refund,
-          sol_escrow_pda: swapCtx.trade.escrow.escrow_pda,
-          sol_vault_ata: swapCtx.trade.escrow.vault_ata,
-          sol_refund_after_unix: swapCtx.trade.escrow.refund_after_unix,
-          state: swapCtx.trade.state,
-        },
-        'sol_escrow_recv',
-        swapCtx.trade.escrow
-      );
+      if (sol?.expectedProgramId && isTaoSettlement) {
+        const gotProgram = String(swapCtx.trade.escrow.htlc_address || '').trim();
+        const wantProgram = String(sol.expectedProgramId || '').trim();
+        if (!gotProgram) throw new Error('escrow.htlc_address missing');
+        if (gotProgram.toLowerCase() !== wantProgram.toLowerCase()) {
+          throw new Error(`escrow.htlc_address mismatch (got=${gotProgram} want=${wantProgram})`);
+        }
+      }
+      if (isTaoSettlement) {
+        persistTrade(
+          {
+            tao_htlc_address: swapCtx.trade.escrow.htlc_address,
+            tao_settlement_id: swapCtx.trade.escrow.settlement_id,
+            tao_recipient: swapCtx.trade.escrow.recipient,
+            tao_refund: swapCtx.trade.escrow.refund,
+            tao_refund_after_unix: swapCtx.trade.escrow.refund_after_unix,
+            state: swapCtx.trade.state,
+          },
+          'tao_htlc_locked_recv',
+          swapCtx.trade.escrow
+        );
+      } else {
+        persistTrade(
+          {
+            sol_program_id: swapCtx.trade.escrow.program_id,
+            sol_mint: swapCtx.trade.escrow.mint,
+            sol_recipient: swapCtx.trade.escrow.recipient,
+            sol_refund: swapCtx.trade.escrow.refund,
+            sol_escrow_pda: swapCtx.trade.escrow.escrow_pda,
+            sol_vault_ata: swapCtx.trade.escrow.vault_ata,
+            sol_refund_after_unix: swapCtx.trade.escrow.refund_after_unix,
+            state: swapCtx.trade.state,
+          },
+          'sol_escrow_recv',
+          swapCtx.trade.escrow
+        );
+      }
     }
 
-    // Hard rule: verify escrow on-chain before paying.
+    // Hard rule: verify settlement lock on-chain before paying.
     const prepay = await sol.settlement.verifySwapPrePayOnchain({
       terms: swapCtx.trade.terms,
       invoiceBody: swapCtx.trade.invoice,
@@ -839,7 +891,7 @@ async function main() {
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
     // Defense-in-depth: ensure the on-chain escrow fee receiver settings match the negotiated TERMS, otherwise
     // claim could fail (wrong trade fee vault PDA) or fees could be misrepresented.
-    if (prepay?.onchain?.state?.v === 3) {
+    if (isSolanaSettlement && prepay?.onchain?.state?.v === 3) {
       const st = prepay.onchain.state;
       const wantTradeFeeCollector = String(swapCtx.trade.terms?.trade_fee_collector || '').trim();
       const gotTradeFeeCollector = String(st.tradeFeeCollector || '').trim();
@@ -912,28 +964,49 @@ async function main() {
       process.exit(0);
     }
 
-    // Claim escrow on Solana.
-    const settlementId = String(swapCtx.trade.escrow?.escrow_pda || '').trim();
+    // Claim settlement lock on-chain.
+    const settlementId = String(isTaoSettlement ? swapCtx.trade.escrow?.settlement_id : swapCtx.trade.escrow?.escrow_pda || '').trim();
     if (!settlementId) throw new Error('Missing escrow settlementId');
     const claimRes = await sol.settlement.claim({ settlementId, preimageHex });
     const claimSig = String(claimRes?.txId || '').trim();
     if (!claimSig) throw new Error('Missing claim txId from settlement provider');
 
-  const solClaimedUnsigned = createUnsignedEnvelope({
-    v: 1,
-    kind: KIND.SOL_CLAIMED,
-    tradeId,
-    body: {
-      payment_hash_hex: paymentHashHex,
-      escrow_pda: swapCtx.trade.escrow.escrow_pda,
-      tx_sig: claimSig,
-    },
-  });
+  const solClaimedUnsigned = createUnsignedEnvelope(
+    isTaoSettlement
+      ? {
+          v: 1,
+          kind: KIND.TAO_CLAIMED,
+          tradeId,
+          body: {
+            payment_hash_hex: paymentHashHex,
+            settlement_id: settlementId,
+            tx_id: claimSig,
+          },
+        }
+      : {
+          v: 1,
+          kind: KIND.SOL_CLAIMED,
+          tradeId,
+          body: {
+            payment_hash_hex: paymentHashHex,
+            escrow_pda: swapCtx.trade.escrow.escrow_pda,
+            tx_sig: claimSig,
+          },
+        }
+  );
   const solClaimedSigned = signSwapEnvelope(solClaimedUnsigned, signing);
   swapCtx.sent.sol_claimed = solClaimedSigned;
   await sc.send(swapChannel, solClaimedSigned);
-    process.stdout.write(`${JSON.stringify({ type: 'sol_claimed_sent', trade_id: tradeId, swap_channel: swapChannel, tx_sig: claimSig })}\n`);
-    persistTrade({ state: swapCtx.trade.state }, 'sol_claimed', solClaimedSigned);
+    process.stdout.write(
+      `${JSON.stringify({
+        type: isTaoSettlement ? 'tao_claimed_sent' : 'sol_claimed_sent',
+        trade_id: tradeId,
+        swap_channel: swapChannel,
+        tx_id: isTaoSettlement ? claimSig : undefined,
+        tx_sig: isTaoSettlement ? undefined : claimSig,
+      })}\n`
+    );
+    persistTrade({ state: swapCtx.trade.state }, isTaoSettlement ? 'tao_claimed' : 'sol_claimed', solClaimedSigned);
 
     // Best-effort: resend final proofs a few times to reduce "sent but peer exited" flakiness.
     for (let i = 0; i < 3; i += 1) {

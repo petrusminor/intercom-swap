@@ -319,8 +319,68 @@ export class TaoEvmSettlementProvider {
     }
   }
 
-  async verifySwapPrePayOnchain(_input) {
-    this._phaseLater('verifySwapPrePayOnchain');
+  async verifySwapPrePayOnchain(input = {}) {
+    const terms = parseMetadataObject(input?.terms);
+    const invoiceBody = parseMetadataObject(input?.invoiceBody);
+    const escrowBody = parseMetadataObject(input?.escrowBody);
+
+    const settlementId = String(escrowBody?.settlement_id || '').trim();
+    if (!settlementId) return { ok: false, error: 'escrowBody.settlement_id is required' };
+
+    const paymentHashHex = String(invoiceBody?.payment_hash_hex || escrowBody?.payment_hash_hex || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(paymentHashHex)) {
+      return { ok: false, error: 'payment_hash_hex is required' };
+    }
+
+    if (String(escrowBody?.payment_hash_hex || '').trim().toLowerCase() !== paymentHashHex) {
+      return { ok: false, error: 'payment_hash mismatch (invoice vs lock message)' };
+    }
+
+    if (terms?.sol_recipient !== undefined && String(terms.sol_recipient).trim() !== String(escrowBody?.recipient || '').trim()) {
+      return { ok: false, error: 'lock recipient mismatch vs terms' };
+    }
+    if (terms?.sol_refund !== undefined && String(terms.sol_refund).trim() !== String(escrowBody?.refund || '').trim()) {
+      return { ok: false, error: 'lock refund mismatch vs terms' };
+    }
+    if (terms?.usdt_amount !== undefined && String(terms.usdt_amount).trim() !== String(escrowBody?.amount_atomic || '').trim()) {
+      return { ok: false, error: 'lock amount mismatch vs terms' };
+    }
+    if (
+      terms?.sol_refund_after_unix !== undefined &&
+      terms?.sol_refund_after_unix !== null &&
+      Number(escrowBody?.refund_after_unix) < Number(terms.sol_refund_after_unix)
+    ) {
+      return { ok: false, error: 'lock refund_after_unix earlier than terms' };
+    }
+
+    const verify = await this.verifyPrePay({
+      settlementId,
+      paymentHashHex,
+      ...(input?.nowUnix !== undefined && input?.nowUnix !== null ? { nowUnix: input.nowUnix } : {}),
+    });
+    if (!verify.ok) {
+      return { ok: false, error: verify.error, metadata: verify.metadata };
+    }
+
+    const md = parseMetadataObject(verify.metadata);
+    return {
+      ok: true,
+      error: null,
+      metadata: md,
+      onchain: {
+        state: {
+          settlementId: String(md.settlement_id || settlementId),
+          sender: String(md.sender || ''),
+          receiver: String(md.receiver || ''),
+          amountAtomic: String(md.amount_atomic || ''),
+          refundAfterUnix: Number(md.refund_after_unix || 0),
+          claimed: Boolean(md.claimed),
+          refunded: Boolean(md.refunded),
+          hashlock: String(md.hashlock || ''),
+          contractAddress: String(md.contract_address || this.htlcAddress || ''),
+        },
+      },
+    };
   }
 
   async claim(input) {

@@ -23,9 +23,12 @@ export const KIND = Object.freeze({
 
   LN_INVOICE: 'swap.ln_invoice',
   SOL_ESCROW_CREATED: 'swap.sol_escrow_created',
+  TAO_HTLC_LOCKED: 'swap.tao_htlc_locked',
   LN_PAID: 'swap.ln_paid',
   SOL_CLAIMED: 'swap.sol_claimed',
+  TAO_CLAIMED: 'swap.tao_claimed',
   SOL_REFUNDED: 'swap.sol_refunded',
+  TAO_REFUNDED: 'swap.tao_refunded',
 });
 
 export const STATE = Object.freeze({

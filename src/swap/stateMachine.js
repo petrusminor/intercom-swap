@@ -187,47 +187,69 @@ export function applySwapEnvelope(trade, envelope) {
       return { ok: true, error: null, trade: next };
     }
 
-    case KIND.SOL_ESCROW_CREATED: {
+    case KIND.SOL_ESCROW_CREATED:
+    case KIND.TAO_HTLC_LOCKED: {
+      const isTao = envelope.kind === KIND.TAO_HTLC_LOCKED;
+      const label = isTao ? 'TAO_HTLC_LOCKED' : 'SOL_ESCROW_CREATED';
       if (![STATE.INVOICE, STATE.ESCROW].includes(next.state)) {
-        return { ok: false, error: `SOL_ESCROW_CREATED not allowed in state=${next.state}`, trade: null };
+        return { ok: false, error: `${label} not allowed in state=${next.state}`, trade: null };
       }
-      if (!next.terms) return { ok: false, error: 'SOL_ESCROW_CREATED requires terms', trade: null };
-      if (!next.invoice) return { ok: false, error: 'SOL_ESCROW_CREATED requires invoice', trade: null };
-      const rs = requireSigner(envelope, next.terms.ln_receiver_peer, 'sol_escrow_created');
+      if (!next.terms) return { ok: false, error: `${label} requires terms`, trade: null };
+      if (!next.invoice) return { ok: false, error: `${label} requires invoice`, trade: null };
+      const rs = requireSigner(envelope, next.terms.ln_receiver_peer, isTao ? 'tao_htlc_locked' : 'sol_escrow_created');
       if (!rs.ok) return { ok: false, error: rs.error, trade: null };
       if (normalizeHex(envelope.body.payment_hash_hex) !== normalizeHex(next.invoice.payment_hash_hex)) {
-        return { ok: false, error: 'SOL escrow payment_hash mismatch vs invoice', trade: null };
+        return { ok: false, error: `${isTao ? 'TAO HTLC' : 'SOL escrow'} payment_hash mismatch vs invoice`, trade: null };
       }
-      // Basic cross-checks with terms.
-      if (envelope.body.recipient !== next.terms.sol_recipient) {
-        return { ok: false, error: 'SOL escrow recipient mismatch vs terms', trade: null };
+
+      // Cross-checks with terms.
+      if (String(envelope.body.recipient) !== String(next.terms.sol_recipient)) {
+        return { ok: false, error: `${isTao ? 'TAO HTLC' : 'SOL escrow'} recipient mismatch vs terms`, trade: null };
       }
-      if (envelope.body.refund !== next.terms.sol_refund) {
-        return { ok: false, error: 'SOL escrow refund mismatch vs terms', trade: null };
+      if (String(envelope.body.refund) !== String(next.terms.sol_refund)) {
+        return { ok: false, error: `${isTao ? 'TAO HTLC' : 'SOL escrow'} refund mismatch vs terms`, trade: null };
       }
-      if (envelope.body.mint !== next.terms.sol_mint) {
-        return { ok: false, error: 'SOL escrow mint mismatch vs terms', trade: null };
+      if (String(envelope.body.refund_after_unix) && Number(envelope.body.refund_after_unix) < Number(next.terms.sol_refund_after_unix)) {
+        return { ok: false, error: `${isTao ? 'TAO HTLC' : 'SOL escrow'} refund_after_unix earlier than terms`, trade: null };
       }
-      if (String(envelope.body.amount) !== String(next.terms.usdt_amount)) {
-        return { ok: false, error: 'SOL escrow amount mismatch vs terms', trade: null };
-      }
-      if (Number(envelope.body.refund_after_unix) < Number(next.terms.sol_refund_after_unix)) {
-        return { ok: false, error: 'SOL escrow refund_after_unix earlier than terms', trade: null };
-      }
-      if (next.escrow) {
-        // Idempotent replay: escrow details must remain stable for a trade.
-        if (String(next.escrow.escrow_pda) !== String(envelope.body.escrow_pda)) {
-          return { ok: false, error: 'SOL escrow escrow_pda mismatch vs prior escrow', trade: null };
+
+      if (isTao) {
+        if (String(envelope.body.amount_atomic) !== String(next.terms.usdt_amount)) {
+          return { ok: false, error: 'TAO HTLC amount_atomic mismatch vs terms', trade: null };
         }
-        if (String(next.escrow.vault_ata) !== String(envelope.body.vault_ata)) {
-          return { ok: false, error: 'SOL escrow vault_ata mismatch vs prior escrow', trade: null };
-        }
-        if (String(next.escrow.tx_sig) !== String(envelope.body.tx_sig)) {
-          return { ok: false, error: 'SOL escrow tx_sig mismatch vs prior escrow', trade: null };
+        if (next.escrow) {
+          if (String(next.escrow.settlement_id) !== String(envelope.body.settlement_id)) {
+            return { ok: false, error: 'TAO HTLC settlement_id mismatch vs prior lock', trade: null };
+          }
+          if (String(next.escrow.tx_id) !== String(envelope.body.tx_id)) {
+            return { ok: false, error: 'TAO HTLC tx_id mismatch vs prior lock', trade: null };
+          }
+        } else {
+          next.escrow = envelope.body;
         }
       } else {
-        next.escrow = envelope.body;
+        if (envelope.body.mint !== next.terms.sol_mint) {
+          return { ok: false, error: 'SOL escrow mint mismatch vs terms', trade: null };
+        }
+        if (String(envelope.body.amount) !== String(next.terms.usdt_amount)) {
+          return { ok: false, error: 'SOL escrow amount mismatch vs terms', trade: null };
+        }
+        if (next.escrow) {
+          // Idempotent replay: escrow details must remain stable for a trade.
+          if (String(next.escrow.escrow_pda) !== String(envelope.body.escrow_pda)) {
+            return { ok: false, error: 'SOL escrow escrow_pda mismatch vs prior escrow', trade: null };
+          }
+          if (String(next.escrow.vault_ata) !== String(envelope.body.vault_ata)) {
+            return { ok: false, error: 'SOL escrow vault_ata mismatch vs prior escrow', trade: null };
+          }
+          if (String(next.escrow.tx_sig) !== String(envelope.body.tx_sig)) {
+            return { ok: false, error: 'SOL escrow tx_sig mismatch vs prior escrow', trade: null };
+          }
+        } else {
+          next.escrow = envelope.body;
+        }
       }
+
       next.state = STATE.ESCROW;
       return { ok: true, error: null, trade: next };
     }
@@ -263,57 +285,82 @@ export function applySwapEnvelope(trade, envelope) {
       return { ok: true, error: null, trade: next };
     }
 
-    case KIND.SOL_CLAIMED: {
+    case KIND.SOL_CLAIMED:
+    case KIND.TAO_CLAIMED: {
+      const isTao = envelope.kind === KIND.TAO_CLAIMED;
+      const label = isTao ? 'TAO_CLAIMED' : 'SOL_CLAIMED';
       if (![STATE.ESCROW, STATE.LN_PAID, STATE.CLAIMED].includes(next.state)) {
-        return { ok: false, error: `SOL_CLAIMED not allowed in state=${next.state}`, trade: null };
+        return { ok: false, error: `${label} not allowed in state=${next.state}`, trade: null };
       }
-      if (!next.terms) return { ok: false, error: 'SOL_CLAIMED requires terms', trade: null };
-      if (!next.escrow) return { ok: false, error: 'SOL_CLAIMED requires escrow', trade: null };
-      const rs = requireSigner(envelope, next.terms.ln_payer_peer, 'sol_claimed');
+      if (!next.terms) return { ok: false, error: `${label} requires terms`, trade: null };
+      if (!next.escrow) return { ok: false, error: `${label} requires escrow`, trade: null };
+      const rs = requireSigner(envelope, next.terms.ln_payer_peer, isTao ? 'tao_claimed' : 'sol_claimed');
       if (!rs.ok) return { ok: false, error: rs.error, trade: null };
       if (normalizeHex(envelope.body.payment_hash_hex) !== normalizeHex(next.escrow.payment_hash_hex)) {
-        return { ok: false, error: 'SOL_CLAIMED payment_hash mismatch vs escrow', trade: null };
+        return { ok: false, error: `${label} payment_hash mismatch vs escrow`, trade: null };
       }
-      if (String(envelope.body.escrow_pda) !== String(next.escrow.escrow_pda)) {
-        return { ok: false, error: 'SOL_CLAIMED escrow_pda mismatch vs escrow', trade: null };
-      }
-      if (next.claimed) {
-        if (String(next.claimed.tx_sig) !== String(envelope.body.tx_sig)) {
-          return { ok: false, error: 'SOL_CLAIMED tx_sig mismatch vs prior claim', trade: null };
+      if (isTao) {
+        if (String(envelope.body.settlement_id) !== String(next.escrow.settlement_id)) {
+          return { ok: false, error: 'TAO_CLAIMED settlement_id mismatch vs escrow', trade: null };
+        }
+        if (next.claimed) {
+          if (String(next.claimed.tx_id) !== String(envelope.body.tx_id)) {
+            return { ok: false, error: 'TAO_CLAIMED tx_id mismatch vs prior claim', trade: null };
+          }
+        } else {
+          next.claimed = envelope.body;
         }
       } else {
-        next.claimed = envelope.body;
+        if (String(envelope.body.escrow_pda) !== String(next.escrow.escrow_pda)) {
+          return { ok: false, error: 'SOL_CLAIMED escrow_pda mismatch vs escrow', trade: null };
+        }
+        if (next.claimed) {
+          if (String(next.claimed.tx_sig) !== String(envelope.body.tx_sig)) {
+            return { ok: false, error: 'SOL_CLAIMED tx_sig mismatch vs prior claim', trade: null };
+          }
+        } else {
+          next.claimed = envelope.body;
+        }
       }
       next.state = STATE.CLAIMED;
       return { ok: true, error: null, trade: next };
     }
 
-    case KIND.SOL_REFUNDED: {
+    case KIND.SOL_REFUNDED:
+    case KIND.TAO_REFUNDED: {
+      const isTao = envelope.kind === KIND.TAO_REFUNDED;
+      const label = isTao ? 'TAO_REFUNDED' : 'SOL_REFUNDED';
       if (![STATE.ESCROW, STATE.REFUNDED].includes(next.state)) {
-        return { ok: false, error: `SOL_REFUNDED not allowed in state=${next.state}`, trade: null };
+        return { ok: false, error: `${label} not allowed in state=${next.state}`, trade: null };
       }
-      if (!next.terms) return { ok: false, error: 'SOL_REFUNDED requires terms', trade: null };
-      if (!next.escrow) return { ok: false, error: 'SOL_REFUNDED requires escrow', trade: null };
-      const rs = requireSigner(envelope, next.terms.ln_receiver_peer, 'sol_refunded');
+      if (!next.terms) return { ok: false, error: `${label} requires terms`, trade: null };
+      if (!next.escrow) return { ok: false, error: `${label} requires escrow`, trade: null };
+      const rs = requireSigner(envelope, next.terms.ln_receiver_peer, isTao ? 'tao_refunded' : 'sol_refunded');
       if (!rs.ok) return { ok: false, error: rs.error, trade: null };
       if (normalizeHex(envelope.body.payment_hash_hex) !== normalizeHex(next.escrow.payment_hash_hex)) {
-        return { ok: false, error: 'SOL_REFUNDED payment_hash mismatch vs escrow', trade: null };
+        return { ok: false, error: `${label} payment_hash mismatch vs escrow`, trade: null };
       }
-      if (String(envelope.body.escrow_pda) !== String(next.escrow.escrow_pda)) {
+      if (isTao) {
+        if (String(envelope.body.settlement_id) !== String(next.escrow.settlement_id)) {
+          return { ok: false, error: 'TAO_REFUNDED settlement_id mismatch vs escrow', trade: null };
+        }
+      } else if (String(envelope.body.escrow_pda) !== String(next.escrow.escrow_pda)) {
         return { ok: false, error: 'SOL_REFUNDED escrow_pda mismatch vs escrow', trade: null };
       }
       if (next.escrow.refund_after_unix !== undefined && next.escrow.refund_after_unix !== null) {
         const refundMs = unixSecToMs(next.escrow.refund_after_unix);
         if (!Number.isFinite(refundMs)) {
-          return { ok: false, error: 'SOL_REFUNDED invalid refund_after_unix', trade: null };
+          return { ok: false, error: `${label} invalid refund_after_unix`, trade: null };
         }
         if (envelope.ts < refundMs) {
-          return { ok: false, error: 'SOL_REFUNDED too early', trade: null };
+          return { ok: false, error: `${label} too early`, trade: null };
         }
       }
       if (next.refunded) {
-        if (String(next.refunded.tx_sig) !== String(envelope.body.tx_sig)) {
-          return { ok: false, error: 'SOL_REFUNDED tx_sig mismatch vs prior refund', trade: null };
+        const priorTx = isTao ? String(next.refunded.tx_id) : String(next.refunded.tx_sig);
+        const gotTx = isTao ? String(envelope.body.tx_id) : String(envelope.body.tx_sig);
+        if (priorTx !== gotTx) {
+          return { ok: false, error: `${label} tx mismatch vs prior refund`, trade: null };
         }
       } else {
         next.refunded = envelope.body;

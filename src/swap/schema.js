@@ -17,6 +17,14 @@ const isBase58 = (value) => {
   return /^[1-9A-HJ-NP-Za-km-z]+$/.test(s);
 };
 
+const isHexAddress = (value) => {
+  if (typeof value !== 'string') return false;
+  const s = value.trim();
+  return /^0x[0-9a-fA-F]{40}$/.test(s);
+};
+
+const isSettlementAddress = (value) => isBase58(value) || isHexAddress(value);
+
 const isUint = (value) =>
   Number.isInteger(value) && Number.isFinite(value) && value >= 0;
 
@@ -162,10 +170,10 @@ export function validateSwapBody(kind, body) {
         return { ok: false, error: 'rfq.min_sol_refund_window_sec must be <= rfq.max_sol_refund_window_sec' };
       }
       if (body.sol_mint !== undefined && body.sol_mint !== null) {
-        if (!isBase58(body.sol_mint)) return { ok: false, error: 'rfq.sol_mint must be base58' };
+        if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'rfq.sol_mint must be base58 or 0x address' };
       }
       if (body.sol_recipient !== undefined && body.sol_recipient !== null) {
-        if (!isBase58(body.sol_recipient)) return { ok: false, error: 'rfq.sol_recipient must be base58' };
+        if (!isSettlementAddress(body.sol_recipient)) return { ok: false, error: 'rfq.sol_recipient must be base58 or 0x address' };
       }
       if (body.valid_until_unix !== undefined && !isPosInt(body.valid_until_unix)) {
         return { ok: false, error: 'rfq.valid_until_unix must be a unix seconds integer' };
@@ -220,13 +228,13 @@ export function validateSwapBody(kind, body) {
         return { ok: false, error: 'quote total fee bps exceeds 1500 bps cap' };
       }
       if (body.platform_fee_collector !== undefined && body.platform_fee_collector !== null) {
-        if (!isBase58(body.platform_fee_collector)) {
-          return { ok: false, error: 'quote.platform_fee_collector must be base58' };
+        if (!isSettlementAddress(body.platform_fee_collector)) {
+          return { ok: false, error: 'quote.platform_fee_collector must be base58 or 0x address' };
         }
       }
       if (body.trade_fee_collector !== undefined && body.trade_fee_collector !== null) {
-        if (!isBase58(body.trade_fee_collector)) {
-          return { ok: false, error: 'quote.trade_fee_collector must be base58' };
+        if (!isSettlementAddress(body.trade_fee_collector)) {
+          return { ok: false, error: 'quote.trade_fee_collector must be base58 or 0x address' };
         }
       }
       if (body.sol_refund_window_sec !== undefined && body.sol_refund_window_sec !== null) {
@@ -241,10 +249,10 @@ export function validateSwapBody(kind, body) {
         }
       }
       if (body.sol_mint !== undefined && body.sol_mint !== null) {
-        if (!isBase58(body.sol_mint)) return { ok: false, error: 'quote.sol_mint must be base58' };
+        if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'quote.sol_mint must be base58 or 0x address' };
       }
       if (body.sol_recipient !== undefined && body.sol_recipient !== null) {
-        if (!isBase58(body.sol_recipient)) return { ok: false, error: 'quote.sol_recipient must be base58' };
+        if (!isSettlementAddress(body.sol_recipient)) return { ok: false, error: 'quote.sol_recipient must be base58 or 0x address' };
       }
       if (!isPosInt(body.valid_until_unix)) {
         return { ok: false, error: 'quote.valid_until_unix must be a unix seconds integer' };
@@ -307,9 +315,9 @@ export function validateSwapBody(kind, body) {
       if (body.usdt_decimals !== undefined && !isUint(body.usdt_decimals)) {
         return { ok: false, error: 'terms.usdt_decimals must be an integer >= 0' };
       }
-      if (!isBase58(body.sol_mint)) return { ok: false, error: 'terms.sol_mint must be base58' };
-      if (!isBase58(body.sol_recipient)) return { ok: false, error: 'terms.sol_recipient must be base58' };
-      if (!isBase58(body.sol_refund)) return { ok: false, error: 'terms.sol_refund must be base58' };
+      if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'terms.sol_mint must be base58 or 0x address' };
+      if (!isSettlementAddress(body.sol_recipient)) return { ok: false, error: 'terms.sol_recipient must be base58 or 0x address' };
+      if (!isSettlementAddress(body.sol_refund)) return { ok: false, error: 'terms.sol_refund must be base58 or 0x address' };
       if (!isPosInt(body.sol_refund_after_unix)) {
         return { ok: false, error: 'terms.sol_refund_after_unix must be a unix seconds integer' };
       }
@@ -337,12 +345,12 @@ export function validateSwapBody(kind, body) {
         return { ok: false, error: 'terms total fee bps exceeds 1500 bps cap' };
       }
       if (body.platform_fee_collector !== undefined && body.platform_fee_collector !== null) {
-        if (!isBase58(body.platform_fee_collector)) {
-          return { ok: false, error: 'terms.platform_fee_collector must be base58' };
+        if (!isSettlementAddress(body.platform_fee_collector)) {
+          return { ok: false, error: 'terms.platform_fee_collector must be base58 or 0x address' };
         }
       }
-      if (!isBase58(body.trade_fee_collector)) {
-        return { ok: false, error: 'terms.trade_fee_collector must be base58' };
+      if (!isSettlementAddress(body.trade_fee_collector)) {
+        return { ok: false, error: 'terms.trade_fee_collector must be base58 or 0x address' };
       }
 
       if (body.terms_valid_until_unix !== undefined && !isPosInt(body.terms_valid_until_unix)) {
@@ -390,6 +398,28 @@ export function validateSwapBody(kind, body) {
       return { ok: true, error: null };
     }
 
+    case KIND.TAO_HTLC_LOCKED: {
+      if (!isHex(body.payment_hash_hex, 32)) return { ok: false, error: 'tao_htlc_locked.payment_hash_hex invalid' };
+      if (typeof body.settlement_id !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(body.settlement_id.trim())) {
+        return { ok: false, error: 'tao_htlc_locked.settlement_id invalid' };
+      }
+      if (!isHexAddress(body.htlc_address)) return { ok: false, error: 'tao_htlc_locked.htlc_address invalid' };
+      if (!isAmountString(body.amount_atomic)) return { ok: false, error: 'tao_htlc_locked.amount_atomic must be a decimal string' };
+      const refundAfter = body.refund_after_unix;
+      if (!(isPosInt(refundAfter) || isAmountString(refundAfter))) {
+        return { ok: false, error: 'tao_htlc_locked.refund_after_unix invalid' };
+      }
+      if (!isHexAddress(body.recipient)) return { ok: false, error: 'tao_htlc_locked.recipient invalid' };
+      if (!isHexAddress(body.refund)) return { ok: false, error: 'tao_htlc_locked.refund invalid' };
+      if (typeof body.tx_id !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(body.tx_id.trim())) {
+        return { ok: false, error: 'tao_htlc_locked.tx_id invalid' };
+      }
+      if (body.fee_snapshot !== undefined && body.fee_snapshot !== null && !isObject(body.fee_snapshot)) {
+        return { ok: false, error: 'tao_htlc_locked.fee_snapshot must be an object' };
+      }
+      return { ok: true, error: null };
+    }
+
     case KIND.LN_PAID: {
       if (!isHex(body.payment_hash_hex, 32)) return { ok: false, error: 'ln_paid.payment_hash_hex invalid' };
       if (body.preimage_hex !== undefined && !isHex(body.preimage_hex, 32)) {
@@ -405,6 +435,19 @@ export function validateSwapBody(kind, body) {
       if (!isBase58(body.escrow_pda)) return { ok: false, error: `${label}.escrow_pda invalid` };
       if (typeof body.tx_sig !== 'string' || body.tx_sig.trim().length === 0) {
         return { ok: false, error: `${label}.tx_sig is required` };
+      }
+      return { ok: true, error: null };
+    }
+
+    case KIND.TAO_CLAIMED:
+    case KIND.TAO_REFUNDED: {
+      const label = kind === KIND.TAO_CLAIMED ? 'tao_claimed' : 'tao_refunded';
+      if (!isHex(body.payment_hash_hex, 32)) return { ok: false, error: `${label}.payment_hash_hex invalid` };
+      if (typeof body.settlement_id !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(body.settlement_id.trim())) {
+        return { ok: false, error: `${label}.settlement_id invalid` };
+      }
+      if (typeof body.tx_id !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(body.tx_id.trim())) {
+        return { ok: false, error: `${label}.tx_id invalid` };
       }
       return { ok: true, error: null };
     }
