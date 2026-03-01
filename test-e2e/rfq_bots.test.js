@@ -22,8 +22,15 @@ import { LN_USDT_ESCROW_PROGRAM_ID } from '../src/solana/lnUsdtEscrowClient.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..');
+const NETWORK_E2E_ENABLED = String(process.env.INTERCOM_E2E_NETWORK || '').trim() === '1';
 
 const APP_HASH = deriveIntercomswapAppHash({ solanaProgramId: LN_USDT_ESCROW_PROGRAM_ID.toBase58() });
+
+function requireNetworkE2E(t) {
+  if (!NETWORK_E2E_ENABLED) {
+    t.skip('requires INTERCOM_E2E_NETWORK=1 (HyperDHT network e2e is disabled in sandbox by default)');
+  }
+}
 
 async function retry(fn, { tries = 80, delayMs = 250, label = 'retry' } = {}) {
   let lastErr = null;
@@ -241,6 +248,7 @@ async function expectNoSidechannel(sc, { channel, pred, durationMs = 1200, label
 }
 
 test('e2e: RFQ maker/taker bots negotiate and join swap channel (sidechannel invites)', async (t) => {
+  requireNetworkE2E(t);
   const runId = crypto.randomBytes(4).toString('hex');
   const rfqChannel = `btc-usdt-sol-rfq-${runId}`;
 
@@ -537,6 +545,7 @@ test('e2e: RFQ maker/taker bots negotiate and join swap channel (sidechannel inv
 });
 
 test('e2e: taker listens to maker Offers (svc_announce) and posts RFQ (Offer -> RFQ -> invite)', async (t) => {
+  requireNetworkE2E(t);
   const runId = crypto.randomBytes(4).toString('hex');
   const rfqChannel = `btc-usdt-sol-rfq-offer-${runId}`;
 
@@ -849,6 +858,7 @@ test('e2e: taker listens to maker Offers (svc_announce) and posts RFQ (Offer -> 
 });
 
 test('e2e: maker rejects quote_accept from non-RFQ signer (prevents quote hijack)', async (t) => {
+  requireNetworkE2E(t);
   const runId = crypto.randomBytes(4).toString('hex');
   const rfqChannel = `btc-usdt-sol-rfq-hijack-${runId}`;
 

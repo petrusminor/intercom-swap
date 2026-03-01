@@ -135,3 +135,77 @@ test('tao provider lock: rejects malformed hash, zero amount, and unsafe refund 
   );
   assert.equal(chainCalls, 0, 'validation failures should happen before any on-chain call');
 });
+
+test('tao provider verifySwapPrePayOnchain: refund_after must be strictly greater than invoice expiry + min timelock', async () => {
+  const prevMin = process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC;
+  process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC = '3600';
+
+  try {
+    const provider = Object.create(TaoEvmSettlementProvider.prototype);
+    provider.htlcAddress = '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653';
+    provider.verifyPrePay = async () => ({
+      ok: true,
+      metadata: {
+        sender: '0x3333333333333333333333333333333333333333',
+        receiver: '0x1111111111111111111111111111111111111111',
+        amount_atomic: '5000000',
+        refund_after_unix: 1770992907,
+        hashlock: `0x${'44'.repeat(32)}`,
+        claimed: false,
+        refunded: false,
+        contract_address: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+      },
+    });
+
+    const input = {
+      terms: {
+        pair: 'BTC_LN/TAO_EVM',
+        tao_amount_atomic: '5000000',
+        sol_recipient: '0x1111111111111111111111111111111111111111',
+        sol_refund: '0x3333333333333333333333333333333333333333',
+        sol_refund_after_unix: 1770992907,
+      },
+      invoiceBody: {
+        payment_hash_hex: '44'.repeat(32),
+        expires_at_unix: 1770989307,
+      },
+      escrowBody: {
+        payment_hash_hex: '44'.repeat(32),
+        settlement_id: `0x${'55'.repeat(32)}`,
+        htlc_address: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+        amount_atomic: '5000000',
+        refund_after_unix: 1770992907,
+        recipient: '0x1111111111111111111111111111111111111111',
+        refund: '0x3333333333333333333333333333333333333333',
+      },
+    };
+
+    const equalBoundary = await provider.verifySwapPrePayOnchain(input);
+    assert.equal(equalBoundary.ok, false);
+    assert.match(equalBoundary.error, /> invoice_expiry_unix \+ INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC/i);
+
+    provider.verifyPrePay = async () => ({
+      ok: true,
+      metadata: {
+        sender: '0x3333333333333333333333333333333333333333',
+        receiver: '0x1111111111111111111111111111111111111111',
+        amount_atomic: '5000000',
+        refund_after_unix: 1770992908,
+        hashlock: `0x${'44'.repeat(32)}`,
+        claimed: false,
+        refunded: false,
+        contract_address: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+      },
+    });
+
+    const aboveBoundary = await provider.verifySwapPrePayOnchain({
+      ...input,
+      escrowBody: { ...input.escrowBody, refund_after_unix: 1770992908 },
+      terms: { ...input.terms, sol_refund_after_unix: 1770992908 },
+    });
+    assert.equal(aboveBoundary.ok, true, aboveBoundary.error);
+  } finally {
+    if (prevMin === undefined) delete process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC;
+    else process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC = prevMin;
+  }
+});

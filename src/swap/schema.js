@@ -1,4 +1,15 @@
-import { ASSET, KIND, PAIR, STATE, SWAP_PROTOCOL_VERSION } from './constants.js';
+import { KIND, STATE, SWAP_PROTOCOL_VERSION } from './constants.js';
+import {
+  getAmountFieldForPair,
+  getAmountForPair,
+  getDirectionForPair,
+  getPairConfig,
+  getQuoteRefundFieldForPair,
+  getRfqRefundRangeFieldsForPair,
+  isSupportedPair,
+  isTaoPair,
+  normalizePair,
+} from './pairs.js';
 
 const isObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
 
@@ -37,6 +48,108 @@ const isAmountString = (value) => {
   // integer amount in smallest units, encoded as decimal string
   return /^[0-9]+$/.test(s) && s.length > 0;
 };
+
+function validatePairAndDirection(body, label) {
+  const pair = normalizePair(body?.pair);
+  if (!isSupportedPair(pair)) return { ok: false, error: `${label}.pair unsupported`, pair: null };
+  if (body.pair !== pair) return { ok: false, error: `${label}.pair unsupported`, pair: null };
+  if (body.direction !== getDirectionForPair(pair)) {
+    return { ok: false, error: `${label}.direction unsupported`, pair: null };
+  }
+  return { ok: true, error: null, pair };
+}
+
+function validatePairAmount(body, label, pair) {
+  const amountField = getAmountFieldForPair(pair);
+  if (isTaoPair(pair) && body.usdt_amount !== undefined && body.usdt_amount !== null) {
+    return { ok: false, error: `${label}.usdt_amount not allowed for ${pair}` };
+  }
+  if (!isTaoPair(pair) && body.tao_amount_atomic !== undefined && body.tao_amount_atomic !== null) {
+    return { ok: false, error: `${label}.tao_amount_atomic not allowed for ${pair}` };
+  }
+  const amount = getAmountForPair(body, pair);
+  if (!isAmountString(amount)) return { ok: false, error: `${label}.${amountField} must be a decimal string` };
+  return { ok: true, error: null };
+}
+
+function validateRefundConstraints(body, label, pair) {
+  if (isTaoPair(pair)) {
+    const refundField = getQuoteRefundFieldForPair(pair);
+    if (body.min_sol_refund_window_sec !== undefined || body.max_sol_refund_window_sec !== undefined) {
+      return { ok: false, error: `${label}.min_sol_refund_window_sec/max_sol_refund_window_sec not allowed for ${pair}` };
+    }
+    if (body.sol_refund_window_sec !== undefined && label === 'quote') {
+      return { ok: false, error: `${label}.sol_refund_window_sec not allowed for ${pair}` };
+    }
+    if (body[refundField] !== undefined && body[refundField] !== null) {
+      if (!isUint(body[refundField])) {
+        return { ok: false, error: `${label}.${refundField} must be an integer >= 0` };
+      }
+      if (Number(body[refundField]) < 3600) {
+        return { ok: false, error: `${label}.${refundField} must be >= 3600` };
+      }
+      if (Number(body[refundField]) > 7 * 24 * 3600) {
+        return { ok: false, error: `${label}.${refundField} must be <= 604800` };
+      }
+    }
+    return { ok: true, error: null };
+  }
+
+  const { minField, maxField } = getRfqRefundRangeFieldsForPair(pair);
+  if (body.settlement_refund_after_sec !== undefined && body.settlement_refund_after_sec !== null) {
+    return { ok: false, error: `${label}.settlement_refund_after_sec not allowed for ${pair}` };
+  }
+  if (label === 'rfq') {
+    if (body[minField] !== undefined && body[minField] !== null) {
+      if (!isUint(body[minField])) {
+        return { ok: false, error: `${label}.${minField} must be an integer >= 0` };
+      }
+      if (Number(body[minField]) < 3600) {
+        return { ok: false, error: `${label}.${minField} must be >= 3600` };
+      }
+      if (Number(body[minField]) > 7 * 24 * 3600) {
+        return { ok: false, error: `${label}.${minField} must be <= 604800` };
+      }
+    }
+    if (body[maxField] !== undefined && body[maxField] !== null) {
+      if (!isUint(body[maxField])) {
+        return { ok: false, error: `${label}.${maxField} must be an integer >= 0` };
+      }
+      if (Number(body[maxField]) < 3600) {
+        return { ok: false, error: `${label}.${maxField} must be >= 3600` };
+      }
+      if (Number(body[maxField]) > 7 * 24 * 3600) {
+        return { ok: false, error: `${label}.${maxField} must be <= 604800` };
+      }
+    }
+    if (
+      body[minField] !== undefined &&
+      body[minField] !== null &&
+      body[maxField] !== undefined &&
+      body[maxField] !== null &&
+      Number(body[minField]) > Number(body[maxField])
+    ) {
+      return { ok: false, error: `${label}.${minField} must be <= ${label}.${maxField}` };
+    }
+    return { ok: true, error: null };
+  }
+
+  if (label === 'quote') {
+    const quoteRefundField = getQuoteRefundFieldForPair(pair);
+    if (body[quoteRefundField] !== undefined && body[quoteRefundField] !== null) {
+      if (!isUint(body[quoteRefundField])) {
+        return { ok: false, error: `${label}.${quoteRefundField} must be an integer >= 0` };
+      }
+      if (Number(body[quoteRefundField]) < 3600) {
+        return { ok: false, error: `${label}.${quoteRefundField} must be >= 3600` };
+      }
+      if (Number(body[quoteRefundField]) > 7 * 24 * 3600) {
+        return { ok: false, error: `${label}.${quoteRefundField} must be <= 604800` };
+      }
+    }
+  }
+  return { ok: true, error: null };
+}
 
 export function validateSwapEnvelopeShape(envelope) {
   if (!isObject(envelope)) return { ok: false, error: 'Envelope must be an object' };
@@ -104,13 +217,13 @@ export function validateSwapBody(kind, body) {
     }
 
     case KIND.RFQ: {
-      if (body.pair !== PAIR.BTC_LN__USDT_SOL) return { ok: false, error: 'rfq.pair unsupported' };
-      if (body.direction !== `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`) {
-        return { ok: false, error: 'rfq.direction unsupported' };
-      }
+      const pd = validatePairAndDirection(body, 'rfq');
+      if (!pd.ok) return pd;
+      const pair = pd.pair;
       if (!isHex(body.app_hash, 32)) return { ok: false, error: 'rfq.app_hash must be 32-byte hex' };
       if (!isPosInt(body.btc_sats)) return { ok: false, error: 'rfq.btc_sats must be a positive integer' };
-      if (!isAmountString(body.usdt_amount)) return { ok: false, error: 'rfq.usdt_amount must be a decimal string' };
+      const amountCheck = validatePairAmount(body, 'rfq', pair);
+      if (!amountCheck.ok) return amountCheck;
       // Optional fee ceilings (pre-filtering only; binding fees are in TERMS).
       if (body.max_platform_fee_bps !== undefined && body.max_platform_fee_bps !== null) {
         if (!isUint(body.max_platform_fee_bps)) {
@@ -136,39 +249,8 @@ export function validateSwapBody(kind, body) {
           return { ok: false, error: 'rfq.max_total_fee_bps exceeds 1500 bps cap' };
         }
       }
-      // Optional Solana refund/claim window requirements (seconds).
-      // This is a negotiation input (pre-filtering). Binding value is terms.sol_refund_after_unix.
-      if (body.min_sol_refund_window_sec !== undefined && body.min_sol_refund_window_sec !== null) {
-        if (!isUint(body.min_sol_refund_window_sec)) {
-          return { ok: false, error: 'rfq.min_sol_refund_window_sec must be an integer >= 0' };
-        }
-        if (Number(body.min_sol_refund_window_sec) < 3600) {
-          return { ok: false, error: 'rfq.min_sol_refund_window_sec must be >= 3600' };
-        }
-        if (Number(body.min_sol_refund_window_sec) > 7 * 24 * 3600) {
-          return { ok: false, error: 'rfq.min_sol_refund_window_sec must be <= 604800' };
-        }
-      }
-      if (body.max_sol_refund_window_sec !== undefined && body.max_sol_refund_window_sec !== null) {
-        if (!isUint(body.max_sol_refund_window_sec)) {
-          return { ok: false, error: 'rfq.max_sol_refund_window_sec must be an integer >= 0' };
-        }
-        if (Number(body.max_sol_refund_window_sec) < 3600) {
-          return { ok: false, error: 'rfq.max_sol_refund_window_sec must be >= 3600' };
-        }
-        if (Number(body.max_sol_refund_window_sec) > 7 * 24 * 3600) {
-          return { ok: false, error: 'rfq.max_sol_refund_window_sec must be <= 604800' };
-        }
-      }
-      if (
-        body.min_sol_refund_window_sec !== undefined &&
-        body.min_sol_refund_window_sec !== null &&
-        body.max_sol_refund_window_sec !== undefined &&
-        body.max_sol_refund_window_sec !== null &&
-        Number(body.min_sol_refund_window_sec) > Number(body.max_sol_refund_window_sec)
-      ) {
-        return { ok: false, error: 'rfq.min_sol_refund_window_sec must be <= rfq.max_sol_refund_window_sec' };
-      }
+      const refundCheck = validateRefundConstraints(body, 'rfq', pair);
+      if (!refundCheck.ok) return refundCheck;
       if (body.sol_mint !== undefined && body.sol_mint !== null) {
         if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'rfq.sol_mint must be base58 or 0x address' };
       }
@@ -183,12 +265,12 @@ export function validateSwapBody(kind, body) {
 
     case KIND.QUOTE: {
       if (!isHex(body.rfq_id, 32)) return { ok: false, error: 'quote.rfq_id must be 32-byte hex' };
-      if (body.pair !== PAIR.BTC_LN__USDT_SOL) return { ok: false, error: 'quote.pair unsupported' };
-      if (body.direction !== `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`) {
-        return { ok: false, error: 'quote.direction unsupported' };
-      }
+      const pd = validatePairAndDirection(body, 'quote');
+      if (!pd.ok) return pd;
+      const pair = pd.pair;
       if (!isHex(body.app_hash, 32)) return { ok: false, error: 'quote.app_hash must be 32-byte hex' };
-      if (!isAmountString(body.usdt_amount)) return { ok: false, error: 'quote.usdt_amount must be a decimal string' };
+      const amountCheck = validatePairAmount(body, 'quote', pair);
+      if (!amountCheck.ok) return amountCheck;
       if (!isPosInt(body.btc_sats)) return { ok: false, error: 'quote.btc_sats must be a positive integer' };
       const hasOfferId = body.offer_id !== undefined && body.offer_id !== null;
       const hasOfferLineIndex = body.offer_line_index !== undefined && body.offer_line_index !== null;
@@ -237,17 +319,8 @@ export function validateSwapBody(kind, body) {
           return { ok: false, error: 'quote.trade_fee_collector must be base58 or 0x address' };
         }
       }
-      if (body.sol_refund_window_sec !== undefined && body.sol_refund_window_sec !== null) {
-        if (!isUint(body.sol_refund_window_sec)) {
-          return { ok: false, error: 'quote.sol_refund_window_sec must be an integer >= 0' };
-        }
-        if (Number(body.sol_refund_window_sec) < 3600) {
-          return { ok: false, error: 'quote.sol_refund_window_sec must be >= 3600' };
-        }
-        if (Number(body.sol_refund_window_sec) > 7 * 24 * 3600) {
-          return { ok: false, error: 'quote.sol_refund_window_sec must be <= 604800' };
-        }
-      }
+      const refundCheck = validateRefundConstraints(body, 'quote', pair);
+      if (!refundCheck.ok) return refundCheck;
       if (body.sol_mint !== undefined && body.sol_mint !== null) {
         if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'quote.sol_mint must be base58 or 0x address' };
       }
@@ -305,14 +378,14 @@ export function validateSwapBody(kind, body) {
     }
 
     case KIND.TERMS: {
-      if (body.pair !== PAIR.BTC_LN__USDT_SOL) return { ok: false, error: 'terms.pair unsupported' };
-      if (body.direction !== `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`) {
-        return { ok: false, error: 'terms.direction unsupported' };
-      }
+      const pd = validatePairAndDirection(body, 'terms');
+      if (!pd.ok) return pd;
+      const pair = pd.pair;
       if (!isHex(body.app_hash, 32)) return { ok: false, error: 'terms.app_hash must be 32-byte hex' };
       if (!isPosInt(body.btc_sats)) return { ok: false, error: 'terms.btc_sats must be a positive integer' };
-      if (!isAmountString(body.usdt_amount)) return { ok: false, error: 'terms.usdt_amount must be a decimal string' };
-      if (body.usdt_decimals !== undefined && !isUint(body.usdt_decimals)) {
+      const amountCheck = validatePairAmount(body, 'terms', pair);
+      if (!amountCheck.ok) return amountCheck;
+      if (!isTaoPair(pair) && body.usdt_decimals !== undefined && !isUint(body.usdt_decimals)) {
         return { ok: false, error: 'terms.usdt_decimals must be an integer >= 0' };
       }
       if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'terms.sol_mint must be base58 or 0x address' };

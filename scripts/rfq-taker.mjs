@@ -11,11 +11,24 @@ import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { deriveIntercomswapAppHash } from '../src/swap/app.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
+import {
+  getAmountFieldForPair,
+  getAmountForPair,
+  getDirectionForPair,
+  getHaveAssetForPair,
+  getPairSettlementKind,
+  getQuoteRefundFieldForPair,
+  getRfqRefundRangeFieldsForPair,
+  isTaoPair,
+  normalizePair,
+} from '../src/swap/pairs.js';
 import { normalizeClnNetwork } from '../src/ln/cln.js';
 import { normalizeLndNetwork } from '../src/ln/lnd.js';
 import { lnPay } from '../src/ln/client.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
+import { resolveRfqSettlementAmountAtomic } from '../src/rfq/cliFlags.js';
+import { matchOfferAnnouncementEvent } from '../src/rfq/offerMatch.js';
 import {
   getSettlementProvider,
   getSettlementAppBinding,
@@ -128,6 +141,17 @@ function asBigIntAmount(value) {
   }
 }
 
+function buildSwapLogFields({ pair, settlementKind, btcSats, amountAtomic }) {
+  const normalizedPair = normalizePair(pair);
+  return {
+    pair: normalizedPair,
+    direction: getDirectionForPair(normalizedPair),
+    settlement_kind: settlementKind,
+    btc_sats: btcSats,
+    [getAmountFieldForPair(normalizedPair)]: amountAtomic,
+  };
+}
+
 async function main() {
   const { flags } = parseArgs(process.argv.slice(2));
 
@@ -147,9 +171,26 @@ async function main() {
   const stopAfterLnPay = parseBool(flags.get('stop-after-ln-pay'), false);
 
   const tradeId = (flags.get('trade-id') && String(flags.get('trade-id')).trim()) || `swap_${crypto.randomUUID()}`;
+  let settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
+  const initialSettlementKind = settlementKind;
+  let isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
+  let isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
+  let rfqPair = isTaoSettlement ? PAIR.BTC_LN__TAO_EVM : PAIR.BTC_LN__USDT_SOL;
 
   let btcSats = parseIntFlag(flags.get('btc-sats'), 'btc-sats', 50_000);
-  let usdtAmount = (flags.get('usdt-amount') && String(flags.get('usdt-amount')).trim()) || '100000000';
+  let usdtAmount = '100000000';
+  try {
+    const amountConfig = resolveRfqSettlementAmountAtomic({
+      settlementKind,
+      usdtAmountRaw: flags.get('usdt-amount'),
+      taoAmountAtomicRaw: flags.get('tao-amount-atomic'),
+      fallbackUsdtAmount: '100000000',
+    });
+    usdtAmount = amountConfig.amountAtomic;
+    for (const warning of amountConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
+  } catch (err) {
+    die(err?.message || String(err));
+  }
   const rfqValidSec = parseIntFlag(flags.get('rfq-valid-sec'), 'rfq-valid-sec', 60);
 
   const timeoutSec = parseIntFlag(flags.get('timeout-sec'), 'timeout-sec', 30);
@@ -159,9 +200,6 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 200);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
-  const settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
-  const isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
-  const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
 
   const runSwap = parseBool(flags.get('run-swap'), false);
   const swapTimeoutSec = parseIntFlag(flags.get('swap-timeout-sec'), 'swap-timeout-sec', 300);
@@ -232,26 +270,6 @@ async function main() {
   const lndMacaroon = flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '';
   const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
 
-  const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
-  const settlementProgramId = getSettlementAppBinding(settlementKind, {
-    solanaProgramId: expectedProgramId,
-    taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
-  });
-  const expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: settlementProgramId });
-
-  const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
-
-  if (runSwap) {
-    if (isSolanaSettlement) {
-      if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1 and --settlement solana)');
-    }
-    if (isTaoSettlement) {
-      if (!process.env.TAO_EVM_PRIVATE_KEY) die('Missing TAO_EVM_PRIVATE_KEY (required when --settlement tao-evm)');
-      if (!process.env.TAO_EVM_HTLC_ADDRESS) die('Missing TAO_EVM_HTLC_ADDRESS (required when --settlement tao-evm)');
-    }
-    if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
-  }
-
   const ln = {
     impl: lnImpl,
     backend: lnBackend,
@@ -268,21 +286,11 @@ async function main() {
     },
   };
 
-  const sc = new ScBridgeClient({ url, token });
-  await sc.connect();
-
-  const joinedChannels = Array.from(new Set([rfqChannel, ...(listenOffers ? offerChannels : [])]));
-  for (const ch of joinedChannels) {
-    ensureOk(await sc.join(ch), `join ${ch}`);
-  }
-  ensureOk(await sc.subscribe(joinedChannels), `subscribe ${joinedChannels.join(',')}`);
-
-  const takerPubkey = String(sc.hello?.peer || '').trim().toLowerCase();
-  if (!takerPubkey) die('SC-Bridge hello missing peer pubkey');
-  const signing = await loadPeerWalletFromFile(peerKeypairPath);
-  if (signing.pubHex !== takerPubkey) {
-    die(`peer keypair pubkey mismatch: sc_bridge=${takerPubkey} keypair=${signing.pubHex}`);
-  }
+  const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
+  let settlementProgramId = null;
+  let expectedAppHash = null;
+  let receipts = null;
+  let sol = null;
 
   const persistTrade = (patch, eventKind = null, eventPayload = null) => {
     if (!receipts) return;
@@ -300,35 +308,71 @@ async function main() {
     }
   };
 
-  const sol = runSwap
-    ? await (async () => {
-        /** @type {import('../settlement/SettlementProvider').SettlementProvider} */
-        const settlement = getSettlementProvider(settlementKind, {
-          solana: {
-            rpcUrls: solRpcUrl,
-            commitment: 'confirmed',
-            keypairPath: solKeypairPath,
-            mint: solMintStr,
-            programId: expectedProgramId,
-            computeUnitLimit: solComputeUnitLimit,
-            computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
-          },
-          taoEvm: {
-            rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
-            chainId: 964,
-            privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
-            confirmations: 1,
-            htlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
-          },
-        });
-        return {
-          settlement,
-          kind: settlementKind,
-          recipientAddress: await settlement.getSignerAddress(),
-          expectedProgramId: settlementProgramId,
-        };
-      })()
-    : null;
+  const initSettlementRuntime = async () => {
+    settlementProgramId = getSettlementAppBinding(settlementKind, {
+      solanaProgramId: expectedProgramId,
+      taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
+    });
+    expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: settlementProgramId });
+    if (!receipts && receiptsDbPath) receipts = openTradeReceiptsStore({ dbPath: receiptsDbPath });
+
+    if (runSwap) {
+      if (isSolanaSettlement) {
+        if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1 and --settlement solana)');
+      }
+      if (isTaoSettlement) {
+        if (!process.env.TAO_EVM_PRIVATE_KEY) die('Missing TAO_EVM_PRIVATE_KEY (required when --settlement tao-evm)');
+        if (!process.env.TAO_EVM_HTLC_ADDRESS) die('Missing TAO_EVM_HTLC_ADDRESS (required when --settlement tao-evm)');
+      }
+      if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
+    }
+
+    sol = runSwap
+      ? await (async () => {
+          /** @type {import('../settlement/SettlementProvider').SettlementProvider} */
+          const settlement = getSettlementProvider(settlementKind, {
+            solana: {
+              rpcUrls: solRpcUrl,
+              commitment: 'confirmed',
+              keypairPath: solKeypairPath,
+              mint: solMintStr,
+              programId: expectedProgramId,
+              computeUnitLimit: solComputeUnitLimit,
+              computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
+            },
+            taoEvm: {
+              rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
+              chainId: 964,
+              privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
+              confirmations: 1,
+              htlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
+            },
+          });
+          return {
+            settlement,
+            kind: settlementKind,
+            recipientAddress: await settlement.getSignerAddress(),
+            expectedProgramId: settlementProgramId,
+          };
+        })()
+      : null;
+  };
+
+  const sc = new ScBridgeClient({ url, token });
+  await sc.connect();
+
+  const joinedChannels = Array.from(new Set([rfqChannel, ...(listenOffers ? offerChannels : [])]));
+  for (const ch of joinedChannels) {
+    ensureOk(await sc.join(ch), `join ${ch}`);
+  }
+  ensureOk(await sc.subscribe(joinedChannels), `subscribe ${joinedChannels.join(',')}`);
+
+  const takerPubkey = String(sc.hello?.peer || '').trim().toLowerCase();
+  if (!takerPubkey) die('SC-Bridge hello missing peer pubkey');
+  const signing = await loadPeerWalletFromFile(peerKeypairPath);
+  if (signing.pubHex !== takerPubkey) {
+    die(`peer keypair pubkey mismatch: sc_bridge=${takerPubkey} keypair=${signing.pubHex}`);
+  }
 
   let offerMeta = null;
   if (listenOffers) {
@@ -350,79 +394,22 @@ async function main() {
 
       const onMsg = (evt) => {
         try {
-          if (!evt || evt.type !== 'sidechannel_message') return;
-          if (!offerChannels.includes(String(evt.channel || ''))) return;
-          const msg = evt.message;
-          if (!msg || typeof msg !== 'object') return;
-          if (msg.kind !== KIND.SVC_ANNOUNCE) return;
-          const v = validateSwapEnvelope(msg);
-          if (!v.ok) return;
-          const body = msg.body;
-          if (!body || typeof body !== 'object') return;
-
-          const now = Math.floor(Date.now() / 1000);
-          const until = Number(body.valid_until_unix);
-          if (Number.isFinite(until) && until <= now) return;
-
-          // If the maker included rfq_channels, ensure ours is included to minimize chatter.
-          if (Array.isArray(body.rfq_channels) && body.rfq_channels.length > 0) {
-            const set = new Set(body.rfq_channels.map((c) => String(c || '').trim()).filter(Boolean));
-            if (!set.has(rfqChannel)) return;
-          }
-
-          const offers = Array.isArray(body.offers) ? body.offers : [];
-          if (offers.length < 1) return;
-
-          for (const o of offers) {
-            if (!o || typeof o !== 'object') continue;
-            if (String(o.pair || '') !== PAIR.BTC_LN__USDT_SOL) continue;
-            if (String(o.have || '') !== ASSET.USDT_SOL) continue;
-            if (String(o.want || '') !== ASSET.BTC_LN) continue;
-
-            const appHash = String(o.app_hash || body.app_hash || '').trim().toLowerCase();
-            if (!appHash || appHash !== expectedAppHash) continue;
-
-            const btc = Number(o.btc_sats);
-            if (!Number.isInteger(btc) || btc < 1) continue;
-            const usdt = String(o.usdt_amount || '').trim();
-            if (!/^[0-9]+$/.test(usdt)) continue;
-            if (BigInt(usdt) <= 0n) continue;
-
-            const maxPlat = Number(o.max_platform_fee_bps);
-            const maxTrade = Number(o.max_trade_fee_bps);
-            const maxTotal = Number(o.max_total_fee_bps);
-            if (!Number.isInteger(maxPlat) || maxPlat < 0 || maxPlat > 500) continue;
-            if (!Number.isInteger(maxTrade) || maxTrade < 0 || maxTrade > 1000) continue;
-            if (!Number.isInteger(maxTotal) || maxTotal < 0 || maxTotal > 1500) continue;
-            if (maxPlat > maxPlatformFeeBpsCfg) continue;
-            if (maxTrade > maxTradeFeeBpsCfg) continue;
-            if (maxTotal > maxTotalFeeBpsCfg) continue;
-
-            const minWin = Number(o.min_sol_refund_window_sec);
-            const maxWin = Number(o.max_sol_refund_window_sec);
-            if (!Number.isInteger(minWin) || minWin < SOL_REFUND_MIN_SEC || minWin > SOL_REFUND_MAX_SEC) continue;
-            if (!Number.isInteger(maxWin) || maxWin < SOL_REFUND_MIN_SEC || maxWin > SOL_REFUND_MAX_SEC) continue;
-            if (minWin > maxWin) continue;
-            if (minWin < minSolRefundWindowSecCfg) continue;
-            if (maxWin > maxSolRefundWindowSecCfg) continue;
-
-            cleanup();
-            resolve({
-              offer_channel: String(evt.channel || ''),
-              offer_name: String(body.name || ''),
-              offer_signer: String(msg.signer || '').trim().toLowerCase() || null,
-              offer_valid_until_unix: Number.isFinite(until) ? until : null,
-              // RFQ mirror values
-              btc_sats: btc,
-              usdt_amount: usdt,
-              max_platform_fee_bps: maxPlat,
-              max_trade_fee_bps: maxTrade,
-              max_total_fee_bps: maxTotal,
-              min_sol_refund_window_sec: minWin,
-              max_sol_refund_window_sec: maxWin,
-            });
-            return;
-          }
+          const matchedOffer = matchOfferAnnouncementEvent(evt, {
+            offerChannels,
+            rfqChannel,
+            fallbackPair: rfqPair,
+            expectedProgramId,
+            taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
+            maxPlatformFeeBps: maxPlatformFeeBpsCfg,
+            maxTradeFeeBps: maxTradeFeeBpsCfg,
+            maxTotalFeeBps: maxTotalFeeBpsCfg,
+            minRefundSec: minSolRefundWindowSecCfg,
+            maxRefundSec: maxSolRefundWindowSecCfg,
+          });
+          if (!matchedOffer) return;
+          cleanup();
+          resolve(matchedOffer);
+          return;
         } catch (err) {
           cleanup();
           reject(err);
@@ -432,13 +419,27 @@ async function main() {
       sc.on('sidechannel_message', onMsg);
     });
 
+    rfqPair = offerMeta.pair;
+    if (offerMeta.settlement_kind !== settlementKind) {
+      process.stderr.write(
+        `Warning: matched ${rfqPair} offer overrides taker settlement from ${initialSettlementKind} to ${offerMeta.settlement_kind}\n`
+      );
+      settlementKind = offerMeta.settlement_kind;
+      isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
+      isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
+    }
     btcSats = offerMeta.btc_sats;
-    usdtAmount = offerMeta.usdt_amount;
+    usdtAmount = String(getAmountForPair(offerMeta, rfqPair) || '').trim();
     maxPlatformFeeBps = offerMeta.max_platform_fee_bps;
     maxTradeFeeBps = offerMeta.max_trade_fee_bps;
     maxTotalFeeBps = offerMeta.max_total_fee_bps;
-    minSolRefundWindowSec = offerMeta.min_sol_refund_window_sec;
-    maxSolRefundWindowSec = offerMeta.max_sol_refund_window_sec;
+    if (isTaoPair(rfqPair)) {
+      minSolRefundWindowSec = Number(offerMeta.settlement_refund_after_sec);
+      maxSolRefundWindowSec = Number(offerMeta.settlement_refund_after_sec);
+    } else {
+      minSolRefundWindowSec = offerMeta.min_sol_refund_window_sec;
+      maxSolRefundWindowSec = offerMeta.max_sol_refund_window_sec;
+    }
 
     process.stdout.write(
       `${JSON.stringify({
@@ -446,11 +447,14 @@ async function main() {
         trade_id: tradeId,
         offer_channel: offerMeta.offer_channel,
         offer_name: offerMeta.offer_name,
+        pair: rfqPair,
         btc_sats: btcSats,
-        usdt_amount: usdtAmount,
+        [getAmountFieldForPair(rfqPair)]: usdtAmount,
       })}\n`
     );
   }
+
+  await initSettlementRuntime();
 
   const nowSec = Math.floor(Date.now() / 1000);
   let rfqValidUntil = nowSec + rfqValidSec;
@@ -461,26 +465,32 @@ async function main() {
     die('Invalid --btc-sats (must be >= 1)');
   }
   if (!/^[0-9]+$/.test(String(usdtAmount || '').trim()) || BigInt(String(usdtAmount || '0')) <= 0n) {
-    die('Invalid --usdt-amount (must be a positive base-unit integer; open RFQ amount=0 is not supported)');
+    const amountFlagLabel = isTaoSettlement ? '--tao-amount-atomic' : '--usdt-amount';
+    die(`Invalid ${amountFlagLabel} (must be a positive base-unit integer; open RFQ amount=0 is not supported)`);
   }
   const rfqUnsigned = createUnsignedEnvelope({
     v: 1,
     kind: KIND.RFQ,
     tradeId,
     body: {
-      pair: PAIR.BTC_LN__USDT_SOL,
-      direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+      pair: rfqPair,
+      direction: getDirectionForPair(rfqPair),
       app_hash: expectedAppHash,
       btc_sats: btcSats,
-      usdt_amount: usdtAmount,
+      [getAmountFieldForPair(rfqPair)]: usdtAmount,
+      settlement_kind: getPairSettlementKind(rfqPair),
       // Pre-filtering: tell makers our fee ceilings up front (binding fees are still in TERMS).
       max_platform_fee_bps: maxPlatformFeeBps,
       max_trade_fee_bps: maxTradeFeeBps,
       max_total_fee_bps: maxTotalFeeBps,
-      // Pre-filtering: request a Solana refund/claim window range (seconds).
-      // Maker will advertise its offered value in QUOTE.sol_refund_window_sec.
-      min_sol_refund_window_sec: minSolRefundWindowSec,
-      max_sol_refund_window_sec: maxSolRefundWindowSec,
+      ...(isTaoPair(rfqPair)
+        ? {
+            settlement_refund_after_sec: minSolRefundWindowSec,
+          }
+        : {
+            min_sol_refund_window_sec: minSolRefundWindowSec,
+            max_sol_refund_window_sec: maxSolRefundWindowSec,
+          }),
       ...(runSwap ? { sol_recipient: sol.recipientAddress } : {}),
       ...(runSwap && solMintStr ? { sol_mint: solMintStr } : {}),
       valid_until_unix: rfqValidUntil,
@@ -497,7 +507,8 @@ async function main() {
       maker_peer: null,
       taker_peer: takerPubkey,
       btc_sats: btcSats,
-      usdt_amount: usdtAmount,
+      usdt_amount: isTaoPair(rfqPair) ? null : usdtAmount,
+      ...(isTaoPair(rfqPair) ? { tao_amount_atomic: usdtAmount } : {}),
       ...(isSolanaSettlement
         ? {
             sol_mint: runSwap && solMintStr ? solMintStr : null,
@@ -641,7 +652,19 @@ async function main() {
   const readySigned = signSwapEnvelope(readyUnsigned, signing);
   swapCtx.sent.ready = readySigned;
   await sc.send(swapChannel, readySigned, { invite });
-    process.stdout.write(`${JSON.stringify({ type: 'swap_ready_sent', trade_id: tradeId, swap_channel: swapChannel })}\n`);
+    process.stdout.write(
+      `${JSON.stringify({
+        type: 'swap_ready_sent',
+        trade_id: tradeId,
+        swap_channel: swapChannel,
+        ...buildSwapLogFields({
+          pair: rfqPair,
+          settlementKind,
+          btcSats,
+          amountAtomic: usdtAmount,
+        }),
+      })}\n`
+    );
     persistTrade({ state: swapCtx.trade.state }, 'swap_ready_sent', readySigned);
 
     const readyTimer = setInterval(async () => {
@@ -719,14 +742,16 @@ async function main() {
 
     // Guardrail: terms must match the quote we accepted (prevents bait-and-switch between RFQ and swap channel).
     if (chosen?.quote?.body) {
+      const quotePair = normalizePair(chosen.quote.body?.pair || rfqPair);
+      const amountField = getAmountFieldForPair(quotePair);
       if (Number(termsMsg.body?.btc_sats) !== Number(chosen.quote.body?.btc_sats)) {
         throw new Error(
           `terms.btc_sats mismatch vs quote (terms=${termsMsg.body?.btc_sats} quote=${chosen.quote.body?.btc_sats})`
         );
       }
-      if (String(termsMsg.body?.usdt_amount) !== String(chosen.quote.body?.usdt_amount)) {
+      if (String(getAmountForPair(termsMsg.body, quotePair, { allowLegacyTaoFallback: true })) !== String(getAmountForPair(chosen.quote.body, quotePair))) {
         throw new Error(
-          `terms.usdt_amount mismatch vs quote (terms=${termsMsg.body?.usdt_amount} quote=${chosen.quote.body?.usdt_amount})`
+          `terms.${amountField} mismatch vs quote`
         );
       }
       if (chosen.quote.body?.sol_mint) {
@@ -736,8 +761,9 @@ async function main() {
           );
         }
       }
-      if (chosen.quote.body?.sol_refund_window_sec !== undefined && chosen.quote.body?.sol_refund_window_sec !== null) {
-        const quoteWindow = Number(chosen.quote.body?.sol_refund_window_sec);
+      const quoteRefundField = getQuoteRefundFieldForPair(quotePair);
+      if (chosen.quote.body?.[quoteRefundField] !== undefined && chosen.quote.body?.[quoteRefundField] !== null) {
+        const quoteWindow = Number(chosen.quote.body?.[quoteRefundField]);
         const refundAfterUnix = Number(termsMsg.body?.sol_refund_after_unix);
         const termsTsSec = Math.floor(Number(termsMsg?.ts || 0) / 1000);
         if (Number.isFinite(quoteWindow) && quoteWindow > 0 && Number.isFinite(refundAfterUnix) && refundAfterUnix > 0 && termsTsSec > 0) {
@@ -1124,7 +1150,8 @@ async function main() {
         if (quotePlatformFeeBps + quoteTradeFeeBps > maxTotalFeeBps) return;
 
         // Pre-filtering: require explicit refund/claim window advertised in QUOTE (seconds).
-        const quoteRefundWindowSec = Number(msg.body?.sol_refund_window_sec);
+        const quotePair = normalizePair(msg.body?.pair || rfqPair);
+        const quoteRefundWindowSec = Number(msg.body?.[getQuoteRefundFieldForPair(quotePair)]);
         if (!Number.isFinite(quoteRefundWindowSec) || quoteRefundWindowSec <= 0) return;
         if (quoteRefundWindowSec < minSolRefundWindowSec) return;
         if (maxSolRefundWindowSec !== null && Number.isFinite(maxSolRefundWindowSec) && quoteRefundWindowSec > maxSolRefundWindowSec) {
@@ -1135,7 +1162,7 @@ async function main() {
           // Guardrail: only accept quotes for the exact requested size.
           if (Number(msg.body?.btc_sats) !== Number(btcSats)) return;
 
-          const quoteAmountStr = String(msg.body?.usdt_amount || '').trim();
+          const quoteAmountStr = String(getAmountForPair(msg.body, quotePair) || '').trim();
           const quoteAmount = asBigIntAmount(quoteAmountStr);
           if (quoteAmount === null) return;
 
@@ -1202,7 +1229,19 @@ async function main() {
         joined = true;
         stopTimers();
         clearInterval(enforceTimeout);
-        process.stdout.write(`${JSON.stringify({ type: 'swap_joined', trade_id: tradeId, swap_channel: swapChannel })}\n`);
+        process.stdout.write(
+          `${JSON.stringify({
+            type: 'swap_joined',
+            trade_id: tradeId,
+            swap_channel: swapChannel,
+            ...buildSwapLogFields({
+              pair: rfqPair,
+              settlementKind,
+              btcSats,
+              amountAtomic: usdtAmount,
+            }),
+          })}\n`
+        );
 
         persistTrade(
           {

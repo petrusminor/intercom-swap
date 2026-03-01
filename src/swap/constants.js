@@ -3,10 +3,17 @@ export const SWAP_PROTOCOL_VERSION = 1;
 export const ASSET = Object.freeze({
   BTC_LN: 'BTC_LN',
   USDT_SOL: 'USDT_SOL',
+  TAO_EVM: 'TAO_EVM',
 });
 
 export const PAIR = Object.freeze({
   BTC_LN__USDT_SOL: 'BTC_LN/USDT_SOL',
+  BTC_LN__TAO_EVM: 'BTC_LN/TAO_EVM',
+});
+
+export const DIR = Object.freeze({
+  BTC_LN__TO__USDT_SOL: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+  BTC_LN__TO__TAO_EVM: `${ASSET.BTC_LN}->${ASSET.TAO_EVM}`,
 });
 
 export const KIND = Object.freeze({

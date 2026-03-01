@@ -6,7 +6,8 @@ cd "$ROOT"
 
 if [[ $# -lt 2 ]]; then
   echo "Usage: scripts/rfq-taker-peer.sh <storeName> <scBridgePort> [rfq-taker args...]" >&2
-  echo "Example: scripts/rfq-taker-peer.sh swap-taker 49223 --btc-sats 50000 --usdt-amount 100000000" >&2
+  echo "Example (SOL): scripts/rfq-taker-peer.sh swap-taker 49223 --btc-sats 50000 --usdt-amount 100000000" >&2
+  echo "Example (TAO): scripts/rfq-taker-peer.sh swap-taker 49223 --rfq-channel 0000intercomswapbtctao --settlement tao-evm --btc-sats 50000 --tao-amount-atomic 100000000" >&2
   exit 1
 fi
 

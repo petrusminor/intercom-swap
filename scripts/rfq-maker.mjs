@@ -10,6 +10,16 @@ import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { deriveIntercomswapAppHash } from '../src/swap/app.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
+import {
+  getAmountFieldForPair,
+  getAmountForPair,
+  getDirectionForPair,
+  getPairSettlementKind,
+  getQuoteRefundFieldForPair,
+  getRfqRefundRangeFieldsForPair,
+  isTaoPair,
+  normalizePair,
+} from '../src/swap/pairs.js';
 import { createSignedWelcome, createSignedInvite, signPayloadHex } from '../src/sidechannel/capabilities.js';
 import { normalizeClnNetwork } from '../src/ln/cln.js';
 import { normalizeLndNetwork } from '../src/ln/lnd.js';
@@ -17,6 +27,7 @@ import { decodeBolt11 } from '../src/ln/bolt11.js';
 import { lnInvoice } from '../src/ln/client.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
+import { resolveSettlementRefundAfterSec } from '../src/rfq/cliFlags.js';
 import {
   getSettlementProvider,
   getSettlementAppBinding,
@@ -106,18 +117,22 @@ function normalizeAmountString(value) {
 
 function buildRfqLockKey(msg) {
   const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
+  const pair = normalizePair(body.pair);
+  const quoteRefundField = getQuoteRefundFieldForPair(pair);
+  const { minField, maxField } = getRfqRefundRangeFieldsForPair(pair);
   return [
     String(msg?.signer || '').trim().toLowerCase(),
     String(msg?.trade_id || '').trim(),
-    String(body.pair || '').trim(),
+    pair,
     String(body.direction || '').trim(),
     String(body.btc_sats ?? '').trim(),
-    normalizeAmountString(body.usdt_amount),
+    normalizeAmountString(getAmountForPair(body, pair, { allowLegacyTaoFallback: true })),
     String(body.max_platform_fee_bps ?? '').trim(),
     String(body.max_trade_fee_bps ?? '').trim(),
     String(body.max_total_fee_bps ?? '').trim(),
-    String(body.min_sol_refund_window_sec ?? '').trim(),
-    String(body.max_sol_refund_window_sec ?? '').trim(),
+    String(body[minField] ?? '').trim(),
+    String(body[maxField] ?? '').trim(),
+    String(body[quoteRefundField] ?? '').trim(),
     String(body.sol_recipient || '').trim().toLowerCase(),
     String(body.sol_mint || '').trim(),
     String(body.app_hash || '').trim().toLowerCase(),
@@ -149,20 +164,26 @@ async function main() {
   const swapResendMs = parseIntFlag(flags.get('swap-resend-ms'), 'swap-resend-ms', 1200);
   const retryResendMinMs = parseIntFlag(flags.get('retry-resend-min-ms'), 'retry-resend-min-ms', 20_000);
   const termsValidSec = parseIntFlag(flags.get('terms-valid-sec'), 'terms-valid-sec', 300);
-  // Default to a long recovery window for the LN payer to claim, but allow overriding for market makers.
-  const solRefundAfterSec = parseIntFlag(flags.get('solana-refund-after-sec'), 'solana-refund-after-sec', 72 * 3600);
   const lnInvoiceExpirySec = parseIntFlag(flags.get('ln-invoice-expiry-sec'), 'ln-invoice-expiry-sec', 3600);
 
   // Hard guardrails for safety + inventory lockup.
   // - Too short => increases "paid but can't claim before refund" risk.
   // - Too long  => griefing can lock maker inventory for excessive time.
-  const SOL_REFUND_MIN_SEC = 3600; // 1h
-  const SOL_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
-  if (!Number.isFinite(solRefundAfterSec) || solRefundAfterSec < SOL_REFUND_MIN_SEC) {
-    die(`Invalid --solana-refund-after-sec (must be >= ${SOL_REFUND_MIN_SEC})`);
-  }
-  if (solRefundAfterSec > SOL_REFUND_MAX_SEC) {
-    die(`Invalid --solana-refund-after-sec (must be <= ${SOL_REFUND_MAX_SEC})`);
+  const SETTLEMENT_REFUND_MIN_SEC = 3600; // 1h
+  const SETTLEMENT_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
+  let settlementRefundAfterSec = 72 * 3600;
+  try {
+    const settlementRefund = resolveSettlementRefundAfterSec({
+      settlementRefundAfterSecRaw: flags.get('settlement-refund-after-sec'),
+      legacySolanaRefundAfterSecRaw: flags.get('solana-refund-after-sec'),
+      fallbackSec: 72 * 3600,
+      minSec: SETTLEMENT_REFUND_MIN_SEC,
+      maxSec: SETTLEMENT_REFUND_MAX_SEC,
+    });
+    settlementRefundAfterSec = settlementRefund.settlementRefundAfterSec;
+    for (const warning of settlementRefund.warnings) process.stderr.write(`${warning}\n`);
+  } catch (err) {
+    die(err?.message || String(err));
   }
 
   const solRpcUrl = (flags.get('solana-rpc-url') && String(flags.get('solana-rpc-url')).trim()) || 'http://127.0.0.1:8899';
@@ -475,16 +496,17 @@ async function main() {
       kind: KIND.TERMS,
       tradeId: ctx.tradeId,
       body: {
-        pair: PAIR.BTC_LN__USDT_SOL,
-        direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+        pair: ctx.pair,
+        direction: getDirectionForPair(ctx.pair),
         app_hash: expectedAppHash,
         btc_sats: ctx.btcSats,
-        usdt_amount: ctx.usdtAmount,
-        usdt_decimals: solDecimals,
+        [getAmountFieldForPair(ctx.pair)]: ctx.usdtAmount,
+        ...(isTaoPair(ctx.pair) ? {} : { usdt_decimals: solDecimals }),
+        settlement_kind: settlementKind,
         sol_mint: sol.mint,
         sol_recipient: ctx.solRecipient,
         sol_refund: sol.refundAddress,
-        sol_refund_after_unix: nowSec + solRefundAfterSec,
+        sol_refund_after_unix: nowSec + settlementRefundAfterSec,
         platform_fee_bps: fees.platformFeeBps,
         platform_fee_collector: fees.platformFeeCollector || null,
         trade_fee_bps: fees.tradeFeeBps,
@@ -512,7 +534,8 @@ async function main() {
         maker_peer: makerPubkey,
         taker_peer: ctx.inviteePubKey,
         btc_sats: ctx.btcSats,
-        usdt_amount: ctx.usdtAmount,
+        usdt_amount: isTaoPair(ctx.pair) ? null : ctx.usdtAmount,
+        ...(isTaoPair(ctx.pair) ? { tao_amount_atomic: ctx.usdtAmount } : {}),
         ...(isSolanaSettlement
           ? {
               sol_mint: signed.body.sol_mint,
@@ -900,28 +923,67 @@ async function main() {
           return;
         }
 
+        const pair = normalizePair(msg.body?.pair || PAIR.BTC_LN__USDT_SOL);
+        if (getPairSettlementKind(pair) !== settlementKind) {
+          if (debug) process.stderr.write(`[maker] skip rfq pair/settlement mismatch pair=${pair} settlement=${settlementKind}\n`);
+          return;
+        }
         // Pre-filtering: only quote if we can meet the RFQ refund-window preference (seconds).
-        const rfqMinRefundWindowSec =
-          msg.body?.min_sol_refund_window_sec !== undefined && msg.body?.min_sol_refund_window_sec !== null
-            ? Number(msg.body.min_sol_refund_window_sec)
-            : null;
-        const rfqMaxRefundWindowSec =
-          msg.body?.max_sol_refund_window_sec !== undefined && msg.body?.max_sol_refund_window_sec !== null
-            ? Number(msg.body.max_sol_refund_window_sec)
-            : null;
-        if (rfqMinRefundWindowSec !== null && Number.isFinite(rfqMinRefundWindowSec) && solRefundAfterSec < rfqMinRefundWindowSec) {
-          if (debug) process.stderr.write(`[maker] skip rfq refund window: want>=${rfqMinRefundWindowSec}s have=${solRefundAfterSec}s\n`);
-          return;
+        if (isTaoPair(pair)) {
+          const rfqRefundWindowSec =
+            msg.body?.settlement_refund_after_sec !== undefined && msg.body?.settlement_refund_after_sec !== null
+              ? Number(msg.body.settlement_refund_after_sec)
+              : null;
+          if (
+            rfqRefundWindowSec !== null &&
+            Number.isFinite(rfqRefundWindowSec) &&
+            settlementRefundAfterSec !== rfqRefundWindowSec
+          ) {
+            if (debug) {
+              process.stderr.write(
+                `[maker] skip rfq settlement refund window: want=${rfqRefundWindowSec}s have=${settlementRefundAfterSec}s\n`
+              );
+            }
+            return;
+          }
+        } else {
+          const rfqMinRefundWindowSec =
+            msg.body?.min_sol_refund_window_sec !== undefined && msg.body?.min_sol_refund_window_sec !== null
+              ? Number(msg.body.min_sol_refund_window_sec)
+              : null;
+          const rfqMaxRefundWindowSec =
+            msg.body?.max_sol_refund_window_sec !== undefined && msg.body?.max_sol_refund_window_sec !== null
+              ? Number(msg.body.max_sol_refund_window_sec)
+              : null;
+          if (
+            rfqMinRefundWindowSec !== null &&
+            Number.isFinite(rfqMinRefundWindowSec) &&
+            settlementRefundAfterSec < rfqMinRefundWindowSec
+          ) {
+            if (debug) {
+              process.stderr.write(
+                `[maker] skip rfq refund window: want>=${rfqMinRefundWindowSec}s have=${settlementRefundAfterSec}s\n`
+              );
+            }
+            return;
+          }
+          if (
+            rfqMaxRefundWindowSec !== null &&
+            Number.isFinite(rfqMaxRefundWindowSec) &&
+            settlementRefundAfterSec > rfqMaxRefundWindowSec
+          ) {
+            if (debug) {
+              process.stderr.write(
+                `[maker] skip rfq refund window: want<=${rfqMaxRefundWindowSec}s have=${settlementRefundAfterSec}s\n`
+              );
+            }
+            return;
+          }
         }
-        if (rfqMaxRefundWindowSec !== null && Number.isFinite(rfqMaxRefundWindowSec) && solRefundAfterSec > rfqMaxRefundWindowSec) {
-          if (debug) process.stderr.write(`[maker] skip rfq refund window: want<=${rfqMaxRefundWindowSec}s have=${solRefundAfterSec}s\n`);
-          return;
-        }
-
-        let quoteUsdtAmount = String(msg.body.usdt_amount || '').trim();
+        let quoteUsdtAmount = String(getAmountForPair(msg.body, pair) || '').trim();
         if (!quoteUsdtAmount) quoteUsdtAmount = '0';
         if (!/^[0-9]+$/.test(quoteUsdtAmount)) {
-          if (debug) process.stderr.write(`[maker] skip rfq invalid usdt_amount trade_id=${msg.trade_id}\n`);
+          if (debug) process.stderr.write(`[maker] skip rfq invalid amount trade_id=${msg.trade_id}\n`);
           return;
         }
         if (quoteUsdtAmount === '0') {
@@ -939,17 +1001,18 @@ async function main() {
           tradeId: String(msg.trade_id),
           body: {
             rfq_id: rfqId,
-            pair: PAIR.BTC_LN__USDT_SOL,
-            direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+            pair,
+            direction: getDirectionForPair(pair),
             app_hash: expectedAppHash,
             btc_sats: msg.body.btc_sats,
-            usdt_amount: quoteUsdtAmount,
+            [getAmountFieldForPair(pair)]: quoteUsdtAmount,
+            settlement_kind: settlementKind,
             // Pre-filtering: fee preview (binding fees are still in TERMS).
             platform_fee_bps: fees.platformFeeBps,
             platform_fee_collector: fees.platformFeeCollector || null,
             trade_fee_bps: fees.tradeFeeBps,
             trade_fee_collector: fees.tradeFeeCollector || null,
-            sol_refund_window_sec: solRefundAfterSec,
+            [getQuoteRefundFieldForPair(pair)]: settlementRefundAfterSec,
             ...(runSwap ? { sol_mint: sol.mint, sol_recipient: solRecipient } : {}),
             valid_until_unix: quoteValidUntilUnix,
           },
@@ -962,13 +1025,14 @@ async function main() {
           rfq_id: rfqId,
           rfq_signer: String(msg.signer || '').trim().toLowerCase(),
           trade_id: String(msg.trade_id),
+          pair,
           btc_sats: msg.body.btc_sats,
           usdt_amount: quoteUsdtAmount,
           platform_fee_bps: fees.platformFeeBps,
           platform_fee_collector: fees.platformFeeCollector || null,
           trade_fee_bps: fees.tradeFeeBps,
           trade_fee_collector: fees.tradeFeeCollector || null,
-          sol_refund_window_sec: solRefundAfterSec,
+          [getQuoteRefundFieldForPair(pair)]: settlementRefundAfterSec,
           sol_recipient: solRecipient,
           sol_mint: runSwap ? sol.mint : (msg.body?.sol_mint ? String(msg.body.sol_mint).trim() : ''),
           lock_key: lockKey,
@@ -1120,6 +1184,7 @@ async function main() {
             quoteId,
             swapChannel,
             inviteePubKey,
+            pair: normalizePair(known.pair || (isTaoSettlement ? PAIR.BTC_LN__TAO_EVM : PAIR.BTC_LN__USDT_SOL)),
             invite,
             btcSats: Number(known.btc_sats),
             usdtAmount: String(known.usdt_amount),
@@ -1162,7 +1227,8 @@ async function main() {
               maker_peer: makerPubkey,
               taker_peer: inviteePubKey,
               btc_sats: ctx.btcSats,
-              usdt_amount: ctx.usdtAmount,
+              usdt_amount: isTaoPair(ctx.pair) ? null : ctx.usdtAmount,
+              ...(isTaoPair(ctx.pair) ? { tao_amount_atomic: ctx.usdtAmount } : {}),
               ...(isSolanaSettlement
                 ? {
                     sol_mint: runSwap ? sol.mint : null,

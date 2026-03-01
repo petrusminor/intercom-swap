@@ -5,7 +5,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $root
 
 if ($args.Length -lt 2) {
-  throw "Usage: scripts\\rfq-taker-peer.ps1 <storeName> <scBridgePort> [rfq-taker args...]`nExample: scripts\\rfq-taker-peer.ps1 swap-taker 49223 --btc-sats 50000 --usdt-amount 100000000"
+  throw "Usage: scripts\\rfq-taker-peer.ps1 <storeName> <scBridgePort> [rfq-taker args...]`nExample (SOL): scripts\\rfq-taker-peer.ps1 swap-taker 49223 --btc-sats 50000 --usdt-amount 100000000`nExample (TAO): scripts\\rfq-taker-peer.ps1 swap-taker 49223 --rfq-channel 0000intercomswapbtctao --settlement tao-evm --btc-sats 50000 --tao-amount-atomic 100000000"
 }
 
 $storeName = [string]$args[0]

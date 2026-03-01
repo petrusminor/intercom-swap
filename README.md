@@ -407,7 +407,8 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--swap-timeout-sec <n>` | Per-swap timeout (default `300`) |
 | `--swap-resend-ms <n>` | Proof resend interval (default `1200`) |
 | `--terms-valid-sec <n>` | Terms validity window (default `300`) |
-| `--solana-refund-after-sec <n>` | Solana refund timelock from terms send time (default `259200` = 72h) |
+| `--settlement-refund-after-sec <n>` | Settlement refund timelock from terms send time (default `259200` = 72h) |
+| `--solana-refund-after-sec <n>` | Deprecated alias for `--settlement-refund-after-sec` |
 | `--ln-invoice-expiry-sec <n>` | LN invoice expiry seconds (default `3600`) |
 
 ##### Solana
@@ -452,7 +453,8 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--trade-id <id>` | Trade id (default random) |
 | `--rfq-channel <name>` | RFQ negotiation channel (default `0000intercomswapbtcusdt`) |
 | `--btc-sats <n>` | Sats requested (default `50000`) |
-| `--usdt-amount <atomicStr>` | USDT requested (base units, must be > 0) |
+| `--usdt-amount <atomicStr>` | USDT requested (base units, must be > 0). In `--settlement tao-evm`, accepted as a deprecated alias for `--tao-amount-atomic`. |
+| `--tao-amount-atomic <atomicStr>` | TAO amount in atomic units for `--settlement tao-evm` (preferred) |
 | `--rfq-valid-sec <n>` | RFQ validity window (default `60`) |
 | `--timeout-sec <n>` | RFQ/quote negotiation timeout (default `30`) |
 | `--rfq-resend-ms <n>` | RFQ resend interval (default `1200`) |
@@ -723,10 +725,10 @@ Complete prompt-tool index (source of truth: `src/prompt/tools.js`, runtime beha
 #### RFQ/Offer/Quote
 | Tool | Description |
 |---|---|
-| `intercomswap_offer_post` | Post a signed Offer announcement (swap.svc_announce) into rendezvous channels (advertise: have USDT, want BTC; prompts BTC sellers to post matching RFQs). |
-| `intercomswap_rfq_post` | Post a signed RFQ envelope into an RFQ rendezvous channel (BTC_LN->USDT_SOL: sell BTC for USDT). |
+| `intercomswap_offer_post` | Post a signed Offer announcement (swap.svc_announce) into rendezvous channels. Pair-aware: supports legacy `BTC_LN/USDT_SOL` and `BTC_LN/TAO_EVM`. |
+| `intercomswap_rfq_post` | Post a signed RFQ envelope into an RFQ rendezvous channel. Pair-aware: supports `BTC_LN->USDT_SOL` and `BTC_LN->TAO_EVM`. |
 | `intercomswap_quote_post` | Post a signed QUOTE envelope into an RFQ channel (references an RFQ id). Fees are read from on-chain config/trade-config (not negotiated). Provide either valid_until_unix or valid_for_sec. |
-| `intercomswap_quote_post_from_rfq` | Maker: post a signed QUOTE that matches an RFQ envelope (no manual rfq_id/btc_sats/usdt_amount required). Fees are read from on-chain config/trade-config (not negotiated). Provide either valid_until_unix or valid_for_sec. |
+| `intercomswap_quote_post_from_rfq` | Maker: post a signed QUOTE that matches an RFQ envelope (no manual rfq_id/btc_sats/amount required). Fees are read from on-chain config/trade-config (not negotiated). Provide either valid_until_unix or valid_for_sec. |
 | `intercomswap_quote_accept` | Post a signed QUOTE_ACCEPT envelope into the RFQ channel (accept a quote). |
 | `intercomswap_swap_invite_from_accept` | Maker: generate welcome+invite and post SWAP_INVITE into the RFQ channel, based on an accepted quote. |
 | `intercomswap_join_from_swap_invite` | Taker: join swap:<id> channel using SWAP_INVITE envelope. |

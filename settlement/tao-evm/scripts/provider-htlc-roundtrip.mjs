@@ -69,7 +69,7 @@ async function main() {
     amountAtomic: LOCK_AMOUNT_WEI,
     recipient: signerAddress,
     refundAddress: signerAddress,
-    refundAfterUnix: nowUnix + 300,
+    refundAfterUnix: nowUnix + 7200,
     terms: {
       client_salt: clientSalt,
     },

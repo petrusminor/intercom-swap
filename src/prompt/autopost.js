@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { getAmountForPair, normalizePair } from '../swap/pairs.js';
 
 function isObject(v) {
   return v && typeof v === 'object' && !Array.isArray(v);
@@ -16,6 +17,15 @@ function buildCollisionSafeName(baseName, { maxLen = 64 } = {}) {
   const base = sanitizeJobName(baseName) || 'job';
   const maxBaseLen = Math.max(1, maxLen - suffix.length - 1);
   return `${base.slice(0, maxBaseLen)}_${suffix}`;
+}
+
+function offerTradeKey(row) {
+  const pair = normalizePair(row?.pair);
+  const btcSats = Number(row?.btc_sats);
+  const amount = String(getAmountForPair(row, pair, { allowLegacyTaoFallback: true }) || '').trim();
+  if (!Number.isInteger(btcSats) || btcSats < 1) return '';
+  if (!/^[0-9]+$/.test(amount)) return '';
+  return `${pair}:${btcSats}:${amount}`;
 }
 
 function clampInt(n, { min, max }) {
@@ -193,20 +203,24 @@ export class AutopostManager {
               if (!maker || maker !== job.peerSignerHex) continue;
               const updatedAt = typeof tr.updated_at === 'number' ? tr.updated_at : null;
               if (startMs && typeof updatedAt === 'number' && updatedAt > 0 && updatedAt < startMs) continue;
-              const btcSats = Number(tr.btc_sats);
-              const usdtAmount = String(tr.usdt_amount || '').trim();
-              if (!Number.isInteger(btcSats) || btcSats < 1) continue;
-              if (!/^[0-9]+$/.test(usdtAmount)) continue;
-              const key = `${btcSats}:${usdtAmount}`;
+              const key = offerTradeKey({
+                pair: tr.settlement_kind === 'tao-evm' ? 'BTC_LN/TAO_EVM' : 'BTC_LN/USDT_SOL',
+                btc_sats: tr.btc_sats,
+                usdt_amount: tr.usdt_amount,
+                tao_amount_atomic: tr.tao_amount_atomic,
+              });
+              if (!key) continue;
               removeCounts.set(key, (removeCounts.get(key) || 0) + 1);
             }
             if (removeCounts.size > 0) {
               const nextOffers = [];
               for (const o of offers) {
                 if (!isObject(o)) continue;
-                const btcSats = Number(o.btc_sats);
-                const usdtAmount = String(o.usdt_amount || '').trim();
-                const key = `${btcSats}:${usdtAmount}`;
+                const key = offerTradeKey(o);
+                if (!key) {
+                  nextOffers.push(o);
+                  continue;
+                }
                 const n = removeCounts.get(key) || 0;
                 if (n > 0) {
                   removeCounts.set(key, n - 1);

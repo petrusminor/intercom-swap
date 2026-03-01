@@ -27,6 +27,18 @@ import { INTERCOMSWAP_APP_TAG, deriveIntercomswapAppHash } from '../swap/app.js'
 import { hashUnsignedEnvelope, sha256Hex } from '../swap/hash.js';
 import { deriveOfferListingId } from '../swap/listings.js';
 import { hashTermsEnvelope } from '../swap/terms.js';
+import {
+  getAmountFieldForPair,
+  getAmountForPair,
+  getDirectionForPair,
+  getHaveAssetForPair,
+  getOfferExactRefundFieldForPair,
+  getPairSettlementKind,
+  getQuoteRefundFieldForPair,
+  getRfqRefundRangeFieldsForPair,
+  isTaoPair,
+  normalizePair,
+} from '../swap/pairs.js';
 import { AutopostManager } from './autopost.js';
 import { TradeAutoManager } from './tradeAuto.js';
 import { lnPeerProbe } from './lnPeerGuard.js';
@@ -1022,6 +1034,48 @@ async function maybeAssertLocalUsdtFunding({
     have_atomic: haveUsdt.toString(),
     sol_lamports: snap.sol_lamports,
   };
+}
+
+async function maybeAssertLocalSettlementFunding({
+  executor,
+  toolName,
+  pair,
+  requiredAtomic,
+  totalFeeBps,
+  context,
+} = {}) {
+  if (isTaoPair(pair)) {
+    return { ok: true, skipped: true, reason: 'tao funding check not implemented' };
+  }
+  return maybeAssertLocalUsdtFunding({ executor, toolName, requiredAtomic, totalFeeBps, context });
+}
+
+function normalizePairAmountFromBody(body, pair, label, { allowLegacyTaoFallback = false } = {}) {
+  const amountField = getAmountFieldForPair(pair);
+  const amount = getAmountForPair(body, pair, { allowLegacyTaoFallback });
+  return normalizeAtomicAmount(String(amount || ''), label || amountField);
+}
+
+function normalizeOfferRefundWindowForPair(offer, toolName, index, pair) {
+  if (isTaoPair(pair)) {
+    if ('min_sol_refund_window_sec' in offer || 'max_sol_refund_window_sec' in offer) {
+      throw new Error(`${toolName}: offers[${index}] min_sol_refund_window_sec/max_sol_refund_window_sec not allowed for ${pair}`);
+    }
+    const refundField = getOfferExactRefundFieldForPair(pair);
+    const refundSec =
+      expectOptionalInt(offer, toolName, refundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
+      SOL_REFUND_DEFAULT_SEC;
+    return { settlement_refund_after_sec: refundSec };
+  }
+
+  const minWin =
+    expectOptionalInt(offer, toolName, 'min_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
+    SOL_REFUND_DEFAULT_SEC;
+  const maxWin =
+    expectOptionalInt(offer, toolName, 'max_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
+    SOL_REFUND_MAX_SEC;
+  if (minWin > maxWin) throw new Error(`${toolName}: offers[${index}] min_sol_refund_window_sec must be <= max_sol_refund_window_sec`);
+  return { min_sol_refund_window_sec: minWin, max_sol_refund_window_sec: maxWin };
 }
 
 function assertRefundAfterUnixWindow(refundAfterUnix, toolName) {
@@ -3198,6 +3252,8 @@ export class ToolExecutor {
         if (env.kind === KIND.RFQ || env.kind === KIND.QUOTE || env.kind === KIND.TERMS) {
           if (env.body.btc_sats !== undefined) out.btc_sats = env.body.btc_sats;
           if (env.body.usdt_amount !== undefined) out.usdt_amount = env.body.usdt_amount;
+          if (env.body.tao_amount_atomic !== undefined) out.tao_amount_atomic = env.body.tao_amount_atomic;
+          if (env.body.pair !== undefined) out.pair = env.body.pair;
         }
         if (env.body.rfq_id !== undefined) out.rfq_id = env.body.rfq_id;
         if (env.body.quote_id !== undefined) out.quote_id = env.body.quote_id;
@@ -3402,25 +3458,42 @@ export class ToolExecutor {
           'pair',
           'have',
           'want',
+          'settlement_kind',
           'line_index',
           'btc_sats',
           'usdt_amount',
+          'tao_amount_atomic',
           'max_platform_fee_bps',
           'max_trade_fee_bps',
           'max_total_fee_bps',
           'min_sol_refund_window_sec',
           'max_sol_refund_window_sec',
+          'settlement_refund_after_sec',
         ];
         for (const k of Object.keys(offer)) {
           if (!allowed.includes(k)) throw new Error(`${toolName}: offers[${i}].${k} unexpected`);
         }
 
-        const pair = expectOptionalString(offer, toolName, 'pair', { min: 1, max: 64 }) ?? PAIR.BTC_LN__USDT_SOL;
-        if (pair !== PAIR.BTC_LN__USDT_SOL) throw new Error(`${toolName}: offers[${i}].pair unsupported`);
-        const have = expectOptionalString(offer, toolName, 'have', { min: 1, max: 32 }) ?? ASSET.USDT_SOL;
+        const pair = normalizePair(expectOptionalString(offer, toolName, 'pair', { min: 1, max: 64 }) ?? PAIR.BTC_LN__USDT_SOL);
+        const have = expectOptionalString(offer, toolName, 'have', { min: 1, max: 32 }) ?? getHaveAssetForPair(pair);
         const want = expectOptionalString(offer, toolName, 'want', { min: 1, max: 32 }) ?? ASSET.BTC_LN;
-        if (have !== ASSET.USDT_SOL) throw new Error(`${toolName}: offers[${i}].have must be ${ASSET.USDT_SOL}`);
+        const settlementKind = expectOptionalString(offer, toolName, 'settlement_kind', { min: 1, max: 32 }) ?? getPairSettlementKind(pair);
+        if (have !== getHaveAssetForPair(pair)) throw new Error(`${toolName}: offers[${i}].have must be ${getHaveAssetForPair(pair)}`);
         if (want !== ASSET.BTC_LN) throw new Error(`${toolName}: offers[${i}].want must be ${ASSET.BTC_LN}`);
+        if (settlementKind !== getPairSettlementKind(pair)) {
+          throw new Error(`${toolName}: offers[${i}].settlement_kind must be ${getPairSettlementKind(pair)} for ${pair}`);
+        }
+        if (isTaoPair(pair) && ('usdt_amount' in offer)) {
+          throw new Error(`${toolName}: offers[${i}].usdt_amount not allowed for ${pair}`);
+        }
+        if (!isTaoPair(pair) && ('tao_amount_atomic' in offer || 'settlement_refund_after_sec' in offer)) {
+          throw new Error(`${toolName}: offers[${i}].tao_amount_atomic/settlement_refund_after_sec not allowed for ${pair}`);
+        }
+        if (settlementKind !== this._settlementKind()) {
+          throw new Error(
+            `${toolName}: offers[${i}] pair ${pair} requires settlement_kind=${settlementKind}, but executor is configured for ${this._settlementKind()}`
+          );
+        }
 
         const lineIndex = expectOptionalInt(offer, toolName, 'line_index', { min: 0, max: 1_000_000 }) ?? i;
         if (usedLineIndices.has(lineIndex)) {
@@ -3429,7 +3502,11 @@ export class ToolExecutor {
         usedLineIndices.add(lineIndex);
 
         const btcSats = expectInt(offer, toolName, 'btc_sats', { min: 1 });
-        const usdtAmount = normalizeAtomicAmount(expectString(offer, toolName, 'usdt_amount', { max: 64 }), `offers[${i}].usdt_amount`);
+        const amountField = getAmountFieldForPair(pair);
+        const amountAtomic = normalizeAtomicAmount(
+          expectString(offer, toolName, amountField, { max: 64 }),
+          `offers[${i}].${amountField}`
+        );
 
         const maxPlatformFeeBps = expectOptionalInt(offer, toolName, 'max_platform_fee_bps', { min: 0, max: 500 }) ?? FIXED_PLATFORM_FEE_BPS;
         const maxTradeFeeBps = expectOptionalInt(offer, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 }) ?? DEFAULT_TRADE_FEE_BPS;
@@ -3437,27 +3514,20 @@ export class ToolExecutor {
         if (maxPlatformFeeBps + maxTradeFeeBps > maxTotalFeeBps) {
           throw new Error(`${toolName}: offers[${i}] max_total_fee_bps must be >= platform+trade`);
         }
-
-        const minWin =
-          expectOptionalInt(offer, toolName, 'min_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-          SOL_REFUND_DEFAULT_SEC;
-        const maxWin =
-          expectOptionalInt(offer, toolName, 'max_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-          SOL_REFUND_MAX_SEC;
-        if (minWin > maxWin) throw new Error(`${toolName}: offers[${i}] min_sol_refund_window_sec must be <= max_sol_refund_window_sec`);
+        const refundFields = normalizeOfferRefundWindowForPair(offer, toolName, i, pair);
 
         maxOffers.push({
           pair,
           have,
           want,
+          settlement_kind: settlementKind,
           line_index: lineIndex,
           btc_sats: btcSats,
-          usdt_amount: usdtAmount,
+          [amountField]: amountAtomic,
           max_platform_fee_bps: maxPlatformFeeBps,
           max_trade_fee_bps: maxTradeFeeBps,
           max_total_fee_bps: maxTotalFeeBps,
-          min_sol_refund_window_sec: minWin,
-          max_sol_refund_window_sec: maxWin,
+          ...refundFields,
         });
       }
 
@@ -3471,9 +3541,10 @@ export class ToolExecutor {
 
       const settlementBinding = this._settlementAppBinding();
       const appHash = this._settlementAppHash();
-      let fundingCheck = { ok: true, skipped: true, reason: 'solana.usdt_mint not configured' };
+      let fundingCheck = { ok: true, skipped: true, reason: 'no settlement funding check required' };
+      const usdtOfferRows = maxOffers.filter((o) => !isTaoPair(o.pair));
       const usdtMintStr = String(this.solana?.usdtMint || '').trim();
-      if (usdtMintStr) {
+      if (usdtOfferRows.length > 0 && usdtMintStr) {
         let signer = null;
         try {
           signer = this._requireSolanaSigner();
@@ -3495,8 +3566,8 @@ export class ToolExecutor {
               `${toolName}: insufficient SOL for tx fees (need_lamports>=${SOL_TX_FEE_BUFFER_LAMPORTS}, have_lamports=${snap.sol_lamports})`
             );
           }
-          for (let i = 0; i < maxOffers.length; i += 1) {
-            const o = maxOffers[i];
+          for (let i = 0; i < usdtOfferRows.length; i += 1) {
+            const o = usdtOfferRows[i];
             const need = computeAtomicWithFeeCeil(o.usdt_amount, o.max_total_fee_bps);
             if (haveUsdt < need) {
               throw new Error(
@@ -3515,6 +3586,9 @@ export class ToolExecutor {
           fundingCheck = { ok: true, skipped: true, reason: 'solana signer not configured' };
         }
       }
+      if (maxOffers.some((o) => isTaoPair(o.pair))) {
+        fundingCheck = { ok: true, skipped: true, reason: 'tao offer funding check not implemented' };
+      }
 
       const unsigned = createUnsignedEnvelope({
         v: 1,
@@ -3522,7 +3596,7 @@ export class ToolExecutor {
         tradeId,
         body: {
           name,
-          pairs: [PAIR.BTC_LN__USDT_SOL],
+          pairs: Array.from(new Set(maxOffers.map((o) => o.pair))),
           rfq_channels: rfqChannels,
           app_tag: INTERCOMSWAP_APP_TAG,
           app_hash: appHash,
@@ -3565,22 +3639,31 @@ export class ToolExecutor {
       assertAllowedKeys(args, toolName, [
         'channel',
         'trade_id',
+        'pair',
         'btc_sats',
         'usdt_amount',
+        'tao_amount_atomic',
         'sol_recipient',
         'max_platform_fee_bps',
         'max_trade_fee_bps',
         'max_total_fee_bps',
         'min_sol_refund_window_sec',
         'max_sol_refund_window_sec',
+        'settlement_refund_after_sec',
         'valid_until_unix',
         'ln_liquidity_mode',
       ]);
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const pair = normalizePair(expectOptionalString(args, toolName, 'pair', { min: 1, max: 64 }) ?? PAIR.BTC_LN__USDT_SOL);
+      if (isTaoPair(pair) && ('usdt_amount' in args)) throw new Error(`${toolName}: usdt_amount not allowed for ${pair}`);
+      if (!isTaoPair(pair) && ('tao_amount_atomic' in args || 'settlement_refund_after_sec' in args)) {
+        throw new Error(`${toolName}: tao_amount_atomic/settlement_refund_after_sec not allowed for ${pair}`);
+      }
       const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
-      const usdtAmount = normalizeAtomicAmount(expectString(args, toolName, 'usdt_amount', { max: 64 }), 'usdt_amount');
+      const amountField = getAmountFieldForPair(pair);
+      const amountAtomic = normalizeAtomicAmount(expectString(args, toolName, amountField, { max: 64 }), amountField);
       const solRecipient =
         'sol_recipient' in args
           ? normalizeSettlementAddress(expectString(args, toolName, 'sol_recipient', { min: 2, max: 66 }), 'sol_recipient')
@@ -3591,14 +3674,28 @@ export class ToolExecutor {
         expectOptionalInt(args, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 }) ?? DEFAULT_TRADE_FEE_BPS;
       const maxTotalFeeBps =
         expectOptionalInt(args, toolName, 'max_total_fee_bps', { min: 0, max: 1500 }) ?? DEFAULT_TOTAL_FEE_BPS;
-      const minSolRefundWindowSec =
-        expectOptionalInt(args, toolName, 'min_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-        SOL_REFUND_DEFAULT_SEC;
-      const maxSolRefundWindowSec =
-        expectOptionalInt(args, toolName, 'max_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-        SOL_REFUND_MAX_SEC;
-      if (minSolRefundWindowSec > maxSolRefundWindowSec) {
-        throw new Error(`${toolName}: min_sol_refund_window_sec must be <= max_sol_refund_window_sec`);
+      const quoteRefundField = getQuoteRefundFieldForPair(pair);
+      const { minField, maxField } = getRfqRefundRangeFieldsForPair(pair);
+      let refundFields = {};
+      if (isTaoPair(pair)) {
+        refundFields = {
+          [quoteRefundField]:
+            expectOptionalInt(args, toolName, quoteRefundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ?? SOL_REFUND_DEFAULT_SEC,
+        };
+      } else {
+        const minSolRefundWindowSec =
+          expectOptionalInt(args, toolName, minField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
+          SOL_REFUND_DEFAULT_SEC;
+        const maxSolRefundWindowSec =
+          expectOptionalInt(args, toolName, maxField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
+          SOL_REFUND_MAX_SEC;
+        if (minSolRefundWindowSec > maxSolRefundWindowSec) {
+          throw new Error(`${toolName}: ${minField} must be <= ${maxField}`);
+        }
+        refundFields = {
+          [minField]: minSolRefundWindowSec,
+          [maxField]: maxSolRefundWindowSec,
+        };
       }
       const validUntil = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
       if (validUntil !== null && isExpiredUnixSec(validUntil)) {
@@ -3614,17 +3711,17 @@ export class ToolExecutor {
         kind: KIND.RFQ,
         tradeId,
         body: {
-          pair: PAIR.BTC_LN__USDT_SOL,
-          direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+          pair,
+          direction: getDirectionForPair(pair),
           app_hash: appHash,
           btc_sats: btcSats,
-          usdt_amount: usdtAmount,
+          [amountField]: amountAtomic,
+          settlement_kind: getPairSettlementKind(pair),
           ...(solRecipient ? { sol_recipient: solRecipient } : {}),
           max_platform_fee_bps: maxPlatformFeeBps,
           max_trade_fee_bps: maxTradeFeeBps,
           max_total_fee_bps: maxTotalFeeBps,
-          min_sol_refund_window_sec: minSolRefundWindowSec,
-          max_sol_refund_window_sec: maxSolRefundWindowSec,
+          ...refundFields,
           ...(validUntil ? { valid_until_unix: validUntil } : {}),
         },
       });
@@ -3651,7 +3748,9 @@ export class ToolExecutor {
 	                role: 'taker',
 	                rfq_channel: channel,
 	                btc_sats: btcSats,
-	                usdt_amount: usdtAmount,
+	                usdt_amount: isTaoPair(pair) ? null : amountAtomic,
+                  settlement_kind: getPairSettlementKind(pair),
+                  ...(isTaoPair(pair) ? { tao_amount_atomic: amountAtomic } : {}),
 	                state: 'rfq',
 	                last_error: null,
 	              });
@@ -3659,7 +3758,7 @@ export class ToolExecutor {
 	                channel,
 	                rfq_id: rfqId,
 	                btc_sats: btcSats,
-	                usdt_amount: usdtAmount,
+	                [amountField]: amountAtomic,
 	                valid_until_unix: validUntil || null,
                   ln_liquidity_mode: lnLiquidityMode,
 	              });
@@ -3677,10 +3776,13 @@ export class ToolExecutor {
         'channel',
         'trade_id',
         'rfq_id',
+        'pair',
         'btc_sats',
         'usdt_amount',
+        'tao_amount_atomic',
         'trade_fee_collector',
         'sol_refund_window_sec',
+        'settlement_refund_after_sec',
         'valid_until_unix',
         'valid_for_sec',
       ]);
@@ -3688,14 +3790,21 @@ export class ToolExecutor {
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
       const rfqId = normalizeHex32(expectString(args, toolName, 'rfq_id', { min: 64, max: 64 }), 'rfq_id');
+      const pair = normalizePair(expectOptionalString(args, toolName, 'pair', { min: 1, max: 64 }) ?? PAIR.BTC_LN__USDT_SOL);
+      if (isTaoPair(pair) && ('usdt_amount' in args)) throw new Error(`${toolName}: usdt_amount not allowed for ${pair}`);
+      if (!isTaoPair(pair) && ('tao_amount_atomic' in args || 'settlement_refund_after_sec' in args)) {
+        throw new Error(`${toolName}: tao_amount_atomic/settlement_refund_after_sec not allowed for ${pair}`);
+      }
       const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
-      const usdtAmount = normalizeAtomicAmount(expectString(args, toolName, 'usdt_amount', { max: 64 }), 'usdt_amount');
+      const amountField = getAmountFieldForPair(pair);
+      const amountAtomic = normalizeAtomicAmount(expectString(args, toolName, amountField, { max: 64 }), amountField);
       const tradeFeeCollector = normalizeSettlementAddress(
         expectString(args, toolName, 'trade_fee_collector', { min: 2, max: 66 }),
         'trade_fee_collector'
       );
-      const solRefundWindowSec =
-        expectOptionalInt(args, toolName, 'sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
+      const quoteRefundField = getQuoteRefundFieldForPair(pair);
+      const quoteRefundWindowSec =
+        expectOptionalInt(args, toolName, quoteRefundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
         SOL_REFUND_DEFAULT_SEC;
       const validUntilRaw = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
       const validFor = expectOptionalInt(args, toolName, 'valid_for_sec', { min: 10, max: 60 * 60 * 24 * 7 });
@@ -3750,10 +3859,11 @@ export class ToolExecutor {
       const platformFeeBps = Number(fees.platformFeeBps || 0);
       const tradeFeeBps = Number(fees.tradeFeeBps || 0);
       if (platformFeeBps + tradeFeeBps > 1500) throw new Error(`${toolName}: on-chain total fee bps exceeds 1500 cap`);
-      const fundingCheck = await maybeAssertLocalUsdtFunding({
+      const fundingCheck = await maybeAssertLocalSettlementFunding({
         executor: this,
         toolName,
-        requiredAtomic: usdtAmount,
+        pair,
+        requiredAtomic: amountAtomic,
         totalFeeBps: platformFeeBps + tradeFeeBps,
         context: 'quote',
       });
@@ -3772,15 +3882,16 @@ export class ToolExecutor {
         tradeId,
         body: {
           rfq_id: rfqId,
-          pair: PAIR.BTC_LN__USDT_SOL,
-          direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+          pair,
+          direction: getDirectionForPair(pair),
           app_hash: appHash,
           btc_sats: btcSats,
-          usdt_amount: usdtAmount,
+          [amountField]: amountAtomic,
+          settlement_kind: getPairSettlementKind(pair),
           platform_fee_bps: platformFeeBps,
           trade_fee_bps: tradeFeeBps,
           trade_fee_collector: tradeFeeCollector,
-          sol_refund_window_sec: solRefundWindowSec,
+          [quoteRefundField]: quoteRefundWindowSec,
           ...(fees.platformFeeCollector ? { platform_fee_collector: String(fees.platformFeeCollector) } : {}),
           valid_until_unix: validUntil,
         },
@@ -3810,6 +3921,7 @@ export class ToolExecutor {
         'offer_line_index',
         'trade_fee_collector',
         'sol_refund_window_sec',
+        'settlement_refund_after_sec',
         'valid_until_unix',
         'valid_for_sec',
       ]);
@@ -3824,9 +3936,11 @@ export class ToolExecutor {
       if (!sigOk.ok) throw new Error(`${toolName}: rfq_envelope signature invalid: ${sigOk.error}`);
 
       const tradeId = String(rfq.trade_id);
+      const pair = normalizePair(rfq?.body?.pair || PAIR.BTC_LN__USDT_SOL);
+      const amountField = getAmountFieldForPair(pair);
       const btcSats = Number(rfq?.body?.btc_sats);
       if (!Number.isInteger(btcSats) || btcSats < 1) throw new Error(`${toolName}: rfq_envelope.body.btc_sats invalid`);
-      const usdtAmount = normalizeAtomicAmount(String(rfq?.body?.usdt_amount), 'rfq_envelope.body.usdt_amount');
+      const amountAtomic = normalizePairAmountFromBody(rfq?.body, pair, `rfq_envelope.body.${amountField}`);
 
       const rfqId = hashUnsignedEnvelope(stripSignature(rfq));
 
@@ -3834,8 +3948,9 @@ export class ToolExecutor {
         expectString(args, toolName, 'trade_fee_collector', { min: 2, max: 66 }),
         'trade_fee_collector'
       );
-      const solRefundWindowSec =
-        expectOptionalInt(args, toolName, 'sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
+      const quoteRefundField = getQuoteRefundFieldForPair(pair);
+      const quoteRefundWindowSec =
+        expectOptionalInt(args, toolName, quoteRefundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
         SOL_REFUND_DEFAULT_SEC;
       const offerArgProvided = args.offer_envelope !== undefined && args.offer_envelope !== null;
       const offerLineArgProvided = args.offer_line_index !== undefined && args.offer_line_index !== null;
@@ -3886,26 +4001,37 @@ export class ToolExecutor {
           );
         }
         const offerLineBtc = Number.parseInt(String(offerLine?.btc_sats || ''), 10);
-        const offerLineUsdt = String(offerLine?.usdt_amount || '').trim();
-        if (!Number.isFinite(offerLineBtc) || offerLineBtc < 1 || !/^[0-9]+$/.test(offerLineUsdt)) {
-          throw new Error(`${toolName}: offer_envelope.offers[offer_line_index] missing btc_sats/usdt_amount`);
+        const offerLineAmount = String(getAmountForPair(offerLine, pair) || '').trim();
+        if (!Number.isFinite(offerLineBtc) || offerLineBtc < 1 || !/^[0-9]+$/.test(offerLineAmount)) {
+          throw new Error(`${toolName}: offer_envelope.offers[offer_line_index] missing btc_sats/${amountField}`);
         }
-        if (offerLineBtc !== btcSats || offerLineUsdt !== usdtAmount) {
-          throw new Error(`${toolName}: offer_envelope.offers[offer_line_index] does not match RFQ btc_sats/usdt_amount`);
+        if (offerLineBtc !== btcSats || offerLineAmount !== amountAtomic) {
+          throw new Error(`${toolName}: offer_envelope.offers[offer_line_index] does not match RFQ btc_sats/${amountField}`);
         }
       }
 
-      const rfqMinWindowRaw = rfq?.body?.min_sol_refund_window_sec;
-      const rfqMaxWindowRaw = rfq?.body?.max_sol_refund_window_sec;
-      const rfqMinWindow =
-        rfqMinWindowRaw !== undefined && rfqMinWindowRaw !== null ? Number.parseInt(String(rfqMinWindowRaw), 10) : null;
-      const rfqMaxWindow =
-        rfqMaxWindowRaw !== undefined && rfqMaxWindowRaw !== null ? Number.parseInt(String(rfqMaxWindowRaw), 10) : null;
-      if (rfqMinWindow !== null && Number.isFinite(rfqMinWindow) && solRefundWindowSec < rfqMinWindow) {
-        throw new Error(`${toolName}: sol_refund_window_sec below RFQ minimum`);
-      }
-      if (rfqMaxWindow !== null && Number.isFinite(rfqMaxWindow) && solRefundWindowSec > rfqMaxWindow) {
-        throw new Error(`${toolName}: sol_refund_window_sec above RFQ maximum`);
+      if (isTaoPair(pair)) {
+        const rfqRefundWindow = rfq?.body?.settlement_refund_after_sec;
+        if (
+          rfqRefundWindow !== undefined &&
+          rfqRefundWindow !== null &&
+          Number.parseInt(String(rfqRefundWindow), 10) !== quoteRefundWindowSec
+        ) {
+          throw new Error(`${toolName}: settlement_refund_after_sec does not match RFQ`);
+        }
+      } else {
+        const rfqMinWindowRaw = rfq?.body?.min_sol_refund_window_sec;
+        const rfqMaxWindowRaw = rfq?.body?.max_sol_refund_window_sec;
+        const rfqMinWindow =
+          rfqMinWindowRaw !== undefined && rfqMinWindowRaw !== null ? Number.parseInt(String(rfqMinWindowRaw), 10) : null;
+        const rfqMaxWindow =
+          rfqMaxWindowRaw !== undefined && rfqMaxWindowRaw !== null ? Number.parseInt(String(rfqMaxWindowRaw), 10) : null;
+        if (rfqMinWindow !== null && Number.isFinite(rfqMinWindow) && quoteRefundWindowSec < rfqMinWindow) {
+          throw new Error(`${toolName}: sol_refund_window_sec below RFQ minimum`);
+        }
+        if (rfqMaxWindow !== null && Number.isFinite(rfqMaxWindow) && quoteRefundWindowSec > rfqMaxWindow) {
+          throw new Error(`${toolName}: sol_refund_window_sec above RFQ maximum`);
+        }
       }
 
       const validUntilRaw = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
@@ -3991,9 +4117,9 @@ export class ToolExecutor {
                   const line = isObject(lineRaw) ? lineRaw : null;
                   if (!line) continue;
                   const lineBtc = Number.parseInt(String(line?.btc_sats || ''), 10);
-                  const lineUsdt = String(line?.usdt_amount || '').trim();
-                  if (!Number.isFinite(lineBtc) || lineBtc < 1 || !/^[0-9]+$/.test(lineUsdt)) continue;
-                  if (lineBtc !== btcSats || lineUsdt !== usdtAmount) continue;
+                  const lineAmount = String(getAmountForPair(line, pair) || '').trim();
+                  if (!Number.isFinite(lineBtc) || lineBtc < 1 || !/^[0-9]+$/.test(lineAmount)) continue;
+                  if (lineBtc !== btcSats || lineAmount !== amountAtomic) continue;
                   const stableLineIndex = toNonNegativeIntOrNull(line?.line_index);
                   const lineIndex = stableLineIndex !== null ? stableLineIndex : j;
                   let cand = null;
@@ -4088,10 +4214,11 @@ export class ToolExecutor {
             `(platform_plus_trade_fee_bps=${platformFeeBps + tradeFeeBps}, rfq_max_total_fee_bps=${rfqMaxTotalFeeBps}, trade_fee_collector=${tradeFeeCollector})`
         );
       }
-      const fundingCheck = await maybeAssertLocalUsdtFunding({
+      const fundingCheck = await maybeAssertLocalSettlementFunding({
         executor: this,
         toolName,
-        requiredAtomic: usdtAmount,
+        pair,
+        requiredAtomic: amountAtomic,
         totalFeeBps: platformFeeBps + tradeFeeBps,
         context: `rfq:${rfqId}`,
       });
@@ -4114,15 +4241,16 @@ export class ToolExecutor {
         tradeId,
         body: {
           rfq_id: rfqId,
-          pair: PAIR.BTC_LN__USDT_SOL,
-          direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+          pair,
+          direction: getDirectionForPair(pair),
           app_hash: appHash,
           btc_sats: btcSats,
-          usdt_amount: usdtAmount,
+          [amountField]: amountAtomic,
+          settlement_kind: getPairSettlementKind(pair),
           platform_fee_bps: platformFeeBps,
           trade_fee_bps: tradeFeeBps,
           trade_fee_collector: tradeFeeCollector,
-          sol_refund_window_sec: solRefundWindowSec,
+          [quoteRefundField]: quoteRefundWindowSec,
           ...(offerLineListing
             ? {
                 offer_id: offerLineListing.offerId,
@@ -4996,8 +5124,10 @@ export class ToolExecutor {
       assertAllowedKeys(args, toolName, [
         'channel',
         'trade_id',
+        'pair',
         'btc_sats',
         'usdt_amount',
+        'tao_amount_atomic',
         'sol_mint',
         'sol_recipient',
         'sol_refund',
@@ -5010,8 +5140,14 @@ export class ToolExecutor {
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const pair = normalizePair(expectOptionalString(args, toolName, 'pair', { min: 1, max: 64 }) ?? PAIR.BTC_LN__USDT_SOL);
+      if (isTaoPair(pair) && ('usdt_amount' in args)) throw new Error(`${toolName}: usdt_amount not allowed for ${pair}`);
+      if (!isTaoPair(pair) && ('tao_amount_atomic' in args)) {
+        throw new Error(`${toolName}: tao_amount_atomic not allowed for ${pair}`);
+      }
       const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
-      const usdtAmount = normalizeAtomicAmount(expectString(args, toolName, 'usdt_amount', { max: 64 }), 'usdt_amount');
+      const amountField = getAmountFieldForPair(pair);
+      const amountAtomic = normalizeAtomicAmount(expectString(args, toolName, amountField, { max: 64 }), amountField);
       const solMint = normalizeSettlementAddress(expectString(args, toolName, 'sol_mint', { min: 2, max: 66 }), 'sol_mint');
       const solRecipient = normalizeSettlementAddress(expectString(args, toolName, 'sol_recipient', { min: 2, max: 66 }), 'sol_recipient');
       const solRefund = normalizeSettlementAddress(expectString(args, toolName, 'sol_refund', { min: 2, max: 66 }), 'sol_refund');
@@ -5039,12 +5175,13 @@ export class ToolExecutor {
         kind: KIND.TERMS,
         tradeId,
         body: {
-          pair: PAIR.BTC_LN__USDT_SOL,
-          direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+          pair,
+          direction: getDirectionForPair(pair),
           app_hash: appHash,
           btc_sats: btcSats,
-          usdt_amount: usdtAmount,
-          usdt_decimals: 6,
+          [amountField]: amountAtomic,
+          ...(isTaoPair(pair) ? {} : { usdt_decimals: 6 }),
+          settlement_kind: getPairSettlementKind(pair),
           sol_mint: solMint,
           sol_recipient: solRecipient,
           sol_refund: solRefund,
@@ -5074,7 +5211,9 @@ export class ToolExecutor {
           maker_peer: String(signed.signer || '').trim().toLowerCase() || lnReceiverPeer,
           taker_peer: lnPayerPeer,
           btc_sats: btcSats,
-          usdt_amount: usdtAmount,
+          usdt_amount: isTaoPair(pair) ? null : amountAtomic,
+          settlement_kind: getPairSettlementKind(pair),
+          ...(isTaoPair(pair) ? { tao_amount_atomic: amountAtomic } : {}),
           sol_mint: solMint,
           sol_program_id: settlementBinding,
           sol_recipient: solRecipient,
@@ -5259,8 +5398,9 @@ export class ToolExecutor {
         const signed = signSwapEnvelope(unsigned, signing);
         await this._sendEnvelopeLogged(sc, channel, signed);
         const body = isObject(terms.body) ? terms.body : {};
+        const pair = normalizePair(body.pair || PAIR.BTC_LN__USDT_SOL);
         const btcSats = Number.isFinite(Number(body.btc_sats)) ? Math.trunc(Number(body.btc_sats)) : null;
-        const usdtAmount = typeof body.usdt_amount === 'string' ? body.usdt_amount : null;
+        const amountAtomic = getAmountForPair(body, pair, { allowLegacyTaoFallback: true }) || null;
         const programId = this._settlementAppBinding();
         store.upsertTrade(tradeId, {
           role: 'taker',
@@ -5268,7 +5408,9 @@ export class ToolExecutor {
           maker_peer: String(terms.signer || '').trim().toLowerCase() || null,
           taker_peer: String(signed.signer || '').trim().toLowerCase() || null,
           btc_sats: btcSats ?? undefined,
-          usdt_amount: usdtAmount ?? undefined,
+          usdt_amount: isTaoPair(pair) ? undefined : amountAtomic ?? undefined,
+          settlement_kind: getPairSettlementKind(pair),
+          ...(isTaoPair(pair) && amountAtomic ? { tao_amount_atomic: amountAtomic } : {}),
           sol_mint: typeof body.sol_mint === 'string' ? body.sol_mint : undefined,
           sol_program_id: programId,
           sol_recipient: typeof body.sol_recipient === 'string' ? body.sol_recipient : undefined,

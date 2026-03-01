@@ -1,4 +1,14 @@
 import { hashUnsignedEnvelope } from '../swap/hash.js';
+import {
+  getAmountFieldForPair,
+  getAmountForPair,
+  getDirectionForPair,
+  getPairSettlementKind,
+  getQuoteRefundFieldForPair,
+  getRfqRefundRangeFieldsForPair,
+  isTaoPair,
+  normalizePair,
+} from '../swap/pairs.js';
 import { SETTLEMENT_KIND, normalizeSettlementKind } from '../../settlement/providerFactory.js';
 
 const FIXED_PLATFORM_FEE_BPS = 10; // 0.1%
@@ -167,16 +177,24 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
   const rfqBody = rfqMsg?.body && typeof rfqMsg.body === 'object' ? rfqMsg.body : null;
   if (!rfqBody) return null;
 
+  const pair = normalizePair(rfqBody.pair);
+  const amountField = getAmountFieldForPair(pair);
   const rfqBtc = toIntOrNull(rfqBody.btc_sats);
-  const rfqUsdt = String(rfqBody.usdt_amount || '').trim();
-  if (rfqBtc === null || rfqBtc < 1 || !/^[0-9]+$/.test(rfqUsdt)) return null;
+  const rfqAmount = String(getAmountForPair(rfqBody, pair) || '').trim();
+  if (rfqBtc === null || rfqBtc < 1 || !/^[0-9]+$/.test(rfqAmount)) return null;
 
   const rfqMaxPlatform = Math.max(0, Math.min(500, toIntOrNull(rfqBody.max_platform_fee_bps) ?? FIXED_PLATFORM_FEE_BPS));
   const rfqMaxTrade = Math.max(0, Math.min(1000, toIntOrNull(rfqBody.max_trade_fee_bps) ?? DEFAULT_TRADE_FEE_BPS));
   const rfqMaxTotal = Math.max(0, Math.min(1500, toIntOrNull(rfqBody.max_total_fee_bps) ?? DEFAULT_TOTAL_FEE_BPS));
-  const rfqMinWin = Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(rfqBody.min_sol_refund_window_sec) ?? 3600));
-  const rfqMaxWin = Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(rfqBody.max_sol_refund_window_sec) ?? 7 * 24 * 3600));
-  if (rfqMinWin > rfqMaxWin) return null;
+  const { minField, maxField } = getRfqRefundRangeFieldsForPair(pair);
+  const quoteRefundField = getQuoteRefundFieldForPair(pair);
+  const rfqMinWin = isTaoPair(pair)
+    ? Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(rfqBody[quoteRefundField]) ?? 72 * 3600))
+    : Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(rfqBody[minField]) ?? 3600));
+  const rfqMaxWin = isTaoPair(pair)
+    ? rfqMinWin
+    : Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(rfqBody[maxField]) ?? 7 * 24 * 3600));
+  if (!isTaoPair(pair) && rfqMinWin > rfqMaxWin) return null;
 
   const rfqChannel = String(rfqEvt?.channel || '').trim();
   const nowSec = Math.floor(Date.now() / 1000);
@@ -205,32 +223,41 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
       const lineRaw = offers[lineIndex];
       const line = isObject(lineRaw) ? lineRaw : null;
       if (!line) continue;
+      const linePair = normalizePair(line.pair || pair);
+      if (linePair !== pair) continue;
       const lineBtc = toIntOrNull(line.btc_sats);
-      const lineUsdt = String(line.usdt_amount || '').trim();
-      if (lineBtc === null || lineBtc < 1 || !/^[0-9]+$/.test(lineUsdt)) continue;
-      if (lineBtc !== rfqBtc || lineUsdt !== rfqUsdt) continue;
+      const lineAmount = String(getAmountForPair(line, linePair) || '').trim();
+      if (lineBtc === null || lineBtc < 1 || !/^[0-9]+$/.test(lineAmount)) continue;
+      if (lineBtc !== rfqBtc || lineAmount !== rfqAmount) continue;
 
       const lineMaxPlatform = Math.max(0, Math.min(500, toIntOrNull(line.max_platform_fee_bps) ?? FIXED_PLATFORM_FEE_BPS));
       const lineMaxTrade = Math.max(0, Math.min(1000, toIntOrNull(line.max_trade_fee_bps) ?? DEFAULT_TRADE_FEE_BPS));
       const lineMaxTotal = Math.max(0, Math.min(1500, toIntOrNull(line.max_total_fee_bps) ?? DEFAULT_TOTAL_FEE_BPS));
       if (lineMaxPlatform > rfqMaxPlatform || lineMaxTrade > rfqMaxTrade || lineMaxTotal > rfqMaxTotal) continue;
 
-      const lineMinWin = Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(line.min_sol_refund_window_sec) ?? 3600));
-      const lineMaxWin = Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(line.max_sol_refund_window_sec) ?? 7 * 24 * 3600));
+      const lineMinWin = isTaoPair(pair)
+        ? Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(line[quoteRefundField]) ?? 72 * 3600))
+        : Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(line.min_sol_refund_window_sec) ?? 3600));
+      const lineMaxWin = isTaoPair(pair)
+        ? lineMinWin
+        : Math.max(3600, Math.min(7 * 24 * 3600, toIntOrNull(line.max_sol_refund_window_sec) ?? 7 * 24 * 3600));
       const overlapMin = Math.max(rfqMinWin, lineMinWin);
       const overlapMax = Math.min(rfqMaxWin, lineMaxWin);
       if (overlapMin > overlapMax) continue;
 
-      let solRefundWindowSec = 72 * 3600;
-      if (solRefundWindowSec < overlapMin) solRefundWindowSec = overlapMin;
-      if (solRefundWindowSec > overlapMax) solRefundWindowSec = overlapMax;
+      let refundWindowSec = 72 * 3600;
+      if (refundWindowSec < overlapMin) refundWindowSec = overlapMin;
+      if (refundWindowSec > overlapMax) refundWindowSec = overlapMax;
       const stableLineIndex = toIntOrNull(line.line_index);
       const offerLineIndexOut = stableLineIndex !== null && stableLineIndex >= 0 ? stableLineIndex : lineIndex;
       return {
-        solRefundWindowSec,
+        pair,
+        settlement_kind: getPairSettlementKind(pair),
+        refundWindowSec,
         offerId,
         offerLineIndex: offerLineIndexOut,
         offerEnvelope: msg,
+        amountField,
       };
     }
   }
@@ -1478,10 +1505,14 @@ export class TradeAutoManager {
           }
           const match = matchOfferForRfq({ rfqEvt, myOfferEvents: ctx.myOfferEvents });
           if (!match && this.opts.enable_quote_from_rfqs !== true) continue;
+          const rfqBody = isObject(rfqEvt?.message?.body) ? rfqEvt.message.body : {};
+          const pair = normalizePair(rfqBody.pair);
+          const quoteRefundField = getQuoteRefundFieldForPair(pair);
           const refundWindowSec =
-            match && Number.isFinite(Number(match.solRefundWindowSec))
-              ? Number(match.solRefundWindowSec)
+            match && Number.isFinite(Number(match.refundWindowSec))
+              ? Number(match.refundWindowSec)
               : Number(this.opts.default_sol_refund_window_sec || 72 * 3600);
+          if (getPairSettlementKind(pair) !== this.opts.settlement_kind) continue;
           try {
             const ch = String(rfqEvt?.channel || '').trim();
             if (!ch) continue;
@@ -1497,7 +1528,7 @@ export class TradeAutoManager {
                     }
                   : {}),
                 trade_fee_collector: localSettlementSigner,
-                sol_refund_window_sec: refundWindowSec,
+                [quoteRefundField]: refundWindowSec,
                 valid_for_sec: 180,
               },
             });
@@ -1864,21 +1895,26 @@ export class TradeAutoManager {
               try {
                 const quoteBody = isObject(quoteEnv?.body) ? quoteEnv.body : {};
                 const rfqBody = isObject(rfqEnv?.body) ? rfqEnv.body : {};
+                const pair = normalizePair(quoteBody?.pair ?? rfqBody?.pair);
+                const amountField = getAmountFieldForPair(pair);
+                const quoteRefundField = getQuoteRefundFieldForPair(pair);
                 const btcSats = toIntOrNull(quoteBody?.btc_sats ?? rfqBody?.btc_sats);
-                const usdtAmount = String(quoteBody?.usdt_amount ?? rfqBody?.usdt_amount ?? '').trim();
+                const amountAtomic = String(
+                  getAmountForPair(quoteBody, pair) || getAmountForPair(rfqBody, pair) || ''
+                ).trim();
                 const solRecipient = String(rfqBody?.sol_recipient || '').trim();
                 const solRefund = localSettlementSigner;
                 const tradeFeeCollector = String(quoteBody?.trade_fee_collector || '').trim();
                 const lnPayerPeer = String(quoteAcceptEnv?.signer || rfqEnv?.signer || '').trim().toLowerCase();
                 const solMint = String(this.opts.usdt_mint || rfqBody?.sol_mint || quoteBody?.sol_mint || '').trim();
                 if (btcSats === null || btcSats < 1) throw new Error('terms_post: missing btc_sats');
-                if (!/^[0-9]+$/.test(usdtAmount)) throw new Error('terms_post: missing usdt_amount');
+                if (!/^[0-9]+$/.test(amountAtomic)) throw new Error(`terms_post: missing ${amountField}`);
                 if (!solMint) throw new Error('terms_post: missing usdt_mint');
                 if (!solRecipient) throw new Error('terms_post: missing sol_recipient');
                 if (!solRefund) throw new Error('terms_post: missing sol_refund');
                 if (!tradeFeeCollector) throw new Error('terms_post: missing trade_fee_collector');
                 if (!lnPayerPeer) throw new Error('terms_post: missing ln_payer_peer');
-                const quoteRefundWindowSec = clampInt(toIntOrNull(quoteBody?.sol_refund_window_sec), {
+                const quoteRefundWindowSec = clampInt(toIntOrNull(quoteBody?.[quoteRefundField]), {
                   min: 3600,
                   max: 7 * 24 * 3600,
                   fallback: this.opts.default_sol_refund_window_sec,
@@ -1890,8 +1926,9 @@ export class TradeAutoManager {
                   args: {
                     channel: swapChannel,
                     trade_id: tradeId,
+                    pair,
                     btc_sats: btcSats,
-                    usdt_amount: usdtAmount,
+                    [amountField]: amountAtomic,
                     sol_mint: solMint,
                     sol_recipient: solRecipient,
                     sol_refund: solRefund,
@@ -2358,7 +2395,8 @@ export class TradeAutoManager {
                 const invBody = isObject(invoiceEnv?.body) ? invoiceEnv.body : {};
                 const paymentHashHex = String(invBody?.payment_hash_hex || '').trim().toLowerCase();
                 const mint = String(termsBody?.sol_mint || this.opts.usdt_mint || '').trim();
-                const amount = String(termsBody?.usdt_amount || '').trim();
+                const termsPair = normalizePair(termsBody?.pair);
+                const amount = String(getAmountForPair(termsBody, termsPair, { allowLegacyTaoFallback: true }) || '').trim();
                 const recipient = String(termsBody?.sol_recipient || '').trim();
                 const refund = String(termsBody?.sol_refund || '').trim();
                 const refundAfterUnix = toIntOrNull(termsBody?.sol_refund_after_unix);

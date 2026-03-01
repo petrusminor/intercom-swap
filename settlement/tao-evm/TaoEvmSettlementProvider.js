@@ -8,6 +8,7 @@ import {
   isAddress,
   randomBytes,
 } from 'ethers';
+import { getAmountForPair, normalizePair } from '../../src/swap/pairs.js';
 
 const DEFAULT_RPC_URL = 'https://lite.chain.opentensor.ai';
 const DEFAULT_CHAIN_ID = 964n;
@@ -355,6 +356,8 @@ export class TaoEvmSettlementProvider {
     const terms = parseMetadataObject(input?.terms);
     const invoiceBody = parseMetadataObject(input?.invoiceBody);
     const escrowBody = parseMetadataObject(input?.escrowBody);
+    const termsPair = normalizePair(terms?.pair);
+    const termsAmount = String(getAmountForPair(terms, termsPair, { allowLegacyTaoFallback: true }) || '').trim();
 
     const settlementId = String(escrowBody?.settlement_id || '').trim();
     if (!settlementId) return { ok: false, error: 'escrowBody.settlement_id is required' };
@@ -377,7 +380,7 @@ export class TaoEvmSettlementProvider {
     if (terms?.sol_refund !== undefined && String(terms.sol_refund).trim() !== String(escrowBody?.refund || '').trim()) {
       return { ok: false, error: 'lock refund mismatch vs terms' };
     }
-    if (terms?.usdt_amount !== undefined && String(terms.usdt_amount).trim() !== String(escrowBody?.amount_atomic || '').trim()) {
+    if (termsAmount && termsAmount !== String(escrowBody?.amount_atomic || '').trim()) {
       return { ok: false, error: 'lock amount mismatch vs terms' };
     }
     if (
@@ -433,14 +436,10 @@ export class TaoEvmSettlementProvider {
         error: `amount_atomic mismatch vs on-chain (expected=${escrowAmountAtomic}, got=${onchainAmountAtomic})`,
       };
     }
-    if (
-      terms?.usdt_amount !== undefined &&
-      terms?.usdt_amount !== null &&
-      String(terms.usdt_amount).trim() !== onchainAmountAtomic
-    ) {
+    if (termsAmount && termsAmount !== onchainAmountAtomic) {
       return {
         ok: false,
-        error: `amount_atomic mismatch vs terms (expected=${String(terms.usdt_amount).trim()}, got=${onchainAmountAtomic})`,
+        error: `amount_atomic mismatch vs terms (expected=${termsAmount}, got=${onchainAmountAtomic})`,
       };
     }
 
@@ -471,6 +470,20 @@ export class TaoEvmSettlementProvider {
         return {
           ok: false,
           error: `refund_after_unix mismatch vs terms (expected=${termsRefundAfterUnix}, got=${onchainRefundAfterUnix})`,
+        };
+      }
+    }
+    const invoiceExpiresAtUnix = Number(invoiceBody?.expires_at_unix);
+    if (Number.isFinite(invoiceExpiresAtUnix) && Number.isInteger(invoiceExpiresAtUnix) && invoiceExpiresAtUnix > 0) {
+      const minTimelockRemainingSec = parseMinRefundSafetySec();
+      const minSafeRefundAfterUnix = invoiceExpiresAtUnix + minTimelockRemainingSec;
+      if (onchainRefundAfterUnix <= minSafeRefundAfterUnix) {
+        return {
+          ok: false,
+          error:
+            `refund_after_unix must be > invoice_expiry_unix + INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC ` +
+            `(refund_after_unix=${onchainRefundAfterUnix} invoice_expiry_unix=${invoiceExpiresAtUnix} ` +
+            `min_timelock_remaining_sec=${minTimelockRemainingSec})`,
         };
       }
     }

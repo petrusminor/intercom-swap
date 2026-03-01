@@ -6,7 +6,8 @@ cd "$ROOT"
 
 if [[ $# -lt 2 ]]; then
   echo "Usage: scripts/rfq-maker-peer.sh <storeName> <scBridgePort> [rfq-maker args...]" >&2
-  echo "Example: scripts/rfq-maker-peer.sh swap-maker 49222 --rfq-channel 0000intercomswapbtcusdt" >&2
+  echo "Example (SOL): scripts/rfq-maker-peer.sh swap-maker 49222 --rfq-channel 0000intercomswapbtcusdt" >&2
+  echo "Example (TAO): scripts/rfq-maker-peer.sh swap-maker 49222 --rfq-channel 0000intercomswapbtctao --settlement tao-evm --settlement-refund-after-sec 259200" >&2
   exit 1
 fi
 

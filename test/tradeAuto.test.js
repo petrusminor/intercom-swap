@@ -87,7 +87,9 @@ test('tradeauto: settlement can start from synthetic swap context (no prior swap
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: MAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [] };
+      if (tool === 'intercomswap_quote_post_from_rfq') return { type: 'quote_posted' };
       if (tool === 'intercomswap_terms_post') {
         sent.push({ tool, args });
         return { type: 'terms_posted' };
@@ -122,6 +124,7 @@ test('tradeauto: start while running can enable trace immediately', async () => 
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: MAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [] };
       throw new Error(`unexpected tool: ${tool}`);
     },
@@ -214,7 +217,9 @@ test('tradeauto: settlement resolves local peer from sc_info.info.peerPubkey', a
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { type: 'info', info: { peerPubkey: MAKER } };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [] };
+      if (tool === 'intercomswap_quote_post_from_rfq') return { type: 'quote_posted' };
       if (tool === 'intercomswap_terms_post') {
         sent.push({ tool, args });
         return { type: 'terms_posted' };
@@ -305,6 +310,7 @@ test('tradeauto: offer-sourced quote path remains active (service announce -> qu
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: MAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [] };
       if (tool === 'intercomswap_quote_post_from_rfq') {
         posted.push({ tool, args });
@@ -328,6 +334,98 @@ test('tradeauto: offer-sourced quote path remains active (service announce -> qu
     assert.equal(String(posted[0]?.args?.channel || ''), '0000intercomswapbtcusdt');
     assert.equal(Number(posted[0]?.args?.offer_line_index), 0);
     assert.equal(String(posted[0]?.args?.offer_envelope?.kind || ''), 'swap.svc_announce');
+  } finally {
+    await mgr.stop({ reason: 'test_done' });
+  }
+});
+
+test('tradeauto: TAO offer-sourced quote uses TAO pair, amount, and refund field', async () => {
+  const tradeId = 'swap_test_offer_tao_1';
+  const now = Date.now();
+  const posted = [];
+  const events = [
+    {
+      seq: 1,
+      ts: now,
+      channel: '0000intercomswapbtctao',
+      kind: 'swap.svc_announce',
+      local: true,
+      dir: 'out',
+      origin: 'local',
+      message: env('swap.svc_announce', 'svc:maker:tao', MAKER, {
+        name: 'maker:tao',
+        pairs: ['BTC_LN/TAO_EVM'],
+        rfq_channels: ['0000intercomswapbtctao'],
+        offers: [
+          {
+            pair: 'BTC_LN/TAO_EVM',
+            have: 'TAO_EVM',
+            want: 'BTC_LN',
+            btc_sats: 10000,
+            tao_amount_atomic: '4200000000',
+            max_platform_fee_bps: 50,
+            max_trade_fee_bps: 50,
+            max_total_fee_bps: 100,
+            settlement_refund_after_sec: 259200,
+          },
+        ],
+      }),
+    },
+    {
+      seq: 2,
+      ts: now + 1,
+      channel: '0000intercomswapbtctao',
+      kind: 'swap.rfq',
+      message: env('swap.rfq', tradeId, TAKER, {
+        pair: 'BTC_LN/TAO_EVM',
+        direction: 'BTC_LN->TAO_EVM',
+        btc_sats: 10000,
+        tao_amount_atomic: '4200000000',
+        max_platform_fee_bps: 50,
+        max_trade_fee_bps: 50,
+        max_total_fee_bps: 100,
+        settlement_refund_after_sec: 259200,
+        valid_until_unix: Math.floor((now + 120_000) / 1000),
+      }),
+    },
+  ];
+
+  let readOnce = false;
+  const mgr = new TradeAutoManager({
+    scLogInfo: () => ({ latest_seq: 2 }),
+    scLogRead: () => {
+      if (readOnce) return { latest_seq: 2, events: [] };
+      readOnce = true;
+      return { latest_seq: 2, events };
+    },
+    runTool: async ({ tool, args }) => {
+      if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
+      if (tool === 'intercomswap_sc_info') return { peer: MAKER };
+      if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
+      if (tool === 'intercomswap_sc_stats') return { channels: [] };
+      if (tool === 'intercomswap_quote_post_from_rfq') {
+        posted.push({ tool, args });
+        return { type: 'quote_posted' };
+      }
+      throw new Error(`unexpected tool: ${tool}`);
+    },
+  });
+
+  try {
+    await mgr.start({
+      channels: ['0000intercomswapbtctao'],
+      settlement_kind: 'tao-evm',
+      enable_quote_from_offers: true,
+      enable_accept_quotes: false,
+      enable_invite_from_accepts: false,
+      enable_join_invites: false,
+      enable_settlement: false,
+    });
+    assert.equal(posted.length, 1);
+    assert.equal(String(posted[0]?.args?.channel || ''), '0000intercomswapbtctao');
+    assert.equal(posted[0]?.args?.settlement_refund_after_sec, 259200);
+    assert.equal(Number(posted[0]?.args?.offer_line_index), 0);
   } finally {
     await mgr.stop({ reason: 'test_done' });
   }
@@ -370,6 +468,7 @@ test('tradeauto: RFQ auto-quote can run without offer match when enabled', async
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: MAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [] };
       if (tool === 'intercomswap_quote_post_from_rfq') {
         posted.push({ tool, args });
@@ -445,6 +544,7 @@ test('tradeauto: RFQ auto-quote is suppressed when trade already has quote_accep
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: MAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [] };
       if (tool === 'intercomswap_quote_post_from_rfq') {
         posted.push({ tool, args });
@@ -517,6 +617,7 @@ test('tradeauto: aggregate liquidity mode is honored for RFQ auto-accept', async
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [] };
       if (tool === 'intercomswap_quote_accept') {
         accepted.push({ tool, args });
@@ -573,6 +674,7 @@ test('tradeauto: backend auto-leaves stale swap channels (expired invite)', asyn
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [`swap:${tradeId}`] };
       if (tool === 'intercomswap_sc_leave') {
         left.push(String(args?.channel || ''));
@@ -681,6 +783,7 @@ test('tradeauto: taker waiting_terms replays quote_accept and then accepts terms
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_sc_send_json') {
         replayCalls.push({ tool, args });
@@ -786,6 +889,7 @@ test('tradeauto: waiting_terms timeout auto-leaves swap channel (bounded wait)',
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_sc_leave') {
         left.push(String(args?.channel || ''));
@@ -892,6 +996,7 @@ test('tradeauto: ln_pay failure auto-leave is deterministic and does not leave e
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_swap_ln_pay_and_post_verified') {
         lnPayAttempts += 1;
@@ -982,6 +1087,7 @@ test('tradeauto: unroutable invoice precheck aborts immediately and traces once'
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_swap_ln_pay_and_post_verified') {
         lnPayAttempts += 1;
@@ -1064,6 +1170,7 @@ test('tradeauto: taker ln_route_precheck failure is traced and status-posted', a
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_swap_ln_route_precheck_from_terms_invoice') {
         throw new Error('intercomswap_swap_ln_route_precheck_from_terms_invoice: unroutable invoice precheck: payer has no active Lightning channels');
@@ -1138,6 +1245,7 @@ test('tradeauto: maker waits for taker ln_route_precheck_ok before escrow', asyn
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: MAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM' };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM' };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_swap_sol_escrow_init_and_post') {
         escrowCalls.push(Date.now());
@@ -1277,6 +1385,7 @@ test('tradeauto: waiting_terms replays latest quote_accept for reposted trade id
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [newSwapChannel] };
       if (tool === 'intercomswap_join_from_swap_invite') return { type: 'joined', swap_channel: newSwapChannel };
       if (tool === 'intercomswap_sc_send_json') {
@@ -1357,6 +1466,7 @@ test('tradeauto: bounded stage retries cancel+leave on ln_route_precheck exhaust
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: TAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: SOL_RECIPIENT };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_swap_ln_route_precheck_from_terms_invoice') {
         precheckCalls += 1;
@@ -1454,6 +1564,7 @@ test('tradeauto: maker aborts immediately when payer reports ln_route_precheck_f
       if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
       if (tool === 'intercomswap_sc_info') return { peer: MAKER };
       if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM' };
+      if (tool === 'intercomswap_settlement_signer_address') return { address: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM' };
       if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
       if (tool === 'intercomswap_swap_sol_escrow_init_and_post') {
         throw new Error('escrow should not be called when payer precheck failed');

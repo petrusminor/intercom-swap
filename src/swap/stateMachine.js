@@ -1,4 +1,5 @@
 import { KIND, STATE } from './constants.js';
+import { getAmountForPair, normalizePair } from './pairs.js';
 import { hashUnsignedEnvelope } from './hash.js';
 import { validateSwapEnvelope } from './schema.js';
 import { verifySignedEnvelope } from '../protocol/signedMessage.js';
@@ -191,6 +192,8 @@ export function applySwapEnvelope(trade, envelope) {
     case KIND.TAO_HTLC_LOCKED: {
       const isTao = envelope.kind === KIND.TAO_HTLC_LOCKED;
       const label = isTao ? 'TAO_HTLC_LOCKED' : 'SOL_ESCROW_CREATED';
+      const termsPair = normalizePair(next.terms?.pair);
+      const termsAmount = getAmountForPair(next.terms, termsPair, { allowLegacyTaoFallback: true });
       if (![STATE.INVOICE, STATE.ESCROW].includes(next.state)) {
         return { ok: false, error: `${label} not allowed in state=${next.state}`, trade: null };
       }
@@ -214,7 +217,7 @@ export function applySwapEnvelope(trade, envelope) {
       }
 
       if (isTao) {
-        if (String(envelope.body.amount_atomic) !== String(next.terms.usdt_amount)) {
+        if (String(envelope.body.amount_atomic) !== String(termsAmount)) {
           return { ok: false, error: 'TAO HTLC amount_atomic mismatch vs terms', trade: null };
         }
         if (next.escrow) {
@@ -231,7 +234,7 @@ export function applySwapEnvelope(trade, envelope) {
         if (envelope.body.mint !== next.terms.sol_mint) {
           return { ok: false, error: 'SOL escrow mint mismatch vs terms', trade: null };
         }
-        if (String(envelope.body.amount) !== String(next.terms.usdt_amount)) {
+        if (String(envelope.body.amount) !== String(termsAmount)) {
           return { ok: false, error: 'SOL escrow amount mismatch vs terms', trade: null };
         }
         if (next.escrow) {

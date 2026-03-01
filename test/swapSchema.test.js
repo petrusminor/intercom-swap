@@ -8,6 +8,8 @@ import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { deriveIntercomswapAppHash } from '../src/swap/app.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { ASSET, KIND, PAIR } from '../src/swap/constants.js';
+import { resolveRfqSettlementAmountAtomic, resolveSettlementRefundAfterSec } from '../src/rfq/cliFlags.js';
+import { SETTLEMENT_KIND } from '../settlement/providerFactory.js';
 
 const APP_HASH = deriveIntercomswapAppHash({ solanaProgramId: '11111111111111111111111111111111' });
 
@@ -158,6 +160,98 @@ test('swap schema: rfq + quote validate', async () => {
   assert.equal(validateSwapEnvelope(quoteMissingOfferLine).ok, false);
 });
 
+test('swap schema: TAO rfq + quote + terms validate', async () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const receiver = await newWallet();
+  const payer = await newWallet();
+
+  const rfq = createUnsignedEnvelope({
+    v: 1,
+    kind: KIND.RFQ,
+    tradeId: 'rfq_tao_1',
+    body: {
+      pair: PAIR.BTC_LN__TAO_EVM,
+      direction: 'BTC_LN->TAO_EVM',
+      app_hash: APP_HASH,
+      btc_sats: 1000,
+      tao_amount_atomic: '4200000000',
+      settlement_refund_after_sec: 259200,
+      valid_until_unix: nowSec + 60,
+    },
+    ts: Date.now(),
+    nonce: 'rt1',
+  });
+  assert.equal(validateSwapEnvelope(rfq).ok, true);
+  const rfqId = hashUnsignedEnvelope(rfq);
+
+  const quote = createUnsignedEnvelope({
+    v: 1,
+    kind: KIND.QUOTE,
+    tradeId: 'quote_tao_1',
+    body: {
+      rfq_id: rfqId,
+      pair: PAIR.BTC_LN__TAO_EVM,
+      direction: 'BTC_LN->TAO_EVM',
+      app_hash: APP_HASH,
+      btc_sats: 1000,
+      tao_amount_atomic: '4200000000',
+      settlement_refund_after_sec: 259200,
+      trade_fee_collector: '0x1111111111111111111111111111111111111111',
+      valid_until_unix: nowSec + 30,
+    },
+    ts: Date.now(),
+    nonce: 'qt1',
+  });
+  assert.equal(validateSwapEnvelope(quote).ok, true);
+
+  const termsUnsigned = createUnsignedEnvelope({
+    v: 1,
+    kind: KIND.TERMS,
+    tradeId: 'terms_tao_1',
+    body: {
+      pair: PAIR.BTC_LN__TAO_EVM,
+      direction: 'BTC_LN->TAO_EVM',
+      app_hash: APP_HASH,
+      btc_sats: 1000,
+      tao_amount_atomic: '4200000000',
+      settlement_kind: 'tao-evm',
+      sol_mint: '0x1111111111111111111111111111111111111111',
+      sol_recipient: '0x2222222222222222222222222222222222222222',
+      sol_refund: '0x3333333333333333333333333333333333333333',
+      sol_refund_after_unix: nowSec + 259200,
+      platform_fee_bps: 0,
+      trade_fee_bps: 0,
+      trade_fee_collector: '0x1111111111111111111111111111111111111111',
+      ln_receiver_peer: b4a.toString(receiver.publicKey, 'hex'),
+      ln_payer_peer: b4a.toString(payer.publicKey, 'hex'),
+      terms_valid_until_unix: nowSec + 300,
+    },
+    ts: Date.now(),
+    nonce: 'tt1',
+  });
+  assert.equal(validateSwapEnvelope(signEnvelope(receiver, termsUnsigned)).ok, true);
+});
+
+test('swap schema: TAO pair rejects usdt_amount', async () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rfq = createUnsignedEnvelope({
+    v: 1,
+    kind: KIND.RFQ,
+    tradeId: 'rfq_tao_bad_1',
+    body: {
+      pair: PAIR.BTC_LN__TAO_EVM,
+      direction: 'BTC_LN->TAO_EVM',
+      app_hash: APP_HASH,
+      btc_sats: 1000,
+      usdt_amount: '1000000',
+      valid_until_unix: nowSec + 60,
+    },
+    ts: Date.now(),
+    nonce: 'rb1',
+  });
+  assert.equal(validateSwapEnvelope(rfq).ok, false);
+});
+
 test('swap schema: quote_accept + swap_invite validate', async () => {
   const maker = await newWallet();
   const taker = await newWallet();
@@ -266,4 +360,63 @@ test('swap schema: svc_announce validates minimal + extended fields', async () =
     nonce: 'svc2',
   });
   assert.equal(validateSwapEnvelope(badOffers).ok, false);
+});
+
+test('rfq flags: tao mode accepts --usdt-amount as deprecated alias with warning', () => {
+  const resolved = resolveRfqSettlementAmountAtomic({
+    settlementKind: SETTLEMENT_KIND.TAO_EVM,
+    usdtAmountRaw: '12345',
+    taoAmountAtomicRaw: '',
+    fallbackUsdtAmount: '100000000',
+  });
+  assert.equal(resolved.amountAtomic, '12345');
+  assert.equal(resolved.warnings.length, 1);
+  assert.match(resolved.warnings[0], /deprecated/i);
+});
+
+test('rfq flags: tao mode prefers --tao-amount-atomic', () => {
+  const resolved = resolveRfqSettlementAmountAtomic({
+    settlementKind: SETTLEMENT_KIND.TAO_EVM,
+    usdtAmountRaw: '',
+    taoAmountAtomicRaw: '777',
+    fallbackUsdtAmount: '100000000',
+  });
+  assert.equal(resolved.amountAtomic, '777');
+  assert.equal(resolved.warnings.length, 0);
+});
+
+test('rfq flags: solana mode rejects --tao-amount-atomic', () => {
+  assert.throws(
+    () =>
+      resolveRfqSettlementAmountAtomic({
+        settlementKind: SETTLEMENT_KIND.SOLANA,
+        usdtAmountRaw: '100',
+        taoAmountAtomicRaw: '200',
+        fallbackUsdtAmount: '100000000',
+      }),
+    /only valid when --settlement tao-evm/i
+  );
+});
+
+test('rfq flags: settlement refund alias + canonical mapping', () => {
+  const canonical = resolveSettlementRefundAfterSec({
+    settlementRefundAfterSecRaw: '7201',
+    legacySolanaRefundAfterSecRaw: '',
+    fallbackSec: 72 * 3600,
+    minSec: 3600,
+    maxSec: 7 * 24 * 3600,
+  });
+  assert.equal(canonical.settlementRefundAfterSec, 7201);
+  assert.equal(canonical.warnings.length, 0);
+
+  const legacy = resolveSettlementRefundAfterSec({
+    settlementRefundAfterSecRaw: '',
+    legacySolanaRefundAfterSecRaw: '7202',
+    fallbackSec: 72 * 3600,
+    minSec: 3600,
+    maxSec: 7 * 24 * 3600,
+  });
+  assert.equal(legacy.settlementRefundAfterSec, 7202);
+  assert.equal(legacy.warnings.length, 1);
+  assert.match(legacy.warnings[0], /deprecated/i);
 });

@@ -112,7 +112,7 @@ Terminal A (maker peer):
 
 ```bash
 cd ~/intercom-swap
-scripts/run-swap-maker.sh swap-maker 49222 0000intercomswapbtcusdt
+scripts/run-swap-maker.sh swap-maker 49222 0000intercomswapbtctao
 ```
 
 Terminal B (taker peer):
@@ -120,7 +120,7 @@ Terminal B (taker peer):
 ```bash
 cd ~/intercom-swap
 export SWAP_INVITER_KEYS="<maker_peer_pubkey_hex32>"
-scripts/run-swap-taker.sh swap-taker 49223 0000intercomswapbtcusdt
+scripts/run-swap-taker.sh swap-taker 49223 0000intercomswapbtctao
 ```
 
 Terminal C (maker RFQ bot in TAO settlement mode):
@@ -128,13 +128,13 @@ Terminal C (maker RFQ bot in TAO settlement mode):
 ```bash
 cd ~/intercom-swap
 scripts/rfq-maker-peer.sh swap-maker 49222 \
-  --rfq-channel 0000intercomswapbtcusdt \
+  --rfq-channel 0000intercomswapbtctao \
   --run-swap 1 \
   --settlement tao-evm \
   --ln-impl cln \
   --ln-backend docker \
   --ln-service cln-alice \
-  --solana-refund-after-sec 259200
+  --settlement-refund-after-sec 259200
 ```
 
 Terminal D (taker RFQ bot in TAO settlement mode):
@@ -142,14 +142,14 @@ Terminal D (taker RFQ bot in TAO settlement mode):
 ```bash
 cd ~/intercom-swap
 scripts/rfq-taker-peer.sh swap-taker 49223 \
-  --rfq-channel 0000intercomswapbtcusdt \
+  --rfq-channel 0000intercomswapbtctao \
   --run-swap 1 \
   --settlement tao-evm \
   --ln-impl cln \
   --ln-backend docker \
   --ln-service cln-bob \
   --btc-sats 50000 \
-  --usdt-amount 100000000
+  --tao-amount-atomic 100000000
 ```
 
 What these wrappers resolve automatically:
@@ -196,6 +196,47 @@ Envelope expectations by settlement mode:
   - `SOL_ESCROW_CREATED`
   - `SOL_CLAIMED`
   - `SOL_REFUNDED`
+
+Example TAO offer announcement payload (`intercomswap_offer_post`):
+
+```json
+{
+  "channels": ["0000intercomswapbtctao"],
+  "name": "maker:tao",
+  "rfq_channels": ["0000intercomswapbtctao"],
+  "offers": [
+    {
+      "pair": "BTC_LN/TAO_EVM",
+      "have": "TAO_EVM",
+      "want": "BTC_LN",
+      "btc_sats": 50000,
+      "tao_amount_atomic": "100000000",
+      "max_platform_fee_bps": 10,
+      "max_trade_fee_bps": 10,
+      "max_total_fee_bps": 20,
+      "settlement_refund_after_sec": 259200
+    }
+  ]
+}
+```
+
+Example promptd maker-side TAO offer command:
+
+```bash
+cd ~/intercom-swap
+curl -sS http://127.0.0.1:7700/v1/run \
+  -H "authorization: Bearer <promptd_token>" \
+  -H "content-type: application/json" \
+  -d '{
+    "auto_approve": true,
+    "max_steps": 1,
+    "prompt": "{\"type\":\"tool\",\"name\":\"intercomswap_offer_post\",\"arguments\":{\"channels\":[\"0000intercomswapbtctao\"],\"name\":\"maker:tao\",\"rfq_channels\":[\"0000intercomswapbtctao\"],\"offers\":[{\"pair\":\"BTC_LN/TAO_EVM\",\"have\":\"TAO_EVM\",\"want\":\"BTC_LN\",\"btc_sats\":50000,\"tao_amount_atomic\":\"100000000\",\"max_platform_fee_bps\":10,\"max_trade_fee_bps\":10,\"max_total_fee_bps\":20,\"settlement_refund_after_sec\":259200}]}}"
+  }'
+```
+
+Pair-aware offers are now the base pattern for future settlement assets:
+- `BTC_LN/USDT_SOL` keeps the legacy USDT + Solana fields.
+- `BTC_LN/TAO_EVM` uses `tao_amount_atomic` + `settlement_refund_after_sec`.
 
 ## 6) Receipts + Recovery (TAO)
 

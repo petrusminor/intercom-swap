@@ -317,7 +317,7 @@ export const INTERCOMSWAP_TOOLS = [
   // RFQ / swap envelope helpers (Phase 5B executor will translate to swapctl+sign safely).
   tool(
     'intercomswap_offer_post',
-    'Post a signed Offer announcement (swap.svc_announce) into rendezvous channels (advertise: have USDT, want BTC; prompts BTC sellers to post matching RFQs).',
+    'Post a signed Offer announcement (swap.svc_announce) into rendezvous channels (advertise: have settlement asset, want BTC; supports BTC_LN/USDT_SOL and BTC_LN/TAO_EVM).',
     {
       type: 'object',
       additionalProperties: false,
@@ -364,35 +364,37 @@ export const INTERCOMSWAP_TOOLS = [
             type: 'object',
             additionalProperties: false,
             properties: {
-              pair: { type: 'string', enum: ['BTC_LN/USDT_SOL'] },
-              have: { type: 'string', enum: ['USDT_SOL'] },
+              pair: { type: 'string', enum: ['BTC_LN/USDT_SOL', 'BTC_LN/TAO_EVM'] },
+              have: { type: 'string', enum: ['USDT_SOL', 'TAO_EVM'] },
               want: { type: 'string', enum: ['BTC_LN'] },
               btc_sats: satsParam,
               usdt_amount: atomicAmountParam,
+              tao_amount_atomic: atomicAmountParam,
+              settlement_kind: { type: 'string', enum: ['solana', 'tao-evm'] },
               max_platform_fee_bps: { type: 'integer', minimum: 0, maximum: 500 },
               max_trade_fee_bps: { type: 'integer', minimum: 0, maximum: 1000 },
               max_total_fee_bps: { type: 'integer', minimum: 0, maximum: 1500 },
               min_sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600 },
               max_sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600 },
+              settlement_refund_after_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600 },
             },
-            required: [
-              'btc_sats',
-              'usdt_amount',
-            ],
+            required: ['btc_sats'],
           },
         },
       },
       required: ['channels', 'name', 'offers'],
     }
   ),
-  tool('intercomswap_rfq_post', 'Post a signed RFQ envelope into an RFQ rendezvous channel (BTC_LN->USDT_SOL: sell BTC for USDT).', {
+  tool('intercomswap_rfq_post', 'Post a signed RFQ envelope into an RFQ rendezvous channel (BTC_LN->settlement asset; supports USDT_SOL and TAO_EVM).', {
     type: 'object',
     additionalProperties: false,
     properties: {
       channel: channelParam,
       trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+      pair: { type: 'string', enum: ['BTC_LN/USDT_SOL', 'BTC_LN/TAO_EVM'] },
       btc_sats: satsParam,
       usdt_amount: atomicAmountParam,
+      tao_amount_atomic: atomicAmountParam,
       sol_recipient: {
         ...settlementAddressParam,
         description: 'Optional settlement recipient (base58 Solana pubkey or 0x EVM address). Recommended/required for full auto swap settlement.',
@@ -402,6 +404,7 @@ export const INTERCOMSWAP_TOOLS = [
       max_total_fee_bps: { type: 'integer', minimum: 0, maximum: 1500, description: 'Optional ceiling for platform+trade fee (bps).' },
       min_sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Optional minimum Solana refund/claim window in seconds.' },
       max_sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Optional maximum Solana refund/claim window in seconds.' },
+      settlement_refund_after_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Optional TAO settlement refund window in seconds.' },
       valid_until_unix: { ...unixSecParam, description: 'Optional expiry for the RFQ (unix seconds).' },
       ln_liquidity_mode: {
         type: 'string',
@@ -410,7 +413,7 @@ export const INTERCOMSWAP_TOOLS = [
           'Lightning outbound liquidity guardrail mode. single_channel (default) requires one active channel to cover btc_sats; aggregate allows sum across active channels.',
       },
     },
-    required: ['channel', 'trade_id', 'btc_sats', 'usdt_amount'],
+    required: ['channel', 'trade_id', 'btc_sats'],
   }),
   tool(
     'intercomswap_quote_post',
@@ -422,22 +425,25 @@ export const INTERCOMSWAP_TOOLS = [
       channel: channelParam,
       trade_id: { type: 'string', minLength: 1, maxLength: 128 },
       rfq_id: hex32Param,
+      pair: { type: 'string', enum: ['BTC_LN/USDT_SOL', 'BTC_LN/TAO_EVM'] },
       btc_sats: satsParam,
       usdt_amount: atomicAmountParam,
+      tao_amount_atomic: atomicAmountParam,
       trade_fee_collector: {
         ...settlementAddressParam,
         description: 'Fee receiver address (base58 for Solana, 0x for TAO EVM). trade_fee_bps is read from the active settlement backend.',
       },
       sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Solana refund/claim window (seconds) that will be used in binding TERMS.' },
+      settlement_refund_after_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'TAO settlement refund window (seconds) that will be used in binding TERMS.' },
       valid_until_unix: unixSecParam,
       valid_for_sec: { type: 'integer', minimum: 10, maximum: 60 * 60 * 24 * 7 },
     },
-    required: ['channel', 'trade_id', 'rfq_id', 'btc_sats', 'usdt_amount', 'trade_fee_collector'],
+    required: ['channel', 'trade_id', 'rfq_id', 'btc_sats', 'trade_fee_collector'],
   }
   ),
   tool(
     'intercomswap_quote_post_from_rfq',
-    'Maker: post a signed QUOTE that matches an RFQ envelope (no manual rfq_id/btc_sats/usdt_amount required). Fees are read from on-chain config/trade-config (not negotiated). Provide either valid_until_unix or valid_for_sec.',
+    'Maker: post a signed QUOTE that matches an RFQ envelope (no manual rfq_id/btc_sats/amount required). Fees are read from on-chain config/trade-config (not negotiated). Provide either valid_until_unix or valid_for_sec.',
     {
       type: 'object',
       additionalProperties: false,
@@ -466,6 +472,7 @@ export const INTERCOMSWAP_TOOLS = [
           description: 'Fee receiver address (base58 for Solana, 0x for TAO EVM). trade_fee_bps is read from the active settlement backend.',
         },
         sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Solana refund/claim window (seconds) that will be used in binding TERMS.' },
+        settlement_refund_after_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'TAO settlement refund window (seconds) that will be used in binding TERMS.' },
         valid_until_unix: unixSecParam,
         valid_for_sec: { type: 'integer', minimum: 10, maximum: 60 * 60 * 24 * 7 },
       },
@@ -719,8 +726,10 @@ export const INTERCOMSWAP_TOOLS = [
     properties: {
       channel: channelParam,
       trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+      pair: { type: 'string', enum: ['BTC_LN/USDT_SOL', 'BTC_LN/TAO_EVM'] },
       btc_sats: satsParam,
       usdt_amount: atomicAmountParam,
+      tao_amount_atomic: atomicAmountParam,
       sol_mint: settlementAddressParam,
       sol_recipient: settlementAddressParam,
       sol_refund: settlementAddressParam,
@@ -737,7 +746,6 @@ export const INTERCOMSWAP_TOOLS = [
       'channel',
       'trade_id',
       'btc_sats',
-      'usdt_amount',
       'sol_mint',
       'sol_recipient',
       'sol_refund',

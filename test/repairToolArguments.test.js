@@ -25,6 +25,25 @@ test('repairToolArguments: coerces offer_post usdt_amount decimal to atomic', ()
   assert.equal(out.offers[0].usdt_amount, '120000');
 });
 
+test('repairToolArguments: preserves TAO offer amount + refund field', () => {
+  const out = repairToolArguments('intercomswap_offer_post', {
+    channels: ['0000intercomswapbtctao'],
+    name: 'maker:tao',
+    offers: [
+      {
+        pair: 'BTC_LN/TAO_EVM',
+        have: 'TAO_EVM',
+        want: 'BTC_LN',
+        btc_sats: 1000,
+        tao_amount_atomic: '4200000000',
+        refund_after_sec: '259200',
+      },
+    ],
+  });
+  assert.equal(out.offers[0].tao_amount_atomic, '4200000000');
+  assert.equal(out.offers[0].settlement_refund_after_sec, 259200);
+});
+
 test('repairToolArguments: coerces flattened offer_post usdt_amount decimal to atomic', () => {
   const out = repairToolArguments('intercomswap_offer_post', {
     channels: ['0000intercomswapbtcusdt'],

@@ -1,5 +1,6 @@
 import { verifyBolt11MatchesInvoiceBody } from '../ln/bolt11.js';
 import { verifyLnUsdtEscrowOnchain } from '../solana/verifyLnUsdtEscrow.js';
+import { getAmountForPair, isTaoPair, normalizePair } from './pairs.js';
 
 const normalizeHex = (value) => String(value || '').trim().toLowerCase();
 
@@ -24,6 +25,8 @@ export function verifyInvoiceBody({ invoiceBody }) {
 export function verifyEscrowAgainstTerms({ terms, escrowBody }) {
   if (!terms || typeof terms !== 'object') return { ok: false, error: 'terms is required' };
   if (!escrowBody || typeof escrowBody !== 'object') return { ok: false, error: 'escrowBody is required' };
+  const pair = normalizePair(terms.pair);
+  const wantAmount = getAmountForPair(terms, pair, { allowLegacyTaoFallback: true });
 
   if (String(escrowBody.recipient) !== String(terms.sol_recipient)) {
     return { ok: false, error: 'escrow recipient mismatch vs terms' };
@@ -31,10 +34,14 @@ export function verifyEscrowAgainstTerms({ terms, escrowBody }) {
   if (String(escrowBody.refund) !== String(terms.sol_refund)) {
     return { ok: false, error: 'escrow refund mismatch vs terms' };
   }
-  if (String(escrowBody.mint) !== String(terms.sol_mint)) {
+  if (!isTaoPair(pair) && String(escrowBody.mint) !== String(terms.sol_mint)) {
     return { ok: false, error: 'escrow mint mismatch vs terms' };
   }
-  if (String(escrowBody.amount) !== String(terms.usdt_amount)) {
+  if (isTaoPair(pair)) {
+    if (String(escrowBody.amount_atomic) !== String(wantAmount)) {
+      return { ok: false, error: 'escrow amount mismatch vs terms' };
+    }
+  } else if (String(escrowBody.amount) !== String(wantAmount)) {
     return { ok: false, error: 'escrow amount mismatch vs terms' };
   }
   if (Number(escrowBody.refund_after_unix) < Number(terms.sol_refund_after_unix)) {

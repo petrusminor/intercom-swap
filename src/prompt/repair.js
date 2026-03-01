@@ -180,11 +180,14 @@ export function repairToolArguments(toolName, args) {
       'want',
       'btc_sats',
       'usdt_amount',
+      'tao_amount_atomic',
+      'settlement_kind',
       'max_platform_fee_bps',
       'max_trade_fee_bps',
       'max_total_fee_bps',
       'min_sol_refund_window_sec',
       'max_sol_refund_window_sec',
+      'settlement_refund_after_sec',
     ];
     const flattened = offerKeys.filter((k) => k in out);
     if (flattened.length > 0) {
@@ -223,6 +226,7 @@ export function repairToolArguments(toolName, args) {
         renameKey(next, 'max_sol_refund_sec', 'max_sol_refund_window_sec');
         renameKey(next, 'min_sol_refund_window', 'min_sol_refund_window_sec');
         renameKey(next, 'max_sol_refund_window', 'max_sol_refund_window_sec');
+        renameKey(next, 'refund_after_sec', 'settlement_refund_after_sec');
         if ('sol_refund_window_sec' in next && !('min_sol_refund_window_sec' in next) && !('max_sol_refund_window_sec' in next)) {
           next.min_sol_refund_window_sec = next.sol_refund_window_sec;
           next.max_sol_refund_window_sec = next.sol_refund_window_sec;
@@ -235,8 +239,10 @@ export function repairToolArguments(toolName, args) {
         if ('max_total_fee_bps' in next) next.max_total_fee_bps = coerceSafeInt(next.max_total_fee_bps);
         if ('min_sol_refund_window_sec' in next) next.min_sol_refund_window_sec = coerceSafeInt(next.min_sol_refund_window_sec);
         if ('max_sol_refund_window_sec' in next) next.max_sol_refund_window_sec = coerceSafeInt(next.max_sol_refund_window_sec);
+        if ('settlement_refund_after_sec' in next) next.settlement_refund_after_sec = coerceSafeInt(next.settlement_refund_after_sec);
 
         if ('usdt_amount' in next) next.usdt_amount = coerceUsdtAtomic(next.usdt_amount);
+        if ('tao_amount_atomic' in next) next.tao_amount_atomic = decimalToAtomicString(next.tao_amount_atomic, 0);
         return next;
       });
     }
@@ -246,6 +252,8 @@ export function repairToolArguments(toolName, args) {
   if (toolName === 'intercomswap_rfq_post' || toolName === 'intercomswap_quote_post' || toolName === 'intercomswap_terms_post') {
     const out = { ...args };
     if ('usdt_amount' in out) out.usdt_amount = coerceUsdtAtomic(out.usdt_amount);
+    if ('tao_amount_atomic' in out) out.tao_amount_atomic = decimalToAtomicString(out.tao_amount_atomic, 0);
+    if ('settlement_refund_after_sec' in out) out.settlement_refund_after_sec = coerceSafeInt(out.settlement_refund_after_sec);
     if (toolName === 'intercomswap_rfq_post') {
       // rfq_post does not accept ttl_sec, but models often emit it for "valid X".
       // Convert it into an absolute valid_until_unix (now + ttl) and drop ttl_sec.
@@ -282,6 +290,7 @@ export function repairToolArguments(toolName, args) {
 
   if (toolName === 'intercomswap_quote_post_from_rfq') {
     const out = { ...args };
+    if ('settlement_refund_after_sec' in out) out.settlement_refund_after_sec = coerceSafeInt(out.settlement_refund_after_sec);
     if ('valid_for_sec' in out) out.valid_for_sec = coerceSafeInt(out.valid_for_sec);
     if ('valid_until_unix' in out) out.valid_until_unix = coerceSafeInt(out.valid_until_unix);
     if ('ttl_sec' in out) {
