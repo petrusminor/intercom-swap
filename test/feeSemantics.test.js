@@ -118,6 +118,72 @@ test('fee semantics: settlement amount fee ceil preserves current atomic roundin
   assert.equal(computeSettlementAmountWithFeeCeil('1', 1).toString(), '2');
 });
 
+test('fee semantics: fee ceil is applied to the settlement-leg atomic amount for SOL and TAO pairs', async () => {
+  const usdtSettlementAmountAtomic = '1000000';
+  const taoSettlementAmountAtomic = '4200000000';
+  const btcSats = 10000;
+  const totalFeeBps = 20;
+
+  const sol = newExecutor({
+    settlementKind: 'solana',
+    taoHtlcAddress: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+  });
+  const tao = newExecutor({
+    settlementKind: 'tao-evm',
+    taoHtlcAddress: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+  });
+
+  const solQuote = await sol.execute(
+    'intercomswap_quote_post',
+    {
+      channel: '0000intercomswapbtcusdt',
+      trade_id: 'trade-sol-leg',
+      rfq_id: 'c'.repeat(64),
+      pair: 'BTC_LN/USDT_SOL',
+      btc_sats: btcSats,
+      usdt_amount: usdtSettlementAmountAtomic,
+      trade_fee_collector: '11111111111111111111111111111111',
+      sol_refund_window_sec: 259200,
+      valid_for_sec: 600,
+    },
+    { autoApprove: true, dryRun: true }
+  );
+  const taoQuote = await tao.execute(
+    'intercomswap_quote_post',
+    {
+      channel: '0000intercomswapbtctao',
+      trade_id: 'trade-tao-leg',
+      rfq_id: 'd'.repeat(64),
+      pair: 'BTC_LN/TAO_EVM',
+      btc_sats: btcSats,
+      tao_amount_atomic: taoSettlementAmountAtomic,
+      trade_fee_collector: '0x2222222222222222222222222222222222222222',
+      settlement_refund_after_sec: 259200,
+      valid_for_sec: 600,
+    },
+    { autoApprove: true, dryRun: true }
+  );
+
+  assert.equal(solQuote.unsigned.body.usdt_amount, usdtSettlementAmountAtomic);
+  assert.equal(taoQuote.unsigned.body.tao_amount_atomic, taoSettlementAmountAtomic);
+  assert.equal(
+    computeSettlementAmountWithFeeCeil(solQuote.unsigned.body.usdt_amount, totalFeeBps).toString(),
+    '1002000'
+  );
+  assert.equal(
+    computeSettlementAmountWithFeeCeil(taoQuote.unsigned.body.tao_amount_atomic, totalFeeBps).toString(),
+    '4208400000'
+  );
+  assert.notEqual(
+    computeSettlementAmountWithFeeCeil(String(btcSats), totalFeeBps).toString(),
+    computeSettlementAmountWithFeeCeil(solQuote.unsigned.body.usdt_amount, totalFeeBps).toString()
+  );
+  assert.notEqual(
+    computeSettlementAmountWithFeeCeil(String(btcSats), totalFeeBps).toString(),
+    computeSettlementAmountWithFeeCeil(taoQuote.unsigned.body.tao_amount_atomic, totalFeeBps).toString()
+  );
+});
+
 test('fee semantics: normalized settlement fee caps preserve existing bps values', () => {
   assert.deepEqual(
     normalizeSettlementFeeCapsBps(
@@ -260,4 +326,9 @@ test('offer matching: settlement fee caps apply consistently across SOL and TAO 
 
   assert.equal(solRejected, null);
   assert.equal(taoRejected, null);
+
+  assert.equal(solMatched.amount_atomic, '1000000');
+  assert.equal(solMatched.amount_field, 'usdt_amount');
+  assert.equal(taoMatched.amount_atomic, '1000000');
+  assert.equal(taoMatched.amount_field, 'tao_amount_atomic');
 });
