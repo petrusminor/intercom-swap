@@ -27,7 +27,13 @@ import { normalizeLndNetwork } from '../src/ln/lnd.js';
 import { lnPay } from '../src/ln/client.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
-import { resolveRfqSettlementAmountAtomic } from '../src/rfq/cliFlags.js';
+import {
+  DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+  resolveRfqSettlementAmountAtomic,
+  resolveSettlementRefundAfterSec,
+  resolveUnsafeMinSettlementRefundAfterSec,
+} from '../src/rfq/cliFlags.js';
+import { buildRfqUnsignedEnvelope } from '../src/rfq/buildRfq.js';
 import { matchOfferAnnouncementEvent } from '../src/rfq/offerMatch.js';
 import {
   getSettlementProvider,
@@ -219,14 +225,18 @@ async function main() {
   const maxPlatformFeeBpsCfg = parseBps(flags.get('max-platform-fee-bps'), 'max-platform-fee-bps', 500);
   const maxTradeFeeBpsCfg = parseBps(flags.get('max-trade-fee-bps'), 'max-trade-fee-bps', 1000);
   const maxTotalFeeBpsCfg = parseBps(flags.get('max-total-fee-bps'), 'max-total-fee-bps', 1500);
+  const DEFAULT_SETTLEMENT_REFUND_AFTER_SEC = 72 * 3600;
+  let settlementRefundAfterSec = DEFAULT_SETTLEMENT_REFUND_AFTER_SEC;
+  let effectiveMinSettlementRefundAfterSec = DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC;
+  let unsafeMinSettlementRefundAfterSecProvided = false;
 
-  const SOL_REFUND_MIN_SEC = 3600; // 1h
-  const SOL_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
-  if (!Number.isFinite(minSolRefundWindowSecCfg) || minSolRefundWindowSecCfg < SOL_REFUND_MIN_SEC) {
-    die(`Invalid --min-solana-refund-window-sec (must be >= ${SOL_REFUND_MIN_SEC})`);
+  const SETTLEMENT_REFUND_MIN_SEC = 3600; // 1h
+  const SETTLEMENT_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
+  if (!Number.isFinite(minSolRefundWindowSecCfg) || minSolRefundWindowSecCfg < SETTLEMENT_REFUND_MIN_SEC) {
+    die(`Invalid --min-solana-refund-window-sec (must be >= ${SETTLEMENT_REFUND_MIN_SEC})`);
   }
-  if (!Number.isFinite(maxSolRefundWindowSecCfg) || maxSolRefundWindowSecCfg > SOL_REFUND_MAX_SEC) {
-    die(`Invalid --max-solana-refund-window-sec (must be <= ${SOL_REFUND_MAX_SEC})`);
+  if (!Number.isFinite(maxSolRefundWindowSecCfg) || maxSolRefundWindowSecCfg > SETTLEMENT_REFUND_MAX_SEC) {
+    die(`Invalid --max-solana-refund-window-sec (must be <= ${SETTLEMENT_REFUND_MAX_SEC})`);
   }
   if (minSolRefundWindowSecCfg > maxSolRefundWindowSecCfg) {
     die('Invalid Solana refund window range (min > max)');
@@ -234,6 +244,31 @@ async function main() {
   if (maxPlatformFeeBpsCfg > 500) die('Invalid --max-platform-fee-bps (must be <= 500)');
   if (maxTradeFeeBpsCfg > 1000) die('Invalid --max-trade-fee-bps (must be <= 1000)');
   if (maxTotalFeeBpsCfg > 1500) die('Invalid --max-total-fee-bps (must be <= 1500)');
+  try {
+    const refundConfig = resolveSettlementRefundAfterSec({
+      settlementRefundAfterSecRaw: flags.get('settlement-refund-after-sec'),
+      legacySolanaRefundAfterSecRaw: flags.get('solana-refund-after-sec'),
+      fallbackSec: DEFAULT_SETTLEMENT_REFUND_AFTER_SEC,
+      minSec: SETTLEMENT_REFUND_MIN_SEC,
+      maxSec: SETTLEMENT_REFUND_MAX_SEC,
+    });
+    settlementRefundAfterSec = refundConfig.settlementRefundAfterSec;
+    for (const warning of refundConfig.warnings) process.stderr.write(`${warning}\n`);
+  } catch (err) {
+    die(err?.message || String(err));
+  }
+  try {
+    const unsafeMinConfig = resolveUnsafeMinSettlementRefundAfterSec({
+      unsafeMinSettlementRefundAfterSecRaw: flags.get('unsafe-min-settlement-refund-after-sec'),
+      fallbackSec: DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+      maxSec: SETTLEMENT_REFUND_MAX_SEC,
+    });
+    effectiveMinSettlementRefundAfterSec = unsafeMinConfig.effectiveMinSettlementRefundAfterSec;
+    unsafeMinSettlementRefundAfterSecProvided = unsafeMinConfig.unsafeMinProvided;
+    for (const warning of unsafeMinConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
+  } catch (err) {
+    die(err?.message || String(err));
+  }
 
   // The actual RFQ we post uses these variables. When listening to offers, they can be overridden
   // (but still constrained by the configured guardrails above).
@@ -366,6 +401,9 @@ async function main() {
     ensureOk(await sc.join(ch), `join ${ch}`);
   }
   ensureOk(await sc.subscribe(joinedChannels), `subscribe ${joinedChannels.join(',')}`);
+  process.stderr.write(
+    `[taker] subscribed rfq_channel=${rfqChannel} joined_channels=${joinedChannels.join(',')} trade_id=${tradeId} rfq_id=pending\n`
+  );
 
   const takerPubkey = String(sc.hello?.peer || '').trim().toLowerCase();
   if (!takerPubkey) die('SC-Bridge hello missing peer pubkey');
@@ -404,6 +442,7 @@ async function main() {
             maxTradeFeeBps: maxTradeFeeBpsCfg,
             maxTotalFeeBps: maxTotalFeeBpsCfg,
             minRefundSec: minSolRefundWindowSecCfg,
+            minSettlementRefundSec: effectiveMinSettlementRefundAfterSec,
             maxRefundSec: maxSolRefundWindowSecCfg,
           });
           if (!matchedOffer) return;
@@ -434,8 +473,9 @@ async function main() {
     maxTradeFeeBps = offerMeta.max_trade_fee_bps;
     maxTotalFeeBps = offerMeta.max_total_fee_bps;
     if (isTaoPair(rfqPair)) {
-      minSolRefundWindowSec = Number(offerMeta.settlement_refund_after_sec);
-      maxSolRefundWindowSec = Number(offerMeta.settlement_refund_after_sec);
+      settlementRefundAfterSec = Number(offerMeta.settlement_refund_after_sec);
+      minSolRefundWindowSec = settlementRefundAfterSec;
+      maxSolRefundWindowSec = settlementRefundAfterSec;
     } else {
       minSolRefundWindowSec = offerMeta.min_sol_refund_window_sec;
       maxSolRefundWindowSec = offerMeta.max_sol_refund_window_sec;
@@ -468,34 +508,25 @@ async function main() {
     const amountFlagLabel = isTaoSettlement ? '--tao-amount-atomic' : '--usdt-amount';
     die(`Invalid ${amountFlagLabel} (must be a positive base-unit integer; open RFQ amount=0 is not supported)`);
   }
-  const rfqUnsigned = createUnsignedEnvelope({
-    v: 1,
-    kind: KIND.RFQ,
+  const rfqUnsigned = buildRfqUnsignedEnvelope({
     tradeId,
-    body: {
-      pair: rfqPair,
-      direction: getDirectionForPair(rfqPair),
-      app_hash: expectedAppHash,
-      btc_sats: btcSats,
-      [getAmountFieldForPair(rfqPair)]: usdtAmount,
-      settlement_kind: getPairSettlementKind(rfqPair),
-      // Pre-filtering: tell makers our fee ceilings up front (binding fees are still in TERMS).
-      max_platform_fee_bps: maxPlatformFeeBps,
-      max_trade_fee_bps: maxTradeFeeBps,
-      max_total_fee_bps: maxTotalFeeBps,
-      ...(isTaoPair(rfqPair)
-        ? {
-            settlement_refund_after_sec: minSolRefundWindowSec,
-          }
-        : {
-            min_sol_refund_window_sec: minSolRefundWindowSec,
-            max_sol_refund_window_sec: maxSolRefundWindowSec,
-          }),
-      ...(runSwap ? { sol_recipient: sol.recipientAddress } : {}),
-      ...(runSwap && solMintStr ? { sol_mint: solMintStr } : {}),
-      valid_until_unix: rfqValidUntil,
-    },
+    pair: rfqPair,
+    expectedAppHash,
+    btcSats,
+    amountAtomic: usdtAmount,
+    maxPlatformFeeBps,
+    maxTradeFeeBps,
+    maxTotalFeeBps,
+    settlementRefundAfterSec,
+    minSolRefundWindowSec,
+    maxSolRefundWindowSec,
+    solRecipient: runSwap ? sol.recipientAddress : null,
+    solMint: runSwap && solMintStr ? solMintStr : null,
+    validUntilUnix: rfqValidUntil,
   });
+  process.stderr.write(
+    `[taker] rfq settlement_refund_after_sec=${rfqUnsigned?.body?.settlement_refund_after_sec} rfq_id=${rfqUnsigned?.body?.rfq_id ?? 'n/a'} trade_id=${rfqUnsigned?.tradeId ?? 'n/a'}\n`
+  );
   const rfqId = hashUnsignedEnvelope(rfqUnsigned);
   const rfqSigned = signSwapEnvelope(rfqUnsigned, signing);
   ensureOk(await sc.send(rfqChannel, rfqSigned), 'send rfq');
@@ -583,6 +614,10 @@ async function main() {
   const enforceTimeout = setInterval(() => {
     if (Date.now() <= deadlineMs) return;
     stopTimers();
+    process.stderr.write(
+      `[taker] still waiting for RFQ handshake expected_next=${chosen ? 'swap_invite' : 'quote'} ` +
+        `trade_id=${tradeId} rfq_id=${rfqId} rfq_channel=${rfqChannel}\n`
+    );
     die(`Timeout waiting for RFQ handshake (timeout-sec=${timeoutSec})`);
   }, 200);
 
@@ -714,7 +749,7 @@ async function main() {
       if (gotMint !== solMintStr) throw new Error(`terms.sol_mint mismatch (got=${gotMint} want=${solMintStr})`);
     }
 
-    if (minSolRefundWindowSec !== null) {
+    {
       const nowSec = Math.floor(Date.now() / 1000);
       const refundAfterUnix = Number(termsMsg.body?.sol_refund_after_unix);
       if (!Number.isFinite(refundAfterUnix) || refundAfterUnix <= 0) {
@@ -722,11 +757,16 @@ async function main() {
       }
       const termsTsSec = Math.floor(Number(termsMsg?.ts || 0) / 1000) || nowSec;
       const windowSec = refundAfterUnix - termsTsSec;
+      const termsPair = normalizePair(termsMsg.body?.pair || rfqPair);
+      const effectiveMinRefundWindowSec = isTaoPair(termsPair)
+        ? effectiveMinSettlementRefundAfterSec
+        : minSolRefundWindowSec;
       // Allow small clock skew / rounding differences between unix-sec and ms timestamps.
       const slackSec = 120;
-      if (windowSec + slackSec < minSolRefundWindowSec) {
+      if (effectiveMinRefundWindowSec !== null && windowSec + slackSec < effectiveMinRefundWindowSec) {
         throw new Error(
-          `terms.sol_refund_after_unix too soon (window_sec=${windowSec} min=${minSolRefundWindowSec})`
+          `terms.sol_refund_after_unix too soon (window_sec=${windowSec} min=${effectiveMinRefundWindowSec}` +
+            ` unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided})`
         );
       }
       if (
@@ -1121,21 +1161,50 @@ async function main() {
       if (evt?.channel !== rfqChannel) return;
       const msg = evt?.message;
       if (!msg || typeof msg !== 'object') return;
+      process.stderr.write(
+        `[taker] rfq_inbound channel=${rfqChannel} msg_kind=${String(msg.kind || msg.type || 'unknown')} ` +
+          `looks_signed_quote=${msg.kind === KIND.QUOTE || (msg?.body?.quote_id && msg?.sig ? 'yes' : 'no')} ` +
+          `trade_id=${String(msg.trade_id || 'n/a')} rfq_id=${String(msg?.body?.rfq_id || 'n/a')}\n`
+      );
 
       if (msg.kind === KIND.QUOTE) {
-        if (String(msg.trade_id) !== tradeId) return;
+        if (String(msg.trade_id) !== tradeId) {
+          process.stderr.write(
+            `[taker] quote_reject reason=trade_id_mismatch actual_trade_id=${String(msg.trade_id || '')} expected_trade_id=${tradeId}\n`
+          );
+          return;
+        }
         const v = validateSwapEnvelope(msg);
-        if (!v.ok) return;
+        if (!v.ok) {
+          process.stderr.write(
+            `[taker] quote_reject reason=invalid_envelope trade_id=${tradeId} rfq_id=${String(msg?.body?.rfq_id || 'n/a')} error=${v.error || 'unknown'}\n`
+          );
+          return;
+        }
         const quoteAppHash = String(msg?.body?.app_hash || '').trim().toLowerCase();
-        if (quoteAppHash !== expectedAppHash) return;
+        if (quoteAppHash !== expectedAppHash) {
+          process.stderr.write(
+            `[taker] quote_reject reason=app_hash_mismatch trade_id=${tradeId} rfq_id=${String(msg?.body?.rfq_id || 'n/a')} ` +
+              `actual_app_hash=${quoteAppHash || 'n/a'} expected_app_hash=${expectedAppHash || 'n/a'}\n`
+          );
+          return;
+        }
         const quoteUnsigned = stripSignature(msg);
         const quoteId = hashUnsignedEnvelope(quoteUnsigned);
         const rfqIdGot = String(msg.body?.rfq_id || '').trim().toLowerCase();
-        if (rfqIdGot !== rfqId) return;
+        if (rfqIdGot !== rfqId) {
+          process.stderr.write(
+            `[taker] quote_reject reason=rfq_id_mismatch trade_id=${tradeId} actual_rfq_id=${rfqIdGot || 'n/a'} expected_rfq_id=${rfqId}\n`
+          );
+          return;
+        }
 
         const validUntil = Number(msg.body?.valid_until_unix);
         const now = Math.floor(Date.now() / 1000);
         if (Number.isFinite(validUntil) && validUntil <= now) {
+          process.stderr.write(
+            `[taker] quote_reject reason=expired quote_id=${quoteId} valid_until_unix=${validUntil} now_unix=${now}\n`
+          );
           if (debug) process.stderr.write(`[taker] ignore expired quote quote_id=${quoteId}\n`);
           return;
         }
@@ -1143,34 +1212,93 @@ async function main() {
         // Pre-filtering: require explicit fee preview in QUOTE so we can reject before joining swap:<id>.
         const quotePlatformFeeBps = Number(msg.body?.platform_fee_bps);
         const quoteTradeFeeBps = Number(msg.body?.trade_fee_bps);
-        if (!Number.isFinite(quotePlatformFeeBps) || quotePlatformFeeBps < 0) return;
-        if (!Number.isFinite(quoteTradeFeeBps) || quoteTradeFeeBps < 0) return;
-        if (quotePlatformFeeBps > maxPlatformFeeBps) return;
-        if (quoteTradeFeeBps > maxTradeFeeBps) return;
-        if (quotePlatformFeeBps + quoteTradeFeeBps > maxTotalFeeBps) return;
+        if (!Number.isFinite(quotePlatformFeeBps) || quotePlatformFeeBps < 0) {
+          process.stderr.write(`[taker] quote_reject reason=invalid_platform_fee quote_id=${quoteId} value=${msg.body?.platform_fee_bps ?? 'n/a'}\n`);
+          return;
+        }
+        if (!Number.isFinite(quoteTradeFeeBps) || quoteTradeFeeBps < 0) {
+          process.stderr.write(`[taker] quote_reject reason=invalid_trade_fee quote_id=${quoteId} value=${msg.body?.trade_fee_bps ?? 'n/a'}\n`);
+          return;
+        }
+        if (quotePlatformFeeBps > maxPlatformFeeBps) {
+          process.stderr.write(
+            `[taker] quote_reject reason=platform_fee_cap_exceeded quote_id=${quoteId} actual=${quotePlatformFeeBps} max=${maxPlatformFeeBps}\n`
+          );
+          return;
+        }
+        if (quoteTradeFeeBps > maxTradeFeeBps) {
+          process.stderr.write(
+            `[taker] quote_reject reason=trade_fee_cap_exceeded quote_id=${quoteId} actual=${quoteTradeFeeBps} max=${maxTradeFeeBps}\n`
+          );
+          return;
+        }
+        if (quotePlatformFeeBps + quoteTradeFeeBps > maxTotalFeeBps) {
+          process.stderr.write(
+            `[taker] quote_reject reason=total_fee_cap_exceeded quote_id=${quoteId} actual=${quotePlatformFeeBps + quoteTradeFeeBps} max=${maxTotalFeeBps}\n`
+          );
+          return;
+        }
 
         // Pre-filtering: require explicit refund/claim window advertised in QUOTE (seconds).
         const quotePair = normalizePair(msg.body?.pair || rfqPair);
         const quoteRefundWindowSec = Number(msg.body?.[getQuoteRefundFieldForPair(quotePair)]);
-        if (!Number.isFinite(quoteRefundWindowSec) || quoteRefundWindowSec <= 0) return;
-        if (quoteRefundWindowSec < minSolRefundWindowSec) return;
+        const effectiveQuoteMinRefundWindowSec = isTaoPair(quotePair)
+          ? effectiveMinSettlementRefundAfterSec
+          : minSolRefundWindowSec;
+        if (!Number.isFinite(quoteRefundWindowSec) || quoteRefundWindowSec <= 0) {
+          process.stderr.write(
+            `[taker] quote_reject reason=invalid_refund_window quote_id=${quoteId} pair=${quotePair} ` +
+              `field=${getQuoteRefundFieldForPair(quotePair)} value=${msg.body?.[getQuoteRefundFieldForPair(quotePair)] ?? 'n/a'}\n`
+          );
+          return;
+        }
+        if (effectiveQuoteMinRefundWindowSec !== null && quoteRefundWindowSec < effectiveQuoteMinRefundWindowSec) {
+          process.stderr.write(
+            `[taker] quote_reject reason=refund_window_too_short quote_id=${quoteId} pair=${quotePair} ` +
+              `actual=${quoteRefundWindowSec} min=${effectiveQuoteMinRefundWindowSec} ` +
+              `unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided}\n`
+          );
+          return;
+        }
         if (maxSolRefundWindowSec !== null && Number.isFinite(maxSolRefundWindowSec) && quoteRefundWindowSec > maxSolRefundWindowSec) {
+          process.stderr.write(
+            `[taker] quote_reject reason=refund_window_too_long quote_id=${quoteId} pair=${quotePair} actual=${quoteRefundWindowSec} max=${maxSolRefundWindowSec}\n`
+          );
           return;
         }
 
         if (!chosen) {
           // Guardrail: only accept quotes for the exact requested size.
-          if (Number(msg.body?.btc_sats) !== Number(btcSats)) return;
+          if (Number(msg.body?.btc_sats) !== Number(btcSats)) {
+            process.stderr.write(
+              `[taker] quote_reject reason=btc_sats_mismatch quote_id=${quoteId} actual=${msg.body?.btc_sats ?? 'n/a'} expected=${btcSats}\n`
+            );
+            return;
+          }
 
           const quoteAmountStr = String(getAmountForPair(msg.body, quotePair) || '').trim();
           const quoteAmount = asBigIntAmount(quoteAmountStr);
-          if (quoteAmount === null) return;
+          if (quoteAmount === null) {
+            process.stderr.write(
+              `[taker] quote_reject reason=invalid_amount quote_id=${quoteId} pair=${quotePair} value=${quoteAmountStr || 'n/a'}\n`
+            );
+            return;
+          }
 
           // Guardrail: treat RFQ usdt_amount as a minimum when set (>0).
           const rfqMin = asBigIntAmount(usdtAmount) ?? 0n;
-          if (rfqMin > 0n && quoteAmount < rfqMin) return;
+          if (rfqMin > 0n && quoteAmount < rfqMin) {
+            process.stderr.write(
+              `[taker] quote_reject reason=amount_below_rfq_min quote_id=${quoteId} actual=${quoteAmount.toString()} min=${rfqMin.toString()}\n`
+            );
+            return;
+          }
 
           chosen = { rfq_id: rfqId, quote_id: quoteId, quote: msg };
+          process.stderr.write(
+            `[taker] quote_accept quote_id=${quoteId} pair=${quotePair} actual=${quoteRefundWindowSec} ` +
+              `min=${effectiveQuoteMinRefundWindowSec} unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided}\n`
+          );
           const quoteAcceptUnsigned = createUnsignedEnvelope({
             v: 1,
             kind: KIND.QUOTE_ACCEPT,

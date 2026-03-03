@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import process from 'node:process';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from '../src/protocol/signedMessage.js';
@@ -87,6 +87,72 @@ function parseIntFlag(value, label, fallback = null) {
   return n;
 }
 
+export const DEFAULT_LN_INVOICE_EXPIRY_SEC = 3600;
+
+export function resolveLnInvoiceExpirySec(value) {
+  const expirySec = parseIntFlag(value, 'ln-invoice-expiry-sec', null);
+  if (expirySec === null) return DEFAULT_LN_INVOICE_EXPIRY_SEC;
+  if (expirySec < 60) die('Invalid --ln-invoice-expiry-sec (must be >= 60)');
+  if (expirySec > 7 * 24 * 3600) die('Invalid --ln-invoice-expiry-sec (must be <= 604800)');
+  return expirySec;
+}
+
+function parseSignedEnvelopeLike(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch (_e) {
+      return null;
+    }
+  }
+  return typeof value === 'object' ? value : null;
+}
+
+export function quoteMatchesCurrentSettlementPolicy({
+  signedQuote,
+  pair,
+  settlementKind,
+  settlementRefundAfterSec,
+}) {
+  if (normalizeSettlementKind(settlementKind) !== SETTLEMENT_KIND.TAO_EVM) return true;
+  const normalizedPair = normalizePair(pair);
+  if (!isTaoPair(normalizedPair)) return true;
+  const quoteEnvelope = parseSignedEnvelopeLike(signedQuote);
+  if (!quoteEnvelope || typeof quoteEnvelope.body !== 'object') return false;
+  const refundField = getQuoteRefundFieldForPair(normalizedPair);
+  const quoteRefundAfterSec = Number(quoteEnvelope.body?.[refundField]);
+  if (!Number.isFinite(quoteRefundAfterSec)) return false;
+  return quoteRefundAfterSec === Number(settlementRefundAfterSec);
+}
+
+export async function maybeReuseExistingQuote({
+  existingLock,
+  pair,
+  settlementKind,
+  settlementRefundAfterSec,
+  sendQuote,
+  nowMs = Date.now(),
+}) {
+  if (!existingLock || existingLock.state !== 'quoted' || !existingLock.signedQuote) {
+    return { reused: false, sent: false, cleared: false, reason: 'missing_existing_quote' };
+  }
+  if (
+    !quoteMatchesCurrentSettlementPolicy({
+      signedQuote: existingLock.signedQuote,
+      pair,
+      settlementKind,
+      settlementRefundAfterSec,
+    })
+  ) {
+    return { reused: false, sent: false, cleared: true, reason: 'quote_policy_changed_repost' };
+  }
+  await sendQuote(existingLock.signedQuote);
+  existingLock.lastSeenMs = nowMs;
+  existingLock.lastQuoteSendAtMs = nowMs;
+  return { reused: true, sent: true, cleared: false, reason: 'resend_existing_quote' };
+}
+
 function stripSignature(envelope) {
   if (!envelope || typeof envelope !== 'object') return envelope;
   const { sig: _sig, signer: _signer, ...unsigned } = envelope;
@@ -164,7 +230,7 @@ async function main() {
   const swapResendMs = parseIntFlag(flags.get('swap-resend-ms'), 'swap-resend-ms', 1200);
   const retryResendMinMs = parseIntFlag(flags.get('retry-resend-min-ms'), 'retry-resend-min-ms', 20_000);
   const termsValidSec = parseIntFlag(flags.get('terms-valid-sec'), 'terms-valid-sec', 300);
-  const lnInvoiceExpirySec = parseIntFlag(flags.get('ln-invoice-expiry-sec'), 'ln-invoice-expiry-sec', 3600);
+  const lnInvoiceExpirySec = resolveLnInvoiceExpirySec(flags.get('ln-invoice-expiry-sec'));
 
   // Hard guardrails for safety + inventory lockup.
   // - Too short => increases "paid but can't claim before refund" risk.
@@ -834,18 +900,46 @@ async function main() {
 
       if (msg.kind === KIND.RFQ) {
         const v = validateSwapEnvelope(msg);
-        if (!v.ok) return;
+        const logRfqEarlyReturn = (reason, extra = {}) => {
+          const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
+          process.stderr.write(
+            `${JSON.stringify({
+              type: 'rfq_skip',
+              reason,
+              trade_id: msg?.trade_id ?? null,
+              rfq_id: extra.rfq_id ?? null,
+              settlement_kind: body.settlement_kind ?? null,
+              settlement_refund_after_sec: body.settlement_refund_after_sec ?? null,
+              pair: extra.pair ?? body.pair ?? null,
+              btc_sats: body.btc_sats ?? null,
+              tao_amount_atomic: body.tao_amount_atomic ?? null,
+              ...extra,
+            })}\n`
+          );
+        };
+        if (!v.ok) {
+          logRfqEarlyReturn('invalid_envelope', { validation_error: v.error || null });
+          return;
+        }
         const rfqAppHash = String(msg?.body?.app_hash || '').trim().toLowerCase();
         if (rfqAppHash !== expectedAppHash) {
+          logRfqEarlyReturn('app_hash_mismatch');
           if (debug) process.stderr.write(`[maker] skip rfq app_hash mismatch trade_id=${msg.trade_id}\n`);
           return;
         }
         const rfqUnsigned = stripSignature(msg);
         const rfqId = hashUnsignedEnvelope(rfqUnsigned);
+        const pair = normalizePair(msg.body?.pair || PAIR.BTC_LN__USDT_SOL);
+        process.stderr.write(
+          `[maker] rfq_received rfq_id=${rfqId} trade_id=${String(msg.trade_id || '').trim() || 'n/a'} ` +
+            `rfq_channel=${rfqChannel} settlement_kind=${String(msg.body?.settlement_kind || '').trim() || 'n/a'} ` +
+            `settlement_refund_after_sec=${msg.body?.settlement_refund_after_sec ?? 'n/a'}\n`
+        );
 
         if (msg.body?.valid_until_unix !== undefined) {
           const nowSec = Math.floor(Date.now() / 1000);
           if (Number(msg.body.valid_until_unix) <= nowSec) {
+            logRfqEarlyReturn('expired_rfq', { rfq_id: rfqId });
             if (debug) process.stderr.write(`[maker] skip expired rfq trade_id=${msg.trade_id} rfq_id=${rfqId}\n`);
             return;
           }
@@ -853,6 +947,7 @@ async function main() {
 
         const solRecipient = msg.body?.sol_recipient ? String(msg.body.sol_recipient).trim() : '';
         if (runSwap && !solRecipient) {
+          logRfqEarlyReturn('missing_sol_recipient', { rfq_id: rfqId });
           if (debug) process.stderr.write(`[maker] skip rfq missing sol_recipient trade_id=${msg.trade_id} rfq_id=${rfqId}\n`);
           return;
         }
@@ -860,6 +955,17 @@ async function main() {
         const lockNowMs = Date.now();
         const lockNowSec = Math.floor(lockNowMs / 1000);
         const existingLock = rfqLocks.get(lockKey);
+        const existingQuoteEnvelope =
+          existingLock && existingLock.signedQuote ? parseSignedEnvelopeLike(existingLock.signedQuote) : null;
+        const existingQuoteBody =
+          existingQuoteEnvelope && typeof existingQuoteEnvelope.body === 'object' ? existingQuoteEnvelope.body : null;
+        process.stderr.write(
+          `[maker] quote_decision rfq_id=${rfqId} trade_id=${String(msg.trade_id || '').trim() || 'n/a'} ` +
+            `existing_lock=${existingLock ? 'yes' : 'no'} existing_quote_id=${existingLock?.quoteId || 'n/a'} ` +
+            `existing_settlement_kind=${String(existingQuoteBody?.settlement_kind || '').trim() || 'n/a'} ` +
+            `existing_settlement_refund_after_sec=${existingQuoteBody?.settlement_refund_after_sec ?? 'n/a'} ` +
+            `maker_settlement_refund_after_sec=${settlementRefundAfterSec}\n`
+        );
         if (existingLock) {
           existingLock.lastSeenMs = lockNowMs;
           const quotedUntil = Number(existingLock.quoteValidUntilUnix || 0);
@@ -869,21 +975,43 @@ async function main() {
             Number.isFinite(quotedUntil) &&
             quotedUntil > lockNowSec
           ) {
-            ensureOk(await sc.send(rfqChannel, existingLock.signedQuote), 'resend quote');
+            const reuseResult = await maybeReuseExistingQuote({
+              existingLock,
+              pair,
+              settlementKind,
+              settlementRefundAfterSec,
+              nowMs: lockNowMs,
+              sendQuote: async (signedQuote) => {
+                process.stderr.write(
+                  `[maker] reuse_quote begin rfq_id=${rfqId} quote_id=${existingLock.quoteId || 'n/a'}\n`
+                );
+                ensureOk(await sc.send(rfqChannel, signedQuote), 'resend quote');
+                process.stderr.write(
+                  `[maker] reuse_quote sent rfq_id=${rfqId} quote_id=${existingLock.quoteId || 'n/a'}\n`
+                );
+              },
+            });
+            if (reuseResult.cleared) {
+              clearRfqLock(lockKey, 'quote_policy_changed_repost');
+            } else {
+              logRfqEarlyReturn('resend_existing_quote', { rfq_id: rfqId, quote_id: existingLock.quoteId });
+              if (debug) {
+                process.stderr.write(
+                  `[maker] resend existing quote trade_id=${msg.trade_id} rfq_id=${rfqId} quote_id=${existingLock.quoteId}\n`
+                );
+              }
+              return;
+            }
+          }
+          const currentLock = rfqLocks.get(lockKey);
+          if (currentLock && (currentLock.state === 'accepting' || currentLock.state === 'swapping')) {
+            logRfqEarlyReturn('repost_while_in_flight', { rfq_id: rfqId, state: currentLock.state });
             if (debug) {
-              process.stderr.write(
-                `[maker] resend existing quote trade_id=${msg.trade_id} rfq_id=${rfqId} quote_id=${existingLock.quoteId}\n`
-              );
+              process.stderr.write(`[maker] skip rfq repost while in-flight trade_id=${msg.trade_id} state=${currentLock.state}\n`);
             }
             return;
           }
-          if (existingLock.state === 'accepting' || existingLock.state === 'swapping') {
-            if (debug) {
-              process.stderr.write(`[maker] skip rfq repost while in-flight trade_id=${msg.trade_id} state=${existingLock.state}\n`);
-            }
-            return;
-          }
-          if (existingLock.state === 'quoted' && Number.isFinite(quotedUntil) && quotedUntil <= lockNowSec) {
+          if (currentLock && currentLock.state === 'quoted' && Number.isFinite(quotedUntil) && quotedUntil <= lockNowSec) {
             clearRfqLock(lockKey, 'quote_expired_repost');
           }
         }
@@ -903,10 +1031,20 @@ async function main() {
             ? Number(msg.body.max_total_fee_bps)
             : null;
         if (rfqMaxPlatformFeeBps !== null && Number.isFinite(rfqMaxPlatformFeeBps) && fees.platformFeeBps > rfqMaxPlatformFeeBps) {
+          logRfqEarlyReturn('platform_fee_cap_exceeded', {
+            rfq_id: rfqId,
+            platform_fee_bps: fees.platformFeeBps,
+            max_platform_fee_bps: rfqMaxPlatformFeeBps,
+          });
           if (debug) process.stderr.write(`[maker] skip rfq fee cap: platform_fee_bps=${fees.platformFeeBps} > max=${rfqMaxPlatformFeeBps}\n`);
           return;
         }
         if (rfqMaxTradeFeeBps !== null && Number.isFinite(rfqMaxTradeFeeBps) && fees.tradeFeeBps > rfqMaxTradeFeeBps) {
+          logRfqEarlyReturn('trade_fee_cap_exceeded', {
+            rfq_id: rfqId,
+            trade_fee_bps: fees.tradeFeeBps,
+            max_trade_fee_bps: rfqMaxTradeFeeBps,
+          });
           if (debug) process.stderr.write(`[maker] skip rfq fee cap: trade_fee_bps=${fees.tradeFeeBps} > max=${rfqMaxTradeFeeBps}\n`);
           return;
         }
@@ -915,6 +1053,11 @@ async function main() {
           Number.isFinite(rfqMaxTotalFeeBps) &&
           fees.platformFeeBps + fees.tradeFeeBps > rfqMaxTotalFeeBps
         ) {
+          logRfqEarlyReturn('total_fee_cap_exceeded', {
+            rfq_id: rfqId,
+            total_fee_bps: fees.platformFeeBps + fees.tradeFeeBps,
+            max_total_fee_bps: rfqMaxTotalFeeBps,
+          });
           if (debug) {
             process.stderr.write(
               `[maker] skip rfq fee cap: total_fee_bps=${fees.platformFeeBps + fees.tradeFeeBps} > max=${rfqMaxTotalFeeBps}\n`
@@ -923,8 +1066,12 @@ async function main() {
           return;
         }
 
-        const pair = normalizePair(msg.body?.pair || PAIR.BTC_LN__USDT_SOL);
         if (getPairSettlementKind(pair) !== settlementKind) {
+          logRfqEarlyReturn('pair_settlement_mismatch', {
+            rfq_id: rfqId,
+            pair,
+            maker_settlement_kind: settlementKind,
+          });
           if (debug) process.stderr.write(`[maker] skip rfq pair/settlement mismatch pair=${pair} settlement=${settlementKind}\n`);
           return;
         }
@@ -939,6 +1086,12 @@ async function main() {
             Number.isFinite(rfqRefundWindowSec) &&
             settlementRefundAfterSec !== rfqRefundWindowSec
           ) {
+            logRfqEarlyReturn('settlement_refund_window_mismatch', {
+              rfq_id: rfqId,
+              pair,
+              requested_settlement_refund_after_sec: rfqRefundWindowSec,
+              maker_settlement_refund_after_sec: settlementRefundAfterSec,
+            });
             if (debug) {
               process.stderr.write(
                 `[maker] skip rfq settlement refund window: want=${rfqRefundWindowSec}s have=${settlementRefundAfterSec}s\n`
@@ -960,6 +1113,12 @@ async function main() {
             Number.isFinite(rfqMinRefundWindowSec) &&
             settlementRefundAfterSec < rfqMinRefundWindowSec
           ) {
+            logRfqEarlyReturn('refund_window_too_short', {
+              rfq_id: rfqId,
+              pair,
+              min_sol_refund_window_sec: rfqMinRefundWindowSec,
+              maker_settlement_refund_after_sec: settlementRefundAfterSec,
+            });
             if (debug) {
               process.stderr.write(
                 `[maker] skip rfq refund window: want>=${rfqMinRefundWindowSec}s have=${settlementRefundAfterSec}s\n`
@@ -972,6 +1131,12 @@ async function main() {
             Number.isFinite(rfqMaxRefundWindowSec) &&
             settlementRefundAfterSec > rfqMaxRefundWindowSec
           ) {
+            logRfqEarlyReturn('refund_window_too_long', {
+              rfq_id: rfqId,
+              pair,
+              max_sol_refund_window_sec: rfqMaxRefundWindowSec,
+              maker_settlement_refund_after_sec: settlementRefundAfterSec,
+            });
             if (debug) {
               process.stderr.write(
                 `[maker] skip rfq refund window: want<=${rfqMaxRefundWindowSec}s have=${settlementRefundAfterSec}s\n`
@@ -983,11 +1148,13 @@ async function main() {
         let quoteUsdtAmount = String(getAmountForPair(msg.body, pair) || '').trim();
         if (!quoteUsdtAmount) quoteUsdtAmount = '0';
         if (!/^[0-9]+$/.test(quoteUsdtAmount)) {
+          logRfqEarlyReturn('invalid_amount', { rfq_id: rfqId, pair });
           if (debug) process.stderr.write(`[maker] skip rfq invalid amount trade_id=${msg.trade_id}\n`);
           return;
         }
         if (quoteUsdtAmount === '0') {
           // Negotiated flow requires explicit amounts; no oracle-priced/open RFQs.
+          logRfqEarlyReturn('open_amount_unsupported', { rfq_id: rfqId, pair });
           if (debug) process.stderr.write(`[maker] skip rfq open amount unsupported trade_id=${msg.trade_id}\n`);
           return;
         }
@@ -1019,7 +1186,12 @@ async function main() {
         });
         const quoteId = hashUnsignedEnvelope(quoteUnsigned);
         const signed = signSwapEnvelope(quoteUnsigned, signing);
+        process.stderr.write(
+          `[maker] new_quote begin rfq_id=${rfqId} quote_id=${quoteId} settlement_kind=${settlementKind} ` +
+            `settlement_refund_after_sec=${isTaoPair(pair) ? settlementRefundAfterSec : 'n/a'}\n`
+        );
         const sent = ensureOk(await sc.send(rfqChannel, signed), 'send quote');
+        process.stderr.write(`[maker] new_quote sent rfq_id=${rfqId} quote_id=${quoteId}\n`);
         if (debug) process.stderr.write(`[maker] quoted trade_id=${msg.trade_id} rfq_id=${rfqId} quote_id=${quoteId} sent=${sent.type}\n`);
         quotes.set(quoteId, {
           rfq_id: rfqId,
@@ -1050,6 +1222,7 @@ async function main() {
           lockDeadlineMs: 0,
           createdAtMs: lockNowMs,
           lastSeenMs: lockNowMs,
+          lastQuoteSendAtMs: lockNowMs,
         });
         quoteIdToLockKey.set(quoteId, lockKey);
         tradeIdToLockKey.set(String(msg.trade_id), lockKey);
@@ -1265,4 +1438,11 @@ async function main() {
   await new Promise(() => {});
 }
 
-main().catch((err) => die(err?.stack || err?.message || String(err)));
+const isDirectRun = (() => {
+  const entry = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : '';
+  return import.meta.url === entry;
+})();
+
+if (isDirectRun) {
+  main().catch((err) => die(err?.stack || err?.message || String(err)));
+}

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { attachSignature } from '../src/protocol/signedMessage.js';
 import { createUnsignedEnvelope } from '../src/protocol/signedMessage.js';
 import { matchOfferAnnouncementEvent } from '../src/rfq/offerMatch.js';
+import { DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC, resolveUnsafeMinSettlementRefundAfterSec } from '../src/rfq/cliFlags.js';
 import { deriveIntercomswapAppHash } from '../src/swap/app.js';
 import { ASSET, KIND, PAIR, DIR } from '../src/swap/constants.js';
 import { SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID } from '../settlement/providerFactory.js';
@@ -41,7 +42,7 @@ function makeOfferEvent(offers) {
   };
 }
 
-function matchOffer(evt) {
+function matchOffer(evt, overrides = {}) {
   return matchOfferAnnouncementEvent(evt, {
     offerChannels: [RFQ_CHANNEL],
     rfqChannel: RFQ_CHANNEL,
@@ -49,10 +50,12 @@ function matchOffer(evt) {
     expectedProgramId: SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
     taoHtlcAddress: TAO_HTLC_ADDRESS,
     minRefundSec: 72 * 3600,
+    minSettlementRefundSec: DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
     maxRefundSec: 7 * 24 * 3600,
     maxPlatformFeeBps: 500,
     maxTradeFeeBps: 1000,
     maxTotalFeeBps: 1500,
+    ...overrides,
   });
 }
 
@@ -138,4 +141,65 @@ test('rfq taker offer-listen: derives USDT RFQ overrides and rejects TAO-only fi
   assert.equal(matched.usdt_amount, '123450000');
   assert.equal(matched.min_sol_refund_window_sec, 72 * 3600);
   assert.equal(matched.max_sol_refund_window_sec, 7 * 24 * 3600);
+});
+
+test('rfq taker offer-listen: default safe TAO min rejects 115000 refund window', () => {
+  const evt = makeOfferEvent([
+    {
+      pair: PAIR.BTC_LN__TAO_EVM,
+      have: ASSET.TAO_EVM,
+      want: ASSET.BTC_LN,
+      settlement_kind: 'tao-evm',
+      app_hash: TAO_APP_HASH,
+      btc_sats: 50_000,
+      tao_amount_atomic: '4200000000',
+      max_platform_fee_bps: 10,
+      max_trade_fee_bps: 10,
+      max_total_fee_bps: 20,
+      settlement_refund_after_sec: 115000,
+    },
+  ]);
+
+  const matched = matchOffer(evt);
+  assert.equal(matched, null);
+});
+
+test('rfq taker offer-listen: unsafe min override accepts 115000 refund window', () => {
+  const evt = makeOfferEvent([
+    {
+      pair: PAIR.BTC_LN__TAO_EVM,
+      have: ASSET.TAO_EVM,
+      want: ASSET.BTC_LN,
+      settlement_kind: 'tao-evm',
+      app_hash: TAO_APP_HASH,
+      btc_sats: 50_000,
+      tao_amount_atomic: '4200000000',
+      max_platform_fee_bps: 10,
+      max_trade_fee_bps: 10,
+      max_total_fee_bps: 20,
+      settlement_refund_after_sec: 115000,
+    },
+  ]);
+
+  const matched = matchOffer(evt, { minSettlementRefundSec: 1 });
+  assert.ok(matched);
+  assert.equal(matched.settlement_refund_after_sec, 115000);
+});
+
+test('rfq taker unsafe min settlement refund override is runtime-only', () => {
+  const overridden = resolveUnsafeMinSettlementRefundAfterSec({
+    unsafeMinSettlementRefundAfterSecRaw: '1',
+    fallbackSec: DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+    maxSec: 7 * 24 * 3600,
+  });
+  assert.equal(overridden.effectiveMinSettlementRefundAfterSec, 1);
+  assert.equal(overridden.unsafeMinProvided, true);
+
+  const defaulted = resolveUnsafeMinSettlementRefundAfterSec({
+    unsafeMinSettlementRefundAfterSecRaw: undefined,
+    fallbackSec: DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+    maxSec: 7 * 24 * 3600,
+  });
+  assert.equal(defaulted.effectiveMinSettlementRefundAfterSec, DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC);
+  assert.equal(defaulted.unsafeMinProvided, false);
 });

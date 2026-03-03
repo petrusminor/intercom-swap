@@ -134,7 +134,8 @@ scripts/rfq-maker-peer.sh swap-maker 49222 \
   --ln-impl cln \
   --ln-backend docker \
   --ln-service cln-alice \
-  --settlement-refund-after-sec 259200
+  --settlement-refund-after-sec 259200 \
+  --ln-invoice-expiry-sec 3600
 ```
 
 Terminal D (taker RFQ bot in TAO settlement mode):
@@ -151,6 +152,14 @@ scripts/rfq-taker-peer.sh swap-taker 49223 \
   --btc-sats 50000 \
   --tao-amount-atomic 100000000
 ```
+
+For local testing only, the taker can lower its normally safe 72h minimum TAO refund window with:
+
+```bash
+--unsafe-min-settlement-refund-after-sec 1
+```
+
+This is process-local only, is not persisted anywhere, and should not be used for live funds.
 
 What these wrappers resolve automatically:
 - SC token file:
@@ -169,6 +178,11 @@ Logs/events to look for:
 - LN pay occurs only after verify
 - taker claim event:
   - `TAO_CLAIMED` / `tao_claimed_sent`
+
+Refund-testing note:
+- `--ln-invoice-expiry-sec` is optional and only changes behavior when explicitly set.
+- It is useful for controlled refund-window testing, but do not set it too low.
+- TAO pre-pay verification now enforces that the on-chain refund timelock must remain safely beyond LN invoice expiry; very short invoice expiries can cause verification to fail before payment.
 
 ## 5) promptd TAO Mode
 
@@ -326,5 +340,6 @@ Before any live swap:
 - Confirm refund timing alignment:
   - `sol_refund_after_unix` / TAO refund timelock must leave enough room beyond LN invoice expiry and routing retries
   - avoid overly short refund windows
+  - avoid overly low `--ln-invoice-expiry-sec` values during TAO testing; the provider rejects locks where `refund_after_unix` is not strictly greater than `invoice_expiry_unix + INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC`
 
 If anything above is not green, do not run swap settlement.

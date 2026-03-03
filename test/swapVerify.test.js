@@ -209,3 +209,55 @@ test('tao provider verifySwapPrePayOnchain: refund_after must be strictly greate
     else process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC = prevMin;
   }
 });
+
+test('tao provider verifySwapPrePayOnchain: refund_after must leave enough time relative to now', async () => {
+  const prevMin = process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC;
+  process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC = '3600';
+
+  try {
+    const provider = Object.create(TaoEvmSettlementProvider.prototype);
+    provider.htlcAddress = '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653';
+    provider.verifyPrePay = async () => ({
+      ok: true,
+      metadata: {
+        sender: '0x3333333333333333333333333333333333333333',
+        receiver: '0x1111111111111111111111111111111111111111',
+        amount_atomic: '5000000',
+        refund_after_unix: 1770990000,
+        hashlock: `0x${'44'.repeat(32)}`,
+        claimed: false,
+        refunded: false,
+        contract_address: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+      },
+    });
+
+    const res = await provider.verifySwapPrePayOnchain({
+      nowUnix: 1770986401,
+      terms: {
+        pair: 'BTC_LN/TAO_EVM',
+        tao_amount_atomic: '5000000',
+        sol_recipient: '0x1111111111111111111111111111111111111111',
+        sol_refund: '0x3333333333333333333333333333333333333333',
+        sol_refund_after_unix: 1770990000,
+      },
+      invoiceBody: {
+        payment_hash_hex: '44'.repeat(32),
+      },
+      escrowBody: {
+        payment_hash_hex: '44'.repeat(32),
+        settlement_id: `0x${'66'.repeat(32)}`,
+        htlc_address: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+        amount_atomic: '5000000',
+        refund_after_unix: 1770990000,
+        recipient: '0x1111111111111111111111111111111111111111',
+        refund: '0x3333333333333333333333333333333333333333',
+      },
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error, /refund_after_unix too soon for safe pay/i);
+  } finally {
+    if (prevMin === undefined) delete process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC;
+    else process.env.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC = prevMin;
+  }
+});

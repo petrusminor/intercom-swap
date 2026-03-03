@@ -1,5 +1,7 @@
 import { SETTLEMENT_KIND } from '../../settlement/providerFactory.js';
 
+export const DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC = 72 * 3600;
+
 function parseOptionalIntFlag(value, label) {
   if (value === undefined || value === null || value === '') return null;
   if (value === true) throw new Error(`Invalid --${label}`);
@@ -38,6 +40,37 @@ export function resolveSettlementRefundAfterSec({
     throw new Error(`Invalid --settlement-refund-after-sec (must be <= ${maxSec})`);
   }
   return { settlementRefundAfterSec, warnings };
+}
+
+export function resolveUnsafeMinSettlementRefundAfterSec({
+  unsafeMinSettlementRefundAfterSecRaw,
+  fallbackSec = DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+  maxSec,
+}) {
+  const unsafeMin = parseOptionalIntFlag(
+    unsafeMinSettlementRefundAfterSecRaw,
+    'unsafe-min-settlement-refund-after-sec'
+  );
+  if (unsafeMin === null) {
+    return {
+      effectiveMinSettlementRefundAfterSec: fallbackSec,
+      unsafeMinProvided: false,
+      warnings: [],
+    };
+  }
+  if (!Number.isFinite(unsafeMin) || unsafeMin < 1) {
+    throw new Error('Invalid --unsafe-min-settlement-refund-after-sec (must be >= 1)');
+  }
+  if (Number.isFinite(maxSec) && unsafeMin > maxSec) {
+    throw new Error(`Invalid --unsafe-min-settlement-refund-after-sec (must be <= ${maxSec})`);
+  }
+  return {
+    effectiveMinSettlementRefundAfterSec: unsafeMin,
+    unsafeMinProvided: true,
+    warnings: [
+      `UNSAFE: lowering taker minimum settlement refund window to ${unsafeMin}s for this process only`,
+    ],
+  };
 }
 
 export function resolveRfqSettlementAmountAtomic({

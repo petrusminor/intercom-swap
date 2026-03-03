@@ -98,6 +98,7 @@ export function matchOfferAnnouncementEvent(evt, opts = {}) {
   const maxTradeFeeBps = Number(opts.maxTradeFeeBps ?? 1000);
   const maxTotalFeeBps = Number(opts.maxTotalFeeBps ?? 1500);
   const minRefundSec = Number(opts.minRefundSec ?? 72 * 3600);
+  const minSettlementRefundSec = Number(opts.minSettlementRefundSec ?? minRefundSec);
   const maxRefundSec = Number(opts.maxRefundSec ?? OFFER_REFUND_MAX_SEC);
   const nowUnix = Number.isFinite(Number(opts.nowUnix)) ? Number(opts.nowUnix) : Math.floor(Date.now() / 1000);
 
@@ -150,7 +151,7 @@ export function matchOfferAnnouncementEvent(evt, opts = {}) {
       const refundAfterSec = Number(offer.settlement_refund_after_sec);
       if (!Number.isInteger(refundAfterSec)) continue;
       if (refundAfterSec < OFFER_REFUND_MIN_SEC || refundAfterSec > OFFER_REFUND_MAX_SEC) continue;
-      if (refundAfterSec < minRefundSec || refundAfterSec > maxRefundSec) continue;
+      if (refundAfterSec < minSettlementRefundSec || refundAfterSec > maxRefundSec) continue;
       return normalizeMatchedOffer(offer, {
         channel: String(evt.channel || ''),
         body,

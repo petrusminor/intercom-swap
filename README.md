@@ -480,6 +480,7 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--swap-resend-ms <n>` | Proof resend interval (default `1200`) |
 | `--min-solana-refund-window-sec <n>` | Reject TERMS where `sol_refund_after_unix - now` is below this (default `3600` = 1h) |
 | `--max-solana-refund-window-sec <n>` | Reject TERMS where `sol_refund_after_unix - now` is above this (default `604800` = 1w) |
+| `--unsafe-min-settlement-refund-after-sec <n>` | UNSAFE taker-only override for TAO settlement quote/terms minimum refund window (default safe minimum `259200` = 72h; local testing only) |
 | `--max-platform-fee-bps <n>` | Reject TERMS with platform fee above this (default `500`) |
 | `--max-trade-fee-bps <n>` | Reject TERMS with trade fee above this (default `1000`) |
 | `--max-total-fee-bps <n>` | Reject TERMS with total fee above this (default `1500`) |

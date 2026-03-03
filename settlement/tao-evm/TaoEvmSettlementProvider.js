@@ -473,6 +473,19 @@ export class TaoEvmSettlementProvider {
         };
       }
     }
+    const nowUnix = Number(input?.nowUnix);
+    if (Number.isFinite(nowUnix) && Number.isInteger(nowUnix) && nowUnix > 0) {
+      const minTimelockRemainingSec = parseMinRefundSafetySec();
+      const remainingSec = onchainRefundAfterUnix - nowUnix;
+      if (remainingSec < minTimelockRemainingSec) {
+        return {
+          ok: false,
+          error:
+            `refund_after_unix too soon for safe pay ` +
+            `(remaining=${remainingSec}s min_timelock_remaining_sec=${minTimelockRemainingSec}s)`,
+        };
+      }
+    }
     const invoiceExpiresAtUnix = Number(invoiceBody?.expires_at_unix);
     if (Number.isFinite(invoiceExpiresAtUnix) && Number.isInteger(invoiceExpiresAtUnix) && invoiceExpiresAtUnix > 0) {
       const minTimelockRemainingSec = parseMinRefundSafetySec();
