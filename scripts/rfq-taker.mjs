@@ -10,6 +10,7 @@ import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
+import { evaluatePrePayTimelockSafety } from '../src/swap/timelockPolicy.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
 import {
   getDefaultPairForSettlementKind,
@@ -979,23 +980,26 @@ async function main() {
     });
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
     const nowUnix = Math.floor(Date.now() / 1000);
-    const refundAfterUnix = Number(swapCtx.trade.escrow?.refund_after_unix || 0);
-    if (!Number.isFinite(refundAfterUnix) || !Number.isInteger(refundAfterUnix) || refundAfterUnix <= 0) {
+    const timelockSafety = evaluatePrePayTimelockSafety({
+      refundAfterUnix: swapCtx.trade.escrow?.refund_after_unix,
+      invoiceExpiryUnix: swapCtx.trade.invoice?.expires_at_unix,
+      nowUnix,
+      minTimelockRemainingSec,
+      invoiceExpirySafetyMarginSec,
+      requireRefundAfterGreaterThanInvoiceExpiryPlusMin: false,
+    });
+    if (timelockSafety.code === 'refund_after_invalid') {
       throw new Error('verify-prepay failed: escrow refund_after_unix missing/invalid');
     }
-    const remainingSec = refundAfterUnix - nowUnix;
-    if (remainingSec < minTimelockRemainingSec) {
+    if (timelockSafety.code === 'timelock_too_short') {
       throw new Error(
-        `verify-prepay failed: refund_after_unix too soon for safe pay (remaining=${remainingSec}s min=${minTimelockRemainingSec}s)`
+        `verify-prepay failed: refund_after_unix too soon for safe pay (remaining=${timelockSafety.remainingSec}s min=${minTimelockRemainingSec}s)`
       );
     }
-    const invoiceExpiryUnix = Number(swapCtx.trade.invoice?.expires_at_unix || 0);
-    if (Number.isFinite(invoiceExpiryUnix) && Number.isInteger(invoiceExpiryUnix) && invoiceExpiryUnix > 0) {
-      if (refundAfterUnix < invoiceExpiryUnix + invoiceExpirySafetyMarginSec) {
-        throw new Error(
-          `verify-prepay failed: refund_after_unix must be >= invoice_expiry_unix + ${invoiceExpirySafetyMarginSec}s (refund_after_unix=${refundAfterUnix} invoice_expiry_unix=${invoiceExpiryUnix})`
-        );
-      }
+    if (timelockSafety.code === 'invoice_expiry_violation_margin') {
+      throw new Error(
+        `verify-prepay failed: refund_after_unix must be >= invoice_expiry_unix + ${invoiceExpirySafetyMarginSec}s (refund_after_unix=${timelockSafety.refundAfterUnix} invoice_expiry_unix=${timelockSafety.invoiceExpiryUnix})`
+      );
     }
     // Defense-in-depth: ensure the on-chain escrow fee receiver settings match the negotiated TERMS, otherwise
     // claim could fail (wrong trade fee vault PDA) or fees could be misrepresented.

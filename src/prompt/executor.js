@@ -26,6 +26,7 @@ import { ASSET, KIND, PAIR } from '../swap/constants.js';
 import { INTERCOMSWAP_APP_TAG, deriveIntercomswapAppHashForBinding } from '../swap/app.js';
 import { hashUnsignedEnvelope, sha256Hex } from '../swap/hash.js';
 import { deriveOfferListingId } from '../swap/listings.js';
+import { evaluatePrePayTimelockSafety, parseUnixSecondsOrNull } from '../swap/timelockPolicy.js';
 import { hashTermsEnvelope } from '../swap/terms.js';
 import {
   getAmountFieldForPair,
@@ -1092,13 +1093,6 @@ function assertRefundAfterUnixWindow(refundAfterUnix, toolName) {
   }
 }
 
-function parseUnixSecondsOrNull(value) {
-  if (value === undefined || value === null || value === '') return null;
-  const n = Number(value);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
-  return n;
-}
-
 function assertPrePayTimelockSafety({
   toolName,
   nowUnix,
@@ -1106,30 +1100,31 @@ function assertPrePayTimelockSafety({
   invoiceBody,
   decodedInvoice = null,
 }) {
-  const refundAfterUnix = parseUnixSecondsOrNull(escrowBody?.refund_after_unix);
-  if (refundAfterUnix === null) {
-    return { ok: false, error: `${toolName}: escrow refund_after_unix missing/invalid` };
-  }
-
-  const remainingSec = refundAfterUnix - Number(nowUnix);
-  if (remainingSec < MIN_TIMELOCK_REMAINING_SEC) {
-    return {
-      ok: false,
-      error: `${toolName}: refund_after_unix too soon for safe pay (remaining=${remainingSec}s min=${MIN_TIMELOCK_REMAINING_SEC}s)`,
-    };
-  }
-
   const invoiceExpiryUnix =
     parseUnixSecondsOrNull(invoiceBody?.expires_at_unix) ??
     parseUnixSecondsOrNull(decodedInvoice?.expires_at_unix);
-  if (invoiceExpiryUnix !== null) {
-    const minRefundAfter = invoiceExpiryUnix + INVOICE_EXPIRY_SAFETY_MARGIN_SEC;
-    if (refundAfterUnix < minRefundAfter) {
-      return {
-        ok: false,
-        error: `${toolName}: refund_after_unix must be >= invoice_expiry_unix + ${INVOICE_EXPIRY_SAFETY_MARGIN_SEC}s (refund_after_unix=${refundAfterUnix} invoice_expiry_unix=${invoiceExpiryUnix})`,
-      };
-    }
+  const res = evaluatePrePayTimelockSafety({
+    refundAfterUnix: escrowBody?.refund_after_unix,
+    invoiceExpiryUnix,
+    nowUnix,
+    minTimelockRemainingSec: MIN_TIMELOCK_REMAINING_SEC,
+    invoiceExpirySafetyMarginSec: INVOICE_EXPIRY_SAFETY_MARGIN_SEC,
+    requireRefundAfterGreaterThanInvoiceExpiryPlusMin: false,
+  });
+  if (res.code === 'refund_after_invalid') {
+    return { ok: false, error: `${toolName}: escrow refund_after_unix missing/invalid` };
+  }
+  if (res.code === 'timelock_too_short') {
+    return {
+      ok: false,
+      error: `${toolName}: refund_after_unix too soon for safe pay (remaining=${res.remainingSec}s min=${MIN_TIMELOCK_REMAINING_SEC}s)`,
+    };
+  }
+  if (res.code === 'invoice_expiry_violation_margin') {
+    return {
+      ok: false,
+      error: `${toolName}: refund_after_unix must be >= invoice_expiry_unix + ${INVOICE_EXPIRY_SAFETY_MARGIN_SEC}s (refund_after_unix=${res.refundAfterUnix} invoice_expiry_unix=${res.invoiceExpiryUnix})`,
+    };
   }
 
   return { ok: true, error: null };

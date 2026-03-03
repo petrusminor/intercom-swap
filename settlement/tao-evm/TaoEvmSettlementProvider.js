@@ -14,6 +14,7 @@ import {
   getTermsSettlementRefundAddress,
   getTermsSettlementRefundAfterUnix,
 } from '../../src/swap/settlementTerms.js';
+import { evaluatePrePayTimelockSafety } from '../../src/swap/timelockPolicy.js';
 
 const DEFAULT_RPC_URL = 'https://lite.chain.opentensor.ai';
 const DEFAULT_CHAIN_ID = 964n;
@@ -481,32 +482,30 @@ export class TaoEvmSettlementProvider {
         };
       }
     }
-    const nowUnix = Number(input?.nowUnix);
-    if (Number.isFinite(nowUnix) && Number.isInteger(nowUnix) && nowUnix > 0) {
-      const minTimelockRemainingSec = parseMinRefundSafetySec();
-      const remainingSec = onchainRefundAfterUnix - nowUnix;
-      if (remainingSec < minTimelockRemainingSec) {
-        return {
-          ok: false,
-          error:
-            `refund_after_unix too soon for safe pay ` +
-            `(remaining=${remainingSec}s min_timelock_remaining_sec=${minTimelockRemainingSec}s)`,
-        };
-      }
+    const minTimelockRemainingSec = parseMinRefundSafetySec();
+    const timelockSafety = evaluatePrePayTimelockSafety({
+      refundAfterUnix: onchainRefundAfterUnix,
+      invoiceExpiryUnix: invoiceBody?.expires_at_unix,
+      nowUnix: input?.nowUnix,
+      minTimelockRemainingSec,
+      requireRefundAfterGreaterThanInvoiceExpiryPlusMin: true,
+    });
+    if (timelockSafety.code === 'timelock_too_short') {
+      return {
+        ok: false,
+        error:
+          `refund_after_unix too soon for safe pay ` +
+          `(remaining=${timelockSafety.remainingSec}s min_timelock_remaining_sec=${minTimelockRemainingSec}s)`,
+      };
     }
-    const invoiceExpiresAtUnix = Number(invoiceBody?.expires_at_unix);
-    if (Number.isFinite(invoiceExpiresAtUnix) && Number.isInteger(invoiceExpiresAtUnix) && invoiceExpiresAtUnix > 0) {
-      const minTimelockRemainingSec = parseMinRefundSafetySec();
-      const minSafeRefundAfterUnix = invoiceExpiresAtUnix + minTimelockRemainingSec;
-      if (onchainRefundAfterUnix <= minSafeRefundAfterUnix) {
-        return {
-          ok: false,
-          error:
-            `refund_after_unix must be > invoice_expiry_unix + INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC ` +
-            `(refund_after_unix=${onchainRefundAfterUnix} invoice_expiry_unix=${invoiceExpiresAtUnix} ` +
-            `min_timelock_remaining_sec=${minTimelockRemainingSec})`,
-        };
-      }
+    if (timelockSafety.code === 'invoice_expiry_violation_strict') {
+      return {
+        ok: false,
+        error:
+          `refund_after_unix must be > invoice_expiry_unix + INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC ` +
+          `(refund_after_unix=${timelockSafety.refundAfterUnix} invoice_expiry_unix=${timelockSafety.invoiceExpiryUnix} ` +
+          `min_timelock_remaining_sec=${minTimelockRemainingSec})`,
+      };
     }
 
     let expectedHtlcAddress = '';
