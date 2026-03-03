@@ -8,10 +8,9 @@ import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
-import { deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
+import { buildSettlementContext } from '../src/swap/settlementContext.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
 import {
-  getDefaultPairForSettlementKind,
   getAmountFieldForPair,
   getAmountForPair,
   getDirectionForPair,
@@ -30,9 +29,7 @@ import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
 import { resolveSettlementRefundAfterSec } from '../src/rfq/cliFlags.js';
 import {
-  getSettlementBinding,
   getSettlementProvider,
-  getSettlementAppBinding,
   normalizeSettlementKind,
   SETTLEMENT_KIND,
   SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
@@ -284,12 +281,14 @@ async function main() {
   const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
 
   const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
-  const settlementBinding = getSettlementBinding(settlementKind, {
+  const settlementCtx = buildSettlementContext({
+    settlementKind,
     solanaProgramId: expectedProgramId,
     taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
   });
+  const settlementBinding = settlementCtx.settlementBinding;
   const settlementProgramId = settlementBinding.binding_id;
-  const expectedAppHash = deriveIntercomswapAppHashForBinding(settlementBinding);
+  const expectedAppHash = settlementCtx.expectedAppHash;
 
   const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
 
@@ -1360,7 +1359,7 @@ async function main() {
             quoteId,
             swapChannel,
             inviteePubKey,
-            pair: normalizePair(known.pair || getDefaultPairForSettlementKind(settlementKind)),
+            pair: buildSettlementContext({ settlementKind, pair: known.pair }).pair,
             invite,
             btcSats: Number(known.btc_sats),
             usdtAmount: String(known.usdt_amount),

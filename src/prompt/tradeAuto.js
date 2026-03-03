@@ -1,16 +1,13 @@
 import { hashUnsignedEnvelope } from '../swap/hash.js';
-import { normalizeSettlementTerms } from '../swap/settlementTerms.js';
+import { buildSettlementContext } from '../swap/settlementContext.js';
 import {
-  buildRefundFieldsForPair,
   getAmountFieldForPair,
   getAmountForPair,
-  getDefaultPairForSettlementKind,
   getDirectionForPair,
   getPairSettlementKind,
   getQuoteRefundFieldForPair,
   getRfqRefundRangeFieldsForPair,
   isTaoPair,
-  normalizeRefundPolicyForPair,
   normalizePair,
 } from '../swap/pairs.js';
 import { SETTLEMENT_KIND, normalizeSettlementKind } from '../../settlement/providerFactory.js';
@@ -181,7 +178,10 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
   const rfqBody = rfqMsg?.body && typeof rfqMsg.body === 'object' ? rfqMsg.body : null;
   if (!rfqBody) return null;
 
-  const pair = normalizePair(rfqBody.pair || getDefaultPairForSettlementKind(rfqBody?.settlement_kind));
+  const pair = buildSettlementContext({
+    settlementKind: rfqBody?.settlement_kind,
+    pair: rfqBody.pair,
+  }).pair;
   const amountField = getAmountFieldForPair(pair);
   const rfqBtc = toIntOrNull(rfqBody.btc_sats);
   const rfqAmount = String(getAmountForPair(rfqBody, pair) || '').trim();
@@ -191,13 +191,17 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
   const rfqMaxTrade = Math.max(0, Math.min(1000, toIntOrNull(rfqBody.max_trade_fee_bps) ?? DEFAULT_TRADE_FEE_BPS));
   const rfqMaxTotal = Math.max(0, Math.min(1500, toIntOrNull(rfqBody.max_total_fee_bps) ?? DEFAULT_TOTAL_FEE_BPS));
   const quoteRefundField = getQuoteRefundFieldForPair(pair);
-  const rfqRefundPolicy = normalizeRefundPolicyForPair(pair, rfqBody, {
-    minSec: 3600,
-    maxSec: 7 * 24 * 3600,
-    defaultQuoteRefundSec: 72 * 3600,
-    defaultMinRefundSec: 3600,
-    defaultMaxRefundSec: 7 * 24 * 3600,
-  });
+  const rfqRefundPolicy = buildSettlementContext({
+    pair,
+    refundRaw: rfqBody,
+    refundDefaults: {
+      minSec: 3600,
+      maxSec: 7 * 24 * 3600,
+      defaultQuoteRefundSec: 72 * 3600,
+      defaultMinRefundSec: 3600,
+      defaultMaxRefundSec: 7 * 24 * 3600,
+    },
+  }).refundPolicy;
   const rfqMinWin = rfqRefundPolicy.minRefundSec;
   const rfqMaxWin = rfqRefundPolicy.maxRefundSec;
   if (!rfqRefundPolicy.rangeValid) return null;
@@ -241,13 +245,17 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
       const lineMaxTotal = Math.max(0, Math.min(1500, toIntOrNull(line.max_total_fee_bps) ?? DEFAULT_TOTAL_FEE_BPS));
       if (lineMaxPlatform > rfqMaxPlatform || lineMaxTrade > rfqMaxTrade || lineMaxTotal > rfqMaxTotal) continue;
 
-      const lineRefundPolicy = normalizeRefundPolicyForPair(pair, line, {
-        minSec: 3600,
-        maxSec: 7 * 24 * 3600,
-        defaultQuoteRefundSec: 72 * 3600,
-        defaultMinRefundSec: 3600,
-        defaultMaxRefundSec: 7 * 24 * 3600,
-      });
+      const lineRefundPolicy = buildSettlementContext({
+        pair,
+        refundRaw: line,
+        refundDefaults: {
+          minSec: 3600,
+          maxSec: 7 * 24 * 3600,
+          defaultQuoteRefundSec: 72 * 3600,
+          defaultMinRefundSec: 3600,
+          defaultMaxRefundSec: 7 * 24 * 3600,
+        },
+      }).refundPolicy;
       const lineMinWin = lineRefundPolicy.minRefundSec;
       const lineMaxWin = lineRefundPolicy.maxRefundSec;
       const overlapMin = Math.max(rfqMinWin, lineMinWin);
@@ -1515,18 +1523,25 @@ export class TradeAutoManager {
           const match = matchOfferForRfq({ rfqEvt, myOfferEvents: ctx.myOfferEvents });
           if (!match && this.opts.enable_quote_from_rfqs !== true) continue;
           const rfqBody = isObject(rfqEvt?.message?.body) ? rfqEvt.message.body : {};
-          const pair = normalizePair(rfqBody.pair || getDefaultPairForSettlementKind(rfqBody?.settlement_kind));
+          const pair = buildSettlementContext({
+            settlementKind: rfqBody?.settlement_kind,
+            pair: rfqBody.pair,
+          }).pair;
           const quoteRefundField = getQuoteRefundFieldForPair(pair);
           const refundWindowSec =
             match && Number.isFinite(Number(match.refundWindowSec))
               ? Number(match.refundWindowSec)
-              : normalizeRefundPolicyForPair(pair, {}, {
-                  minSec: 3600,
-                  maxSec: 7 * 24 * 3600,
-                  defaultQuoteRefundSec: Number(this.opts.default_sol_refund_window_sec || 72 * 3600),
-                  defaultMinRefundSec: 3600,
-                  defaultMaxRefundSec: 7 * 24 * 3600,
-                }).quoteRefundSec;
+              : buildSettlementContext({
+                  pair,
+                  refundRaw: {},
+                  refundDefaults: {
+                    minSec: 3600,
+                    maxSec: 7 * 24 * 3600,
+                    defaultQuoteRefundSec: Number(this.opts.default_sol_refund_window_sec || 72 * 3600),
+                    defaultMinRefundSec: 3600,
+                    defaultMaxRefundSec: 7 * 24 * 3600,
+                  },
+                }).refundPolicy.quoteRefundSec;
           if (getPairSettlementKind(pair) !== this.opts.settlement_kind) continue;
           try {
             const ch = String(rfqEvt?.channel || '').trim();
@@ -1910,15 +1925,27 @@ export class TradeAutoManager {
               try {
                 const quoteBody = isObject(quoteEnv?.body) ? quoteEnv.body : {};
                 const rfqBody = isObject(rfqEnv?.body) ? rfqEnv.body : {};
-                const pair = normalizePair(
-                  quoteBody?.pair ?? rfqBody?.pair ?? getDefaultPairForSettlementKind(this.opts.settlement_kind)
-                );
+                const settlementCtx = buildSettlementContext({
+                  settlementKind: this.opts.settlement_kind,
+                  pair: quoteBody?.pair ?? rfqBody?.pair,
+                  terms: rfqBody,
+                  refundRaw: quoteBody,
+                  refundDefaults: {
+                    minSec: 3600,
+                    maxSec: 7 * 24 * 3600,
+                    defaultQuoteRefundSec: this.opts.default_sol_refund_window_sec,
+                    defaultMinRefundSec: 3600,
+                    defaultMaxRefundSec: 7 * 24 * 3600,
+                  },
+                  refundNowUnix: Math.floor(Date.now() / 1000),
+                });
+                const pair = settlementCtx.pair;
                 const amountField = getAmountFieldForPair(pair);
                 const btcSats = toIntOrNull(quoteBody?.btc_sats ?? rfqBody?.btc_sats);
                 const amountAtomic = String(
                   getAmountForPair(quoteBody, pair) || getAmountForPair(rfqBody, pair) || ''
                 ).trim();
-                const normalizedRfqTerms = normalizeSettlementTerms(rfqBody, pair);
+                const normalizedRfqTerms = settlementCtx.normalizedTerms;
                 const solRecipient = String(normalizedRfqTerms.settlement_recipient || '').trim();
                 const solRefund = localSettlementSigner;
                 const tradeFeeCollector = String(quoteBody?.trade_fee_collector || '').trim();
@@ -1933,14 +1960,7 @@ export class TradeAutoManager {
                 if (!solRefund) throw new Error('terms_post: missing sol_refund');
                 if (!tradeFeeCollector) throw new Error('terms_post: missing trade_fee_collector');
                 if (!lnPayerPeer) throw new Error('terms_post: missing ln_payer_peer');
-                const refundPolicy = normalizeRefundPolicyForPair(pair, quoteBody, {
-                  minSec: 3600,
-                  maxSec: 7 * 24 * 3600,
-                  defaultQuoteRefundSec: this.opts.default_sol_refund_window_sec,
-                  defaultMinRefundSec: 3600,
-                  defaultMaxRefundSec: 7 * 24 * 3600,
-                });
-                const refundFields = buildRefundFieldsForPair(pair, refundPolicy, Math.floor(Date.now() / 1000));
+                const refundFields = settlementCtx.refundFields;
                 const termsValidUntilUnix = toIntOrNull(quoteBody?.valid_until_unix);
                 await this._runToolWithTimeout({
                   tool: 'intercomswap_terms_post',
@@ -2415,8 +2435,9 @@ export class TradeAutoManager {
               try {
                 const invBody = isObject(invoiceEnv?.body) ? invoiceEnv.body : {};
                 const paymentHashHex = String(invBody?.payment_hash_hex || '').trim().toLowerCase();
-                const termsPair = normalizePair(termsBody?.pair);
-                const normalizedTerms = normalizeSettlementTerms(termsBody, termsPair);
+                const settlementCtx = buildSettlementContext({ pair: termsBody?.pair, terms: termsBody });
+                const termsPair = settlementCtx.pair;
+                const normalizedTerms = settlementCtx.normalizedTerms;
                 const mint = String(normalizedTerms.settlement_asset_id || this.opts.usdt_mint || '').trim();
                 const amount = String(getAmountForPair(termsBody, termsPair, { allowLegacyTaoFallback: true }) || '').trim();
                 const recipient = String(normalizedTerms.settlement_recipient || '').trim();
@@ -2569,8 +2590,9 @@ export class TradeAutoManager {
               this._markStageInFlight(stageKey);
               try {
                 if (!termsBoundToLocalSolRecipient) throw new Error(`${claimStageName}: terms.sol_recipient mismatch`);
-                const termsPair = normalizePair(termsBody?.pair);
-                const normalizedTerms = normalizeSettlementTerms(termsBody, termsPair);
+                const settlementCtx = buildSettlementContext({ pair: termsBody?.pair, terms: termsBody });
+                const termsPair = settlementCtx.pair;
+                const normalizedTerms = settlementCtx.normalizedTerms;
                 const mint = String(normalizedTerms.settlement_asset_id || this.opts.usdt_mint || '').trim();
                 if (!isTaoPair(termsPair) && !mint) throw new Error(`${claimStageName}: missing mint`);
                 let preimageHex = String(this._tradePreimage.get(tradeId) || '').trim().toLowerCase();

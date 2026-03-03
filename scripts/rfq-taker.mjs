@@ -9,11 +9,9 @@ import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
-import { deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
-import { evaluatePrePayTimelockSafety } from '../src/swap/timelockPolicy.js';
+import { buildSettlementContext } from '../src/swap/settlementContext.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
 import {
-  getDefaultPairForSettlementKind,
   getAmountFieldForPair,
   getAmountForPair,
   getDirectionForPair,
@@ -38,9 +36,7 @@ import {
 import { buildRfqUnsignedEnvelope } from '../src/rfq/buildRfq.js';
 import { matchOfferAnnouncementEvent } from '../src/rfq/offerMatch.js';
 import {
-  getSettlementBinding,
   getSettlementProvider,
-  getSettlementAppBinding,
   normalizeSettlementKind,
   SETTLEMENT_KIND,
   SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
@@ -184,7 +180,7 @@ async function main() {
   const initialSettlementKind = settlementKind;
   let isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
   let isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
-  let rfqPair = getDefaultPairForSettlementKind(settlementKind);
+  let rfqPair = buildSettlementContext({ settlementKind }).pair;
 
   let btcSats = parseIntFlag(flags.get('btc-sats'), 'btc-sats', 50_000);
   let usdtAmount = '100000000';
@@ -348,12 +344,14 @@ async function main() {
   };
 
   const initSettlementRuntime = async () => {
-    settlementBinding = getSettlementBinding(settlementKind, {
+    const settlementCtx = buildSettlementContext({
+      settlementKind,
       solanaProgramId: expectedProgramId,
       taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
     });
+    settlementBinding = settlementCtx.settlementBinding;
     settlementProgramId = settlementBinding.binding_id;
-    expectedAppHash = deriveIntercomswapAppHashForBinding(settlementBinding);
+    expectedAppHash = settlementCtx.expectedAppHash;
     if (!receipts && receiptsDbPath) receipts = openTradeReceiptsStore({ dbPath: receiptsDbPath });
 
     if (runSwap) {
@@ -980,14 +978,16 @@ async function main() {
     });
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
     const nowUnix = Math.floor(Date.now() / 1000);
-    const timelockSafety = evaluatePrePayTimelockSafety({
-      refundAfterUnix: swapCtx.trade.escrow?.refund_after_unix,
-      invoiceExpiryUnix: swapCtx.trade.invoice?.expires_at_unix,
-      nowUnix,
-      minTimelockRemainingSec,
-      invoiceExpirySafetyMarginSec,
-      requireRefundAfterGreaterThanInvoiceExpiryPlusMin: false,
-    });
+    const timelockSafety = buildSettlementContext({
+      timelock: {
+        refundAfterUnix: swapCtx.trade.escrow?.refund_after_unix,
+        invoiceExpiryUnix: swapCtx.trade.invoice?.expires_at_unix,
+        nowUnix,
+        minTimelockRemainingSec,
+        invoiceExpirySafetyMarginSec,
+        requireRefundAfterGreaterThanInvoiceExpiryPlusMin: false,
+      },
+    }).timelockSafety;
     if (timelockSafety.code === 'refund_after_invalid') {
       throw new Error('verify-prepay failed: escrow refund_after_unix missing/invalid');
     }
