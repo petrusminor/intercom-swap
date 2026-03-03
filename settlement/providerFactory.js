@@ -17,16 +17,30 @@ export function normalizeSettlementKind(value) {
   throw new Error(`Invalid settlement kind: ${String(value)}`);
 }
 
-export function getSettlementAppBinding(kind, opts = {}) {
+export function getSettlementBinding(kind, opts = {}) {
   const normalized = normalizeSettlementKind(kind);
   if (normalized === SETTLEMENT_KIND.SOLANA) {
     const programId = String(opts.solanaProgramId || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID).trim();
     if (!programId) throw new Error('Missing Solana settlement program id');
-    return programId;
+    return {
+      settlement_kind: normalized,
+      binding_type: 'program',
+      binding_id: programId,
+    };
   }
   const htlcAddress = String(opts.taoHtlcAddress || process.env.TAO_EVM_HTLC_ADDRESS || '').trim();
   if (!htlcAddress) throw new Error('Missing TAO_EVM_HTLC_ADDRESS');
-  return htlcAddress;
+  const chainId = Number(opts.taoChainId);
+  return {
+    settlement_kind: normalized,
+    binding_type: 'htlc_contract',
+    binding_id: htlcAddress,
+    ...(Number.isFinite(chainId) ? { chain_id: chainId } : {}),
+  };
+}
+
+export function getSettlementAppBinding(kind, opts = {}) {
+  return getSettlementBinding(kind, opts).binding_id;
 }
 
 export function getSettlementProvider(kind, opts = {}) {

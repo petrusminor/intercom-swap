@@ -1,6 +1,12 @@
 import { verifyBolt11MatchesInvoiceBody } from '../ln/bolt11.js';
 import { verifyLnUsdtEscrowOnchain } from '../solana/verifyLnUsdtEscrow.js';
 import { getAmountForPair, isTaoPair, normalizePair } from './pairs.js';
+import {
+  getTermsSettlementAssetId,
+  getTermsSettlementRecipient,
+  getTermsSettlementRefundAddress,
+  getTermsSettlementRefundAfterUnix,
+} from './settlementTerms.js';
 
 const normalizeHex = (value) => String(value || '').trim().toLowerCase();
 
@@ -27,14 +33,18 @@ export function verifyEscrowAgainstTerms({ terms, escrowBody }) {
   if (!escrowBody || typeof escrowBody !== 'object') return { ok: false, error: 'escrowBody is required' };
   const pair = normalizePair(terms.pair);
   const wantAmount = getAmountForPair(terms, pair, { allowLegacyTaoFallback: true });
+  const termsRecipient = getTermsSettlementRecipient(terms);
+  const termsRefund = getTermsSettlementRefundAddress(terms);
+  const termsAssetId = getTermsSettlementAssetId(terms, pair);
+  const termsRefundAfterUnix = getTermsSettlementRefundAfterUnix(terms);
 
-  if (String(escrowBody.recipient) !== String(terms.sol_recipient)) {
+  if (String(escrowBody.recipient) !== String(termsRecipient)) {
     return { ok: false, error: 'escrow recipient mismatch vs terms' };
   }
-  if (String(escrowBody.refund) !== String(terms.sol_refund)) {
+  if (String(escrowBody.refund) !== String(termsRefund)) {
     return { ok: false, error: 'escrow refund mismatch vs terms' };
   }
-  if (!isTaoPair(pair) && String(escrowBody.mint) !== String(terms.sol_mint)) {
+  if (!isTaoPair(pair) && String(escrowBody.mint) !== String(termsAssetId)) {
     return { ok: false, error: 'escrow mint mismatch vs terms' };
   }
   if (isTaoPair(pair)) {
@@ -44,7 +54,7 @@ export function verifyEscrowAgainstTerms({ terms, escrowBody }) {
   } else if (String(escrowBody.amount) !== String(wantAmount)) {
     return { ok: false, error: 'escrow amount mismatch vs terms' };
   }
-  if (Number(escrowBody.refund_after_unix) < Number(terms.sol_refund_after_unix)) {
+  if (Number(escrowBody.refund_after_unix) < Number(termsRefundAfterUnix)) {
     return { ok: false, error: 'escrow refund_after_unix earlier than terms' };
   }
 

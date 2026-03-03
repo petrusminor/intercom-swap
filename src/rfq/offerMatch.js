@@ -1,5 +1,5 @@
-import { getSettlementAppBinding } from '../../settlement/providerFactory.js';
-import { deriveIntercomswapAppHash } from '../swap/app.js';
+import { getSettlementBinding } from '../../settlement/providerFactory.js';
+import { deriveIntercomswapAppHashForBinding } from '../swap/app.js';
 import { KIND, ASSET } from '../swap/constants.js';
 import { validateSwapEnvelope } from '../swap/schema.js';
 import {
@@ -25,11 +25,11 @@ function includesChannel(list, channel) {
 
 function getExpectedOfferAppHash(pair, { expectedProgramId, taoHtlcAddress }) {
   const settlementKind = getPairSettlementKind(pair);
-  const programId = getSettlementAppBinding(settlementKind, {
+  const binding = getSettlementBinding(settlementKind, {
     solanaProgramId: expectedProgramId,
     taoHtlcAddress,
   });
-  return deriveIntercomswapAppHash({ solanaProgramId: programId });
+  return deriveIntercomswapAppHashForBinding(binding);
 }
 
 function hasValue(value) {

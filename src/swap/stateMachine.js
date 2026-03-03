@@ -1,5 +1,11 @@
 import { KIND, STATE } from './constants.js';
 import { getAmountForPair, normalizePair } from './pairs.js';
+import {
+  getTermsSettlementAssetId,
+  getTermsSettlementRecipient,
+  getTermsSettlementRefundAddress,
+  getTermsSettlementRefundAfterUnix,
+} from './settlementTerms.js';
 import { hashUnsignedEnvelope } from './hash.js';
 import { validateSwapEnvelope } from './schema.js';
 import { verifySignedEnvelope } from '../protocol/signedMessage.js';
@@ -194,6 +200,10 @@ export function applySwapEnvelope(trade, envelope) {
       const label = isTao ? 'TAO_HTLC_LOCKED' : 'SOL_ESCROW_CREATED';
       const termsPair = normalizePair(next.terms?.pair);
       const termsAmount = getAmountForPair(next.terms, termsPair, { allowLegacyTaoFallback: true });
+      const termsRecipient = getTermsSettlementRecipient(next.terms);
+      const termsRefund = getTermsSettlementRefundAddress(next.terms);
+      const termsRefundAfterUnix = getTermsSettlementRefundAfterUnix(next.terms);
+      const termsAssetId = getTermsSettlementAssetId(next.terms, termsPair);
       if (![STATE.INVOICE, STATE.ESCROW].includes(next.state)) {
         return { ok: false, error: `${label} not allowed in state=${next.state}`, trade: null };
       }
@@ -206,13 +216,13 @@ export function applySwapEnvelope(trade, envelope) {
       }
 
       // Cross-checks with terms.
-      if (String(envelope.body.recipient) !== String(next.terms.sol_recipient)) {
+      if (String(envelope.body.recipient) !== String(termsRecipient)) {
         return { ok: false, error: `${isTao ? 'TAO HTLC' : 'SOL escrow'} recipient mismatch vs terms`, trade: null };
       }
-      if (String(envelope.body.refund) !== String(next.terms.sol_refund)) {
+      if (String(envelope.body.refund) !== String(termsRefund)) {
         return { ok: false, error: `${isTao ? 'TAO HTLC' : 'SOL escrow'} refund mismatch vs terms`, trade: null };
       }
-      if (String(envelope.body.refund_after_unix) && Number(envelope.body.refund_after_unix) < Number(next.terms.sol_refund_after_unix)) {
+      if (String(envelope.body.refund_after_unix) && Number(envelope.body.refund_after_unix) < Number(termsRefundAfterUnix)) {
         return { ok: false, error: `${isTao ? 'TAO HTLC' : 'SOL escrow'} refund_after_unix earlier than terms`, trade: null };
       }
 
@@ -231,7 +241,7 @@ export function applySwapEnvelope(trade, envelope) {
           next.escrow = envelope.body;
         }
       } else {
-        if (envelope.body.mint !== next.terms.sol_mint) {
+        if (envelope.body.mint !== termsAssetId) {
           return { ok: false, error: 'SOL escrow mint mismatch vs terms', trade: null };
         }
         if (String(envelope.body.amount) !== String(termsAmount)) {

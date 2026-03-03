@@ -5,14 +5,22 @@ import { attachSignature } from '../src/protocol/signedMessage.js';
 import { createUnsignedEnvelope } from '../src/protocol/signedMessage.js';
 import { matchOfferAnnouncementEvent } from '../src/rfq/offerMatch.js';
 import { DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC, resolveUnsafeMinSettlementRefundAfterSec } from '../src/rfq/cliFlags.js';
-import { deriveIntercomswapAppHash } from '../src/swap/app.js';
+import { deriveIntercomswapAppHash, deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
 import { ASSET, KIND, PAIR, DIR } from '../src/swap/constants.js';
-import { SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID } from '../settlement/providerFactory.js';
+import { getSettlementBinding, SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID } from '../settlement/providerFactory.js';
 
 const TAO_HTLC_ADDRESS = '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653';
 const RFQ_CHANNEL = '0000intercomswapbtctao';
 const SOL_APP_HASH = deriveIntercomswapAppHash({ solanaProgramId: SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID });
 const TAO_APP_HASH = deriveIntercomswapAppHash({ solanaProgramId: TAO_HTLC_ADDRESS });
+
+test('settlement binding app hash stays byte-identical for TAO', () => {
+  const binding = getSettlementBinding('tao-evm', { taoHtlcAddress: TAO_HTLC_ADDRESS, taoChainId: 964 });
+  assert.equal(binding.binding_type, 'htlc_contract');
+  assert.equal(binding.binding_id, TAO_HTLC_ADDRESS);
+  assert.equal(binding.chain_id, 964);
+  assert.equal(deriveIntercomswapAppHashForBinding(binding), TAO_APP_HASH);
+});
 
 function signEnvelope(unsignedEnvelope) {
   return attachSignature(unsignedEnvelope, {

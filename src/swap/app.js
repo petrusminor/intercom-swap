@@ -15,3 +15,8 @@ export function deriveIntercomswapAppHash({ solanaProgramId, appTag = INTERCOMSW
   return sha256Hex(canon);
 }
 
+export function deriveIntercomswapAppHashForBinding(binding, { appTag = INTERCOMSWAP_APP_TAG } = {}) {
+  const bindingId = String(binding?.binding_id || '').trim();
+  if (!bindingId) throw new Error('deriveIntercomswapAppHashForBinding: binding.binding_id is required');
+  return deriveIntercomswapAppHash({ solanaProgramId: bindingId, appTag });
+}

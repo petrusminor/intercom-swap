@@ -23,7 +23,7 @@ import { ScBridgeClient } from '../sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex, verifySignedEnvelope } from '../protocol/signedMessage.js';
 import { validateSwapEnvelope } from '../swap/schema.js';
 import { ASSET, KIND, PAIR } from '../swap/constants.js';
-import { INTERCOMSWAP_APP_TAG, deriveIntercomswapAppHash } from '../swap/app.js';
+import { INTERCOMSWAP_APP_TAG, deriveIntercomswapAppHashForBinding } from '../swap/app.js';
 import { hashUnsignedEnvelope, sha256Hex } from '../swap/hash.js';
 import { deriveOfferListingId } from '../swap/listings.js';
 import { hashTermsEnvelope } from '../swap/terms.js';
@@ -37,6 +37,7 @@ import {
   getQuoteRefundFieldForPair,
   getRfqRefundRangeFieldsForPair,
   isTaoPair,
+  normalizeRefundPolicyForPair,
   normalizePair,
 } from '../swap/pairs.js';
 import { AutopostManager } from './autopost.js';
@@ -101,6 +102,7 @@ import {
 import {
   SETTLEMENT_KIND,
   getSettlementAppBinding,
+  getSettlementBinding,
   getSettlementProvider,
   normalizeSettlementKind,
 } from '../../settlement/providerFactory.js';
@@ -1634,16 +1636,20 @@ export class ToolExecutor {
     return this._settlementKind() === SETTLEMENT_KIND.TAO_EVM;
   }
 
-  _settlementAppBinding() {
-    return getSettlementAppBinding(this._settlementKind(), {
+  _settlementBinding() {
+    return getSettlementBinding(this._settlementKind(), {
       solanaProgramId: this._programId().toBase58(),
       taoHtlcAddress: String(this.taoEvm?.htlcAddress || process.env.TAO_EVM_HTLC_ADDRESS || '').trim(),
+      taoChainId: this.taoEvm?.chainId,
     });
   }
 
+  _settlementAppBinding() {
+    return this._settlementBinding().binding_id;
+  }
+
   _settlementAppHash() {
-    return deriveIntercomswapAppHash({
-      solanaProgramId: this._settlementAppBinding(),
+    return deriveIntercomswapAppHashForBinding(this._settlementBinding(), {
       appTag: INTERCOMSWAP_APP_TAG,
     });
   }
@@ -3674,29 +3680,30 @@ export class ToolExecutor {
         expectOptionalInt(args, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 }) ?? DEFAULT_TRADE_FEE_BPS;
       const maxTotalFeeBps =
         expectOptionalInt(args, toolName, 'max_total_fee_bps', { min: 0, max: 1500 }) ?? DEFAULT_TOTAL_FEE_BPS;
-      const quoteRefundField = getQuoteRefundFieldForPair(pair);
-      const { minField, maxField } = getRfqRefundRangeFieldsForPair(pair);
-      let refundFields = {};
-      if (isTaoPair(pair)) {
-        refundFields = {
-          [quoteRefundField]:
-            expectOptionalInt(args, toolName, quoteRefundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ?? SOL_REFUND_DEFAULT_SEC,
-        };
-      } else {
-        const minSolRefundWindowSec =
-          expectOptionalInt(args, toolName, minField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-          SOL_REFUND_DEFAULT_SEC;
-        const maxSolRefundWindowSec =
-          expectOptionalInt(args, toolName, maxField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-          SOL_REFUND_MAX_SEC;
-        if (minSolRefundWindowSec > maxSolRefundWindowSec) {
-          throw new Error(`${toolName}: ${minField} must be <= ${maxField}`);
-        }
-        refundFields = {
-          [minField]: minSolRefundWindowSec,
-          [maxField]: maxSolRefundWindowSec,
-        };
+      const refundPolicy = normalizeRefundPolicyForPair(pair, {
+        settlement_refund_after_sec: expectOptionalInt(args, toolName, 'settlement_refund_after_sec', {
+          min: SOL_REFUND_MIN_SEC,
+          max: SOL_REFUND_MAX_SEC,
+        }),
+        min_sol_refund_window_sec: expectOptionalInt(args, toolName, 'min_sol_refund_window_sec', {
+          min: SOL_REFUND_MIN_SEC,
+          max: SOL_REFUND_MAX_SEC,
+        }),
+        max_sol_refund_window_sec: expectOptionalInt(args, toolName, 'max_sol_refund_window_sec', {
+          min: SOL_REFUND_MIN_SEC,
+          max: SOL_REFUND_MAX_SEC,
+        }),
+      }, {
+        minSec: SOL_REFUND_MIN_SEC,
+        maxSec: SOL_REFUND_MAX_SEC,
+        defaultQuoteRefundSec: SOL_REFUND_DEFAULT_SEC,
+        defaultMinRefundSec: SOL_REFUND_DEFAULT_SEC,
+        defaultMaxRefundSec: SOL_REFUND_MAX_SEC,
+      });
+      if (!refundPolicy.rangeValid) {
+        throw new Error(`${toolName}: ${refundPolicy.minField} must be <= ${refundPolicy.maxField}`);
       }
+      const refundFields = refundPolicy.rfqFields;
       const validUntil = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
       if (validUntil !== null && isExpiredUnixSec(validUntil)) {
         throw new Error(`${toolName}: valid_until_unix is already expired`);
@@ -3803,9 +3810,19 @@ export class ToolExecutor {
         'trade_fee_collector'
       );
       const quoteRefundField = getQuoteRefundFieldForPair(pair);
-      const quoteRefundWindowSec =
-        expectOptionalInt(args, toolName, quoteRefundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-        SOL_REFUND_DEFAULT_SEC;
+      const refundPolicy = normalizeRefundPolicyForPair(pair, {
+        [quoteRefundField]: expectOptionalInt(args, toolName, quoteRefundField, {
+          min: SOL_REFUND_MIN_SEC,
+          max: SOL_REFUND_MAX_SEC,
+        }),
+      }, {
+        minSec: SOL_REFUND_MIN_SEC,
+        maxSec: SOL_REFUND_MAX_SEC,
+        defaultQuoteRefundSec: SOL_REFUND_DEFAULT_SEC,
+        defaultMinRefundSec: SOL_REFUND_DEFAULT_SEC,
+        defaultMaxRefundSec: SOL_REFUND_MAX_SEC,
+      });
+      const quoteRefundWindowSec = refundPolicy.quoteRefundSec;
       const validUntilRaw = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
       const validFor = expectOptionalInt(args, toolName, 'valid_for_sec', { min: 10, max: 60 * 60 * 24 * 7 });
       const nowSec = Math.floor(Date.now() / 1000);
@@ -3949,9 +3966,19 @@ export class ToolExecutor {
         'trade_fee_collector'
       );
       const quoteRefundField = getQuoteRefundFieldForPair(pair);
-      const quoteRefundWindowSec =
-        expectOptionalInt(args, toolName, quoteRefundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-        SOL_REFUND_DEFAULT_SEC;
+      const refundPolicy = normalizeRefundPolicyForPair(pair, {
+        [quoteRefundField]: expectOptionalInt(args, toolName, quoteRefundField, {
+          min: SOL_REFUND_MIN_SEC,
+          max: SOL_REFUND_MAX_SEC,
+        }),
+      }, {
+        minSec: SOL_REFUND_MIN_SEC,
+        maxSec: SOL_REFUND_MAX_SEC,
+        defaultQuoteRefundSec: SOL_REFUND_DEFAULT_SEC,
+        defaultMinRefundSec: SOL_REFUND_DEFAULT_SEC,
+        defaultMaxRefundSec: SOL_REFUND_MAX_SEC,
+      });
+      const quoteRefundWindowSec = refundPolicy.quoteRefundSec;
       const offerArgProvided = args.offer_envelope !== undefined && args.offer_envelope !== null;
       const offerLineArgProvided = args.offer_line_index !== undefined && args.offer_line_index !== null;
       let offerEnvelope = null;

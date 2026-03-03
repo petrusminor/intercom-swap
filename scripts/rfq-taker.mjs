@@ -9,9 +9,10 @@ import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
-import { deriveIntercomswapAppHash } from '../src/swap/app.js';
+import { deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
 import {
+  getDefaultPairForSettlementKind,
   getAmountFieldForPair,
   getAmountForPair,
   getDirectionForPair,
@@ -36,6 +37,7 @@ import {
 import { buildRfqUnsignedEnvelope } from '../src/rfq/buildRfq.js';
 import { matchOfferAnnouncementEvent } from '../src/rfq/offerMatch.js';
 import {
+  getSettlementBinding,
   getSettlementProvider,
   getSettlementAppBinding,
   normalizeSettlementKind,
@@ -181,7 +183,7 @@ async function main() {
   const initialSettlementKind = settlementKind;
   let isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
   let isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
-  let rfqPair = isTaoSettlement ? PAIR.BTC_LN__TAO_EVM : PAIR.BTC_LN__USDT_SOL;
+  let rfqPair = getDefaultPairForSettlementKind(settlementKind);
 
   let btcSats = parseIntFlag(flags.get('btc-sats'), 'btc-sats', 50_000);
   let usdtAmount = '100000000';
@@ -323,6 +325,7 @@ async function main() {
 
   const expectedProgramId = solProgramIdStr || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID;
   let settlementProgramId = null;
+  let settlementBinding = null;
   let expectedAppHash = null;
   let receipts = null;
   let sol = null;
@@ -344,11 +347,12 @@ async function main() {
   };
 
   const initSettlementRuntime = async () => {
-    settlementProgramId = getSettlementAppBinding(settlementKind, {
+    settlementBinding = getSettlementBinding(settlementKind, {
       solanaProgramId: expectedProgramId,
       taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
     });
-    expectedAppHash = deriveIntercomswapAppHash({ solanaProgramId: settlementProgramId });
+    settlementProgramId = settlementBinding.binding_id;
+    expectedAppHash = deriveIntercomswapAppHashForBinding(settlementBinding);
     if (!receipts && receiptsDbPath) receipts = openTradeReceiptsStore({ dbPath: receiptsDbPath });
 
     if (runSwap) {

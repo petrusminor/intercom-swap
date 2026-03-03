@@ -9,6 +9,11 @@ import {
   randomBytes,
 } from 'ethers';
 import { getAmountForPair, normalizePair } from '../../src/swap/pairs.js';
+import {
+  getTermsSettlementRecipient,
+  getTermsSettlementRefundAddress,
+  getTermsSettlementRefundAfterUnix,
+} from '../../src/swap/settlementTerms.js';
 
 const DEFAULT_RPC_URL = 'https://lite.chain.opentensor.ai';
 const DEFAULT_CHAIN_ID = 964n;
@@ -369,24 +374,27 @@ export class TaoEvmSettlementProvider {
     if (!/^[0-9a-f]{64}$/.test(paymentHashHex)) {
       return { ok: false, error: 'payment_hash_hex is required (32-byte hex without 0x)' };
     }
+    const termsRecipientRaw = getTermsSettlementRecipient(terms);
+    const termsRefundRaw = getTermsSettlementRefundAddress(terms);
+    const termsRefundAfterUnixRaw = getTermsSettlementRefundAfterUnix(terms);
 
     if (String(escrowBody?.payment_hash_hex || '').trim().toLowerCase() !== paymentHashHex) {
       return { ok: false, error: 'payment_hash mismatch (invoice vs lock message)' };
     }
 
-    if (terms?.sol_recipient !== undefined && String(terms.sol_recipient).trim() !== String(escrowBody?.recipient || '').trim()) {
+    if (termsRecipientRaw !== undefined && String(termsRecipientRaw).trim() !== String(escrowBody?.recipient || '').trim()) {
       return { ok: false, error: 'lock recipient mismatch vs terms' };
     }
-    if (terms?.sol_refund !== undefined && String(terms.sol_refund).trim() !== String(escrowBody?.refund || '').trim()) {
+    if (termsRefundRaw !== undefined && String(termsRefundRaw).trim() !== String(escrowBody?.refund || '').trim()) {
       return { ok: false, error: 'lock refund mismatch vs terms' };
     }
     if (termsAmount && termsAmount !== String(escrowBody?.amount_atomic || '').trim()) {
       return { ok: false, error: 'lock amount mismatch vs terms' };
     }
     if (
-      terms?.sol_refund_after_unix !== undefined &&
-      terms?.sol_refund_after_unix !== null &&
-      Number(escrowBody?.refund_after_unix) < Number(terms.sol_refund_after_unix)
+      termsRefundAfterUnixRaw !== undefined &&
+      termsRefundAfterUnixRaw !== null &&
+      Number(escrowBody?.refund_after_unix) < Number(termsRefundAfterUnixRaw)
     ) {
       return { ok: false, error: 'lock refund_after_unix earlier than terms' };
     }
@@ -457,8 +465,8 @@ export class TaoEvmSettlementProvider {
         error: `refund_after_unix mismatch vs on-chain (expected=${escrowRefundAfterUnix}, got=${onchainRefundAfterUnix})`,
       };
     }
-    if (terms?.sol_refund_after_unix !== undefined && terms?.sol_refund_after_unix !== null) {
-      const termsRefundAfterUnix = Number(terms.sol_refund_after_unix);
+    if (termsRefundAfterUnixRaw !== undefined && termsRefundAfterUnixRaw !== null) {
+      const termsRefundAfterUnix = Number(termsRefundAfterUnixRaw);
       if (
         !Number.isFinite(termsRefundAfterUnix) ||
         !Number.isInteger(termsRefundAfterUnix) ||
@@ -533,13 +541,13 @@ export class TaoEvmSettlementProvider {
     try {
       escrowRecipient = normalizeAddress(escrowBody?.recipient, 'escrowBody.recipient');
       onchainRecipient = normalizeAddress(md.receiver, 'on-chain receiver');
-      if (terms?.sol_recipient !== undefined && terms?.sol_recipient !== null) {
-        termsRecipient = normalizeAddress(terms.sol_recipient, 'terms.sol_recipient');
+      if (termsRecipientRaw !== undefined && termsRecipientRaw !== null) {
+        termsRecipient = normalizeAddress(termsRecipientRaw, 'terms.sol_recipient');
       }
       escrowRefund = normalizeAddress(escrowBody?.refund, 'escrowBody.refund');
       onchainSender = normalizeAddress(md.sender, 'on-chain sender');
-      if (terms?.sol_refund !== undefined && terms?.sol_refund !== null) {
-        termsRefund = normalizeAddress(terms.sol_refund, 'terms.sol_refund');
+      if (termsRefundRaw !== undefined && termsRefundRaw !== null) {
+        termsRefund = normalizeAddress(termsRefundRaw, 'terms.sol_refund');
       }
     } catch (err) {
       return { ok: false, error: err?.message || String(err) };

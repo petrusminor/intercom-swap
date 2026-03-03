@@ -103,3 +103,87 @@ export function setAmountForPair(target, pair, amount) {
 export function isTaoPair(pair) {
   return normalizePair(pair) === PAIR.BTC_LN__TAO_EVM;
 }
+
+function toIntOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const n = typeof value === 'number' ? value : Number.parseInt(String(value).trim(), 10);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+}
+
+function normalizeSec(value, fallback, { minSec, maxSec }) {
+  const base = toIntOrNull(value) ?? fallback;
+  return Math.max(minSec, Math.min(maxSec, base));
+}
+
+export function getDefaultPairForSettlementKind(settlementKind) {
+  const kind = String(settlementKind || SETTLEMENT_KIND_SOLANA).trim().toLowerCase();
+  if (kind === SETTLEMENT_KIND_TAO_EVM) return PAIR.BTC_LN__TAO_EVM;
+  return DEFAULT_PAIR;
+}
+
+export function normalizeRefundPolicyForPair(pair, raw = {}, defaults = {}) {
+  const normalizedPair = normalizePair(pair);
+  const quoteRefundField = getQuoteRefundFieldForPair(normalizedPair);
+  const { minField, maxField } = getRfqRefundRangeFieldsForPair(normalizedPair);
+  const minSec = toIntOrNull(defaults.minSec) ?? 3600;
+  const maxSec = toIntOrNull(defaults.maxSec) ?? 7 * 24 * 3600;
+  const defaultQuoteRefundSec = toIntOrNull(defaults.defaultQuoteRefundSec) ?? 72 * 3600;
+  const defaultMinRefundSec = toIntOrNull(defaults.defaultMinRefundSec) ?? minSec;
+  const defaultMaxRefundSec = toIntOrNull(defaults.defaultMaxRefundSec) ?? maxSec;
+
+  const quoteRefundSec = normalizeSec(raw?.quoteRefundSec ?? raw?.[quoteRefundField], defaultQuoteRefundSec, {
+    minSec,
+    maxSec,
+  });
+
+  if (isTaoPair(normalizedPair)) {
+    return {
+      pair: normalizedPair,
+      quoteRefundField,
+      minField,
+      maxField,
+      quoteRefundSec,
+      minRefundSec: quoteRefundSec,
+      maxRefundSec: quoteRefundSec,
+      rangeValid: true,
+      rfqFields: { [quoteRefundField]: quoteRefundSec },
+      quoteFields: { [quoteRefundField]: quoteRefundSec },
+    };
+  }
+
+  const minRefundSec = normalizeSec(raw?.minRefundSec ?? raw?.[minField], defaultMinRefundSec, {
+    minSec,
+    maxSec,
+  });
+  const maxRefundSec = normalizeSec(raw?.maxRefundSec ?? raw?.[maxField], defaultMaxRefundSec, {
+    minSec,
+    maxSec,
+  });
+
+  return {
+    pair: normalizedPair,
+    quoteRefundField,
+    minField,
+    maxField,
+    quoteRefundSec,
+    minRefundSec,
+    maxRefundSec,
+    rangeValid: minRefundSec <= maxRefundSec,
+    rfqFields: { [minField]: minRefundSec, [maxField]: maxRefundSec },
+    quoteFields: { [quoteRefundField]: quoteRefundSec },
+  };
+}
+
+export function buildRefundFieldsForPair(pair, policy, nowUnix) {
+  const normalizedPair = normalizePair(pair);
+  const baseNowUnix = toIntOrNull(nowUnix) ?? Math.floor(Date.now() / 1000);
+  const refundWindowSec =
+    toIntOrNull(policy?.quoteRefundSec) ??
+    toIntOrNull(policy?.minRefundSec) ??
+    72 * 3600;
+
+  return {
+    sol_refund_after_unix: baseNowUnix + refundWindowSec,
+  };
+}
