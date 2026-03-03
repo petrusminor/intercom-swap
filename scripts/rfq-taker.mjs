@@ -627,6 +627,9 @@ async function main() {
       `[taker] still waiting for RFQ handshake expected_next=${chosen ? 'swap_invite' : 'quote'} ` +
         `trade_id=${tradeId} rfq_id=${rfqId} rfq_channel=${rfqChannel}\n`
     );
+    process.stderr.write(
+      '[taker] hint: common offer-listen skip causes: offer missing app_hash; offer app_hash mismatch vs settlement binding\n'
+    );
     die(`Timeout waiting for RFQ handshake (timeout-sec=${timeoutSec})`);
   }, 200);
 

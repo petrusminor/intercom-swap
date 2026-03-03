@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from '../src/protocol/signedMessage.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { KIND, ASSET, PAIR } from '../src/swap/constants.js';
+import { deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { hashTermsEnvelope } from '../src/swap/terms.js';
 import { verifySwapPrePay, verifySwapPrePayOnchain } from '../src/swap/verify.js';
+import { getPairSettlementKind, normalizePair } from '../src/swap/pairs.js';
 import {
   createSignedWelcome,
   createSignedInvite,
@@ -17,6 +20,7 @@ import {
 } from '../src/sidechannel/capabilities.js';
 import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
+import { getSettlementBinding } from '../settlement/providerFactory.js';
 
 function die(msg) {
   process.stderr.write(`${msg}\n`);
@@ -107,6 +111,27 @@ function parseBoolFlag(value, fallback = false) {
   const s = String(value).trim().toLowerCase();
   if (!s) return fallback;
   return ['1', 'true', 'yes', 'on'].includes(s);
+}
+
+export function injectMissingOfferAppHashes(offers, { solanaProgramId, taoHtlcAddress } = {}) {
+  if (!Array.isArray(offers)) return offers;
+  return offers.map((offer, index) => {
+    if (!offer || typeof offer !== 'object') return offer;
+    const currentAppHash = String(offer.app_hash || '').trim();
+    if (currentAppHash) return offer;
+    const pair = normalizePair(offer.pair || PAIR.BTC_LN__USDT_SOL);
+    const settlementKind = getPairSettlementKind(pair);
+    let binding;
+    try {
+      binding = getSettlementBinding(settlementKind, { solanaProgramId, taoHtlcAddress });
+    } catch (err) {
+      throw new Error(`offers[${index}] app_hash autofill failed for pair=${pair}: ${err?.message || String(err)}`);
+    }
+    return {
+      ...offer,
+      app_hash: deriveIntercomswapAppHashForBinding(binding),
+    };
+  });
 }
 
 function readTextMaybeFile(value) {
@@ -441,7 +466,9 @@ async function main() {
     const pairs = splitCsv(flags.get('pairs'));
     const rfqChannels = splitCsv(flags.get('rfq-channels'));
     const note = flags.get('note') ? String(flags.get('note')) : null;
-    const offers = parseJsonMaybeFile(flags.get('offers-json'));
+    const offers = injectMissingOfferAppHashes(parseJsonMaybeFile(flags.get('offers-json')), {
+      taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS,
+    });
     if (flags.get('offers-json') && !offers) die('Invalid --offers-json (expected JSON or @file)');
 
     const ttlSec = maybeInt(flags.get('ttl-sec'), 'ttl-sec');
@@ -897,7 +924,19 @@ async function main() {
   die(`Unknown command: ${cmd}\n\n${usage()}`);
 }
 
-main().catch((err) => {
-  const msg = err?.stack || err?.message || String(err);
-  die(msg);
-});
+const isDirectRun = (() => {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  try {
+    return import.meta.url === pathToFileURL(argv1).href;
+  } catch (_e) {
+    return false;
+  }
+})();
+
+if (isDirectRun) {
+  main().catch((err) => {
+    const msg = err?.stack || err?.message || String(err);
+    die(msg);
+  });
+}
