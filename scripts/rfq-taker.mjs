@@ -475,14 +475,20 @@ async function main() {
     maxPlatformFeeBps = offerMeta.max_platform_fee_bps;
     maxTradeFeeBps = offerMeta.max_trade_fee_bps;
     maxTotalFeeBps = offerMeta.max_total_fee_bps;
-    if (isTaoPair(rfqPair)) {
-      settlementRefundAfterSec = Number(offerMeta.settlement_refund_after_sec);
-      minSolRefundWindowSec = settlementRefundAfterSec;
-      maxSolRefundWindowSec = settlementRefundAfterSec;
-    } else {
-      minSolRefundWindowSec = offerMeta.min_sol_refund_window_sec;
-      maxSolRefundWindowSec = offerMeta.max_sol_refund_window_sec;
-    }
+    const offerRefundPolicy = buildSettlementContext({
+      pair: rfqPair,
+      refundRaw: offerMeta,
+      refundDefaults: {
+        minSec: SETTLEMENT_REFUND_MIN_SEC,
+        maxSec: SETTLEMENT_REFUND_MAX_SEC,
+        defaultQuoteRefundSec: settlementRefundAfterSec,
+        defaultMinRefundSec: minSolRefundWindowSec,
+        defaultMaxRefundSec: maxSolRefundWindowSec,
+      },
+    }).refundPolicy;
+    settlementRefundAfterSec = offerRefundPolicy.quoteRefundSec;
+    minSolRefundWindowSec = offerRefundPolicy.minRefundSec;
+    maxSolRefundWindowSec = offerRefundPolicy.maxRefundSec;
 
     process.stdout.write(
       `${JSON.stringify({
@@ -741,26 +747,29 @@ async function main() {
       throw new Error(`terms.ln_payer_peer mismatch vs our pubkey (terms=${termsPayer} want=${takerPubkey})`);
     }
 
-    // Verify Solana recipient matches our keypair before proceeding.
+    const termsCtx = buildSettlementContext({ pair: termsMsg.body?.pair || rfqPair, terms: termsMsg.body });
+    const normalizedTerms = termsCtx.normalizedTerms;
+
+    // Verify settlement recipient matches our signer before proceeding.
     const wantRecipient = sol.recipientAddress;
-    const gotRecipient = String(termsMsg.body?.sol_recipient || '');
+    const gotRecipient = String(normalizedTerms?.settlement_recipient || '');
     if (gotRecipient !== wantRecipient) {
       throw new Error(`terms.sol_recipient mismatch (got=${gotRecipient} want=${wantRecipient})`);
     }
     if (solMintStr) {
-      const gotMint = String(termsMsg.body?.sol_mint || '');
+      const gotMint = String(normalizedTerms?.settlement_asset_id || '');
       if (gotMint !== solMintStr) throw new Error(`terms.sol_mint mismatch (got=${gotMint} want=${solMintStr})`);
     }
 
     {
       const nowSec = Math.floor(Date.now() / 1000);
-      const refundAfterUnix = Number(termsMsg.body?.sol_refund_after_unix);
+      const refundAfterUnix = Number(normalizedTerms?.refund_after_unix);
       if (!Number.isFinite(refundAfterUnix) || refundAfterUnix <= 0) {
         throw new Error('terms.sol_refund_after_unix missing/invalid');
       }
       const termsTsSec = Math.floor(Number(termsMsg?.ts || 0) / 1000) || nowSec;
       const windowSec = refundAfterUnix - termsTsSec;
-      const termsPair = normalizePair(termsMsg.body?.pair || rfqPair);
+      const termsPair = termsCtx.pair;
       const effectiveMinRefundWindowSec = isTaoPair(termsPair)
         ? effectiveMinSettlementRefundAfterSec
         : minSolRefundWindowSec;
@@ -807,7 +816,7 @@ async function main() {
       const quoteRefundField = getQuoteRefundFieldForPair(quotePair);
       if (chosen.quote.body?.[quoteRefundField] !== undefined && chosen.quote.body?.[quoteRefundField] !== null) {
         const quoteWindow = Number(chosen.quote.body?.[quoteRefundField]);
-        const refundAfterUnix = Number(termsMsg.body?.sol_refund_after_unix);
+        const refundAfterUnix = Number(normalizedTerms?.refund_after_unix);
         const termsTsSec = Math.floor(Number(termsMsg?.ts || 0) / 1000);
         if (Number.isFinite(quoteWindow) && quoteWindow > 0 && Number.isFinite(refundAfterUnix) && refundAfterUnix > 0 && termsTsSec > 0) {
           const termsWindow = refundAfterUnix - termsTsSec;
@@ -1250,9 +1259,23 @@ async function main() {
         // Pre-filtering: require explicit refund/claim window advertised in QUOTE (seconds).
         const quotePair = normalizePair(msg.body?.pair || rfqPair);
         const quoteRefundWindowSec = Number(msg.body?.[getQuoteRefundFieldForPair(quotePair)]);
-        const effectiveQuoteMinRefundWindowSec = isTaoPair(quotePair)
-          ? effectiveMinSettlementRefundAfterSec
-          : minSolRefundWindowSec;
+        const quoteMinPolicy = buildSettlementContext({
+          pair: quotePair,
+          refundRaw: isTaoPair(quotePair)
+            ? { settlement_refund_after_sec: effectiveMinSettlementRefundAfterSec }
+            : {
+                min_sol_refund_window_sec: minSolRefundWindowSec,
+                max_sol_refund_window_sec: maxSolRefundWindowSec,
+              },
+          refundDefaults: {
+            minSec: SETTLEMENT_REFUND_MIN_SEC,
+            maxSec: SETTLEMENT_REFUND_MAX_SEC,
+            defaultQuoteRefundSec: settlementRefundAfterSec,
+            defaultMinRefundSec: minSolRefundWindowSec,
+            defaultMaxRefundSec: maxSolRefundWindowSec,
+          },
+        }).refundPolicy;
+        const effectiveQuoteMinRefundWindowSec = quoteMinPolicy.minRefundSec;
         if (!Number.isFinite(quoteRefundWindowSec) || quoteRefundWindowSec <= 0) {
           process.stderr.write(
             `[taker] quote_reject reason=invalid_refund_window quote_id=${quoteId} pair=${quotePair} ` +

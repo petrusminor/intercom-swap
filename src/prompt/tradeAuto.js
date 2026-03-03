@@ -1,5 +1,6 @@
 import { hashUnsignedEnvelope } from '../swap/hash.js';
 import { buildSettlementContext } from '../swap/settlementContext.js';
+import { normalizeSettlementFeeCapsBps } from '../swap/fees.js';
 import {
   getAmountFieldForPair,
   getAmountForPair,
@@ -187,9 +188,22 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
   const rfqAmount = String(getAmountForPair(rfqBody, pair) || '').trim();
   if (rfqBtc === null || rfqBtc < 1 || !/^[0-9]+$/.test(rfqAmount)) return null;
 
-  const rfqMaxPlatform = Math.max(0, Math.min(500, toIntOrNull(rfqBody.max_platform_fee_bps) ?? FIXED_PLATFORM_FEE_BPS));
-  const rfqMaxTrade = Math.max(0, Math.min(1000, toIntOrNull(rfqBody.max_trade_fee_bps) ?? DEFAULT_TRADE_FEE_BPS));
-  const rfqMaxTotal = Math.max(0, Math.min(1500, toIntOrNull(rfqBody.max_total_fee_bps) ?? DEFAULT_TOTAL_FEE_BPS));
+  const {
+    settlementLegMaxPlatformFeeBps: rfqSettlementMaxPlatformFeeBps,
+    settlementLegMaxTradeFeeBps: rfqSettlementMaxTradeFeeBps,
+    settlementLegMaxTotalFeeBps: rfqSettlementMaxTotalFeeBps,
+  } = normalizeSettlementFeeCapsBps(
+    {
+      max_platform_fee_bps: toIntOrNull(rfqBody.max_platform_fee_bps),
+      max_trade_fee_bps: toIntOrNull(rfqBody.max_trade_fee_bps),
+      max_total_fee_bps: toIntOrNull(rfqBody.max_total_fee_bps),
+    },
+    {
+      defaultPlatformFeeBps: FIXED_PLATFORM_FEE_BPS,
+      defaultTradeFeeBps: DEFAULT_TRADE_FEE_BPS,
+      defaultTotalFeeBps: DEFAULT_TOTAL_FEE_BPS,
+    }
+  );
   const quoteRefundField = getQuoteRefundFieldForPair(pair);
   const rfqRefundPolicy = buildSettlementContext({
     pair,
@@ -240,10 +254,27 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
       if (lineBtc === null || lineBtc < 1 || !/^[0-9]+$/.test(lineAmount)) continue;
       if (lineBtc !== rfqBtc || lineAmount !== rfqAmount) continue;
 
-      const lineMaxPlatform = Math.max(0, Math.min(500, toIntOrNull(line.max_platform_fee_bps) ?? FIXED_PLATFORM_FEE_BPS));
-      const lineMaxTrade = Math.max(0, Math.min(1000, toIntOrNull(line.max_trade_fee_bps) ?? DEFAULT_TRADE_FEE_BPS));
-      const lineMaxTotal = Math.max(0, Math.min(1500, toIntOrNull(line.max_total_fee_bps) ?? DEFAULT_TOTAL_FEE_BPS));
-      if (lineMaxPlatform > rfqMaxPlatform || lineMaxTrade > rfqMaxTrade || lineMaxTotal > rfqMaxTotal) continue;
+      const {
+        settlementLegMaxPlatformFeeBps: offerSettlementMaxPlatformFeeBps,
+        settlementLegMaxTradeFeeBps: offerSettlementMaxTradeFeeBps,
+        settlementLegMaxTotalFeeBps: offerSettlementMaxTotalFeeBps,
+      } = normalizeSettlementFeeCapsBps(
+        {
+          max_platform_fee_bps: toIntOrNull(line.max_platform_fee_bps),
+          max_trade_fee_bps: toIntOrNull(line.max_trade_fee_bps),
+          max_total_fee_bps: toIntOrNull(line.max_total_fee_bps),
+        },
+        {
+          defaultPlatformFeeBps: FIXED_PLATFORM_FEE_BPS,
+          defaultTradeFeeBps: DEFAULT_TRADE_FEE_BPS,
+          defaultTotalFeeBps: DEFAULT_TOTAL_FEE_BPS,
+        }
+      );
+      if (
+        offerSettlementMaxPlatformFeeBps > rfqSettlementMaxPlatformFeeBps ||
+        offerSettlementMaxTradeFeeBps > rfqSettlementMaxTradeFeeBps ||
+        offerSettlementMaxTotalFeeBps > rfqSettlementMaxTotalFeeBps
+      ) continue;
 
       const lineRefundPolicy = buildSettlementContext({
         pair,
@@ -1865,8 +1896,10 @@ export class TradeAutoManager {
           }
 
           const termsBody = isObject(termsEnv?.body) ? termsEnv.body : {};
+          const termsCtx = buildSettlementContext({ pair: termsBody?.pair, terms: termsBody });
+          const normalizedTerms = termsCtx.normalizedTerms;
           const termsLnPayerPeer = String(termsBody?.ln_payer_peer || '').trim().toLowerCase();
-          const termsSolRecipient = String(termsBody?.sol_recipient || '').trim();
+          const termsSolRecipient = String(normalizedTerms?.settlement_recipient || '').trim();
 
           const makerSigner = String(termsEnv?.signer || quoteEnv?.signer || '').trim().toLowerCase();
           const takerSigner = String(acceptEnv?.signer || quoteAcceptEnv?.signer || rfqEnv?.signer || '').trim().toLowerCase();

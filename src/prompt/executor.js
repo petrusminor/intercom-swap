@@ -24,6 +24,7 @@ import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex, verif
 import { validateSwapEnvelope } from '../swap/schema.js';
 import { ASSET, KIND, PAIR } from '../swap/constants.js';
 import { INTERCOMSWAP_APP_TAG } from '../swap/app.js';
+import { computeSettlementAmountWithFeeCeil, normalizeSettlementFeeCapsBps } from '../swap/fees.js';
 import { hashUnsignedEnvelope, sha256Hex } from '../swap/hash.js';
 import { deriveOfferListingId } from '../swap/listings.js';
 import { buildSettlementContext } from '../swap/settlementContext.js';
@@ -956,13 +957,6 @@ async function runLnRoutePrecheck({
   };
 }
 
-function computeAtomicWithFeeCeil(amountAtomic, feeBps) {
-  const amt = BigInt(String(amountAtomic || 0));
-  const bps = Number.isFinite(feeBps) ? Math.max(0, Math.min(15_000, Math.trunc(feeBps))) : 0;
-  if (bps <= 0) return amt;
-  return (amt * BigInt(10_000 + bps) + 9_999n) / 10_000n;
-}
-
 async function fetchSolUsdtFundingSnapshot({ pool, signer, mint, commitment }) {
   return pool.call(async (connection) => {
     const owner = signer.publicKey;
@@ -988,8 +982,8 @@ async function fetchSolUsdtFundingSnapshot({ pool, signer, mint, commitment }) {
 async function maybeAssertLocalUsdtFunding({
   executor,
   toolName,
-  requiredAtomic,
-  totalFeeBps,
+  settlementAmountAtomic,
+  settlementFeeBpsAppliedToSettlementAmount,
   context = 'line',
 }) {
   const mintStr = String(executor?.solana?.usdtMint || '').trim();
@@ -1014,7 +1008,10 @@ async function maybeAssertLocalUsdtFunding({
     mint,
     commitment: executor._commitment(),
   });
-  const requiredWithFees = computeAtomicWithFeeCeil(requiredAtomic, totalFeeBps);
+  const settlementAmountWithFeesAtomic = computeSettlementAmountWithFeeCeil(
+    settlementAmountAtomic,
+    settlementFeeBpsAppliedToSettlementAmount
+  );
   const haveUsdt = BigInt(String(snap.usdt_atomic || '0'));
   const haveLamports = BigInt(String(snap.sol_lamports || 0));
   if (haveLamports < BigInt(SOL_TX_FEE_BUFFER_LAMPORTS)) {
@@ -1022,16 +1019,16 @@ async function maybeAssertLocalUsdtFunding({
       `${toolName}: insufficient SOL for tx fees (${context}; need_lamports>=${SOL_TX_FEE_BUFFER_LAMPORTS}, have_lamports=${snap.sol_lamports})`
     );
   }
-  if (haveUsdt < requiredWithFees) {
+  if (haveUsdt < settlementAmountWithFeesAtomic) {
     throw new Error(
-      `${toolName}: insufficient USDT balance (${context}; need_atomic=${requiredWithFees.toString()}, have_atomic=${haveUsdt.toString()}, mint=${mint.toBase58()})`
+      `${toolName}: insufficient USDT balance (${context}; need_atomic=${settlementAmountWithFeesAtomic.toString()}, have_atomic=${haveUsdt.toString()}, mint=${mint.toBase58()})`
     );
   }
   return {
     ok: true,
     skipped: false,
     mint: mint.toBase58(),
-    required_atomic: requiredWithFees.toString(),
+    required_atomic: settlementAmountWithFeesAtomic.toString(),
     have_atomic: haveUsdt.toString(),
     sol_lamports: snap.sol_lamports,
   };
@@ -1041,14 +1038,20 @@ async function maybeAssertLocalSettlementFunding({
   executor,
   toolName,
   pair,
-  requiredAtomic,
-  totalFeeBps,
+  settlementAmountAtomic,
+  settlementFeeBpsAppliedToSettlementAmount,
   context,
 } = {}) {
   if (isTaoPair(pair)) {
     return { ok: true, skipped: true, reason: 'tao funding check not implemented' };
   }
-  return maybeAssertLocalUsdtFunding({ executor, toolName, requiredAtomic, totalFeeBps, context });
+  return maybeAssertLocalUsdtFunding({
+    executor,
+    toolName,
+    settlementAmountAtomic,
+    settlementFeeBpsAppliedToSettlementAmount,
+    context,
+  });
 }
 
 function normalizePairAmountFromBody(body, pair, label, { allowLegacyTaoFallback = false } = {}) {
@@ -1058,25 +1061,41 @@ function normalizePairAmountFromBody(body, pair, label, { allowLegacyTaoFallback
 }
 
 function normalizeOfferRefundWindowForPair(offer, toolName, index, pair) {
-  if (isTaoPair(pair)) {
-    if ('min_sol_refund_window_sec' in offer || 'max_sol_refund_window_sec' in offer) {
-      throw new Error(`${toolName}: offers[${index}] min_sol_refund_window_sec/max_sol_refund_window_sec not allowed for ${pair}`);
-    }
-    const refundField = getOfferExactRefundFieldForPair(pair);
-    const refundSec =
-      expectOptionalInt(offer, toolName, refundField, { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-      SOL_REFUND_DEFAULT_SEC;
-    return { settlement_refund_after_sec: refundSec };
+  if (isTaoPair(pair) && ('min_sol_refund_window_sec' in offer || 'max_sol_refund_window_sec' in offer)) {
+    throw new Error(`${toolName}: offers[${index}] min_sol_refund_window_sec/max_sol_refund_window_sec not allowed for ${pair}`);
   }
-
-  const minWin =
-    expectOptionalInt(offer, toolName, 'min_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-    SOL_REFUND_DEFAULT_SEC;
-  const maxWin =
-    expectOptionalInt(offer, toolName, 'max_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
-    SOL_REFUND_MAX_SEC;
-  if (minWin > maxWin) throw new Error(`${toolName}: offers[${index}] min_sol_refund_window_sec must be <= max_sol_refund_window_sec`);
-  return { min_sol_refund_window_sec: minWin, max_sol_refund_window_sec: maxWin };
+  const refundField = getOfferExactRefundFieldForPair(pair);
+  const refundPolicy = buildSettlementContext({
+    pair,
+    refundRaw: isTaoPair(pair)
+      ? {
+          [refundField]: expectOptionalInt(offer, toolName, refundField, {
+            min: SOL_REFUND_MIN_SEC,
+            max: SOL_REFUND_MAX_SEC,
+          }),
+        }
+      : {
+          min_sol_refund_window_sec: expectOptionalInt(offer, toolName, 'min_sol_refund_window_sec', {
+            min: SOL_REFUND_MIN_SEC,
+            max: SOL_REFUND_MAX_SEC,
+          }),
+          max_sol_refund_window_sec: expectOptionalInt(offer, toolName, 'max_sol_refund_window_sec', {
+            min: SOL_REFUND_MIN_SEC,
+            max: SOL_REFUND_MAX_SEC,
+          }),
+        },
+    refundDefaults: {
+      minSec: SOL_REFUND_MIN_SEC,
+      maxSec: SOL_REFUND_MAX_SEC,
+      defaultQuoteRefundSec: SOL_REFUND_DEFAULT_SEC,
+      defaultMinRefundSec: SOL_REFUND_DEFAULT_SEC,
+      defaultMaxRefundSec: SOL_REFUND_MAX_SEC,
+    },
+  }).refundPolicy;
+  if (!refundPolicy.rangeValid) {
+    throw new Error(`${toolName}: offers[${index}] min_sol_refund_window_sec must be <= max_sol_refund_window_sec`);
+  }
+  return refundPolicy.rfqFields;
 }
 
 function assertRefundAfterUnixWindow(refundAfterUnix, toolName) {
@@ -3513,9 +3532,22 @@ export class ToolExecutor {
           `offers[${i}].${amountField}`
         );
 
-        const maxPlatformFeeBps = expectOptionalInt(offer, toolName, 'max_platform_fee_bps', { min: 0, max: 500 }) ?? FIXED_PLATFORM_FEE_BPS;
-        const maxTradeFeeBps = expectOptionalInt(offer, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 }) ?? DEFAULT_TRADE_FEE_BPS;
-        const maxTotalFeeBps = expectOptionalInt(offer, toolName, 'max_total_fee_bps', { min: 0, max: 1500 }) ?? DEFAULT_TOTAL_FEE_BPS;
+        const {
+          settlementLegMaxPlatformFeeBps: maxPlatformFeeBps,
+          settlementLegMaxTradeFeeBps: maxTradeFeeBps,
+          settlementLegMaxTotalFeeBps: maxTotalFeeBps,
+        } = normalizeSettlementFeeCapsBps(
+          {
+            max_platform_fee_bps: expectOptionalInt(offer, toolName, 'max_platform_fee_bps', { min: 0, max: 500 }),
+            max_trade_fee_bps: expectOptionalInt(offer, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 }),
+            max_total_fee_bps: expectOptionalInt(offer, toolName, 'max_total_fee_bps', { min: 0, max: 1500 }),
+          },
+          {
+            defaultPlatformFeeBps: FIXED_PLATFORM_FEE_BPS,
+            defaultTradeFeeBps: DEFAULT_TRADE_FEE_BPS,
+            defaultTotalFeeBps: DEFAULT_TOTAL_FEE_BPS,
+          }
+        );
         if (maxPlatformFeeBps + maxTradeFeeBps > maxTotalFeeBps) {
           throw new Error(`${toolName}: offers[${i}] max_total_fee_bps must be >= platform+trade`);
         }
@@ -3573,10 +3605,13 @@ export class ToolExecutor {
           }
           for (let i = 0; i < usdtOfferRows.length; i += 1) {
             const o = usdtOfferRows[i];
-            const need = computeAtomicWithFeeCeil(o.usdt_amount, o.max_total_fee_bps);
-            if (haveUsdt < need) {
+            const settlementAmountWithFeesAtomic = computeSettlementAmountWithFeeCeil(
+              o.usdt_amount,
+              o.max_total_fee_bps
+            );
+            if (haveUsdt < settlementAmountWithFeesAtomic) {
               throw new Error(
-                `${toolName}: offers[${i}] exceeds USDT balance (need_atomic=${need.toString()}, have_atomic=${haveUsdt.toString()}, mint=${mint.toBase58()})`
+                `${toolName}: offers[${i}] exceeds USDT balance (need_atomic=${settlementAmountWithFeesAtomic.toString()}, have_atomic=${haveUsdt.toString()}, mint=${mint.toBase58()})`
               );
             }
           }
@@ -3673,12 +3708,22 @@ export class ToolExecutor {
         'sol_recipient' in args
           ? normalizeSettlementAddress(expectString(args, toolName, 'sol_recipient', { min: 2, max: 66 }), 'sol_recipient')
           : null;
-      const maxPlatformFeeBps =
-        expectOptionalInt(args, toolName, 'max_platform_fee_bps', { min: 0, max: 500 }) ?? FIXED_PLATFORM_FEE_BPS;
-      const maxTradeFeeBps =
-        expectOptionalInt(args, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 }) ?? DEFAULT_TRADE_FEE_BPS;
-      const maxTotalFeeBps =
-        expectOptionalInt(args, toolName, 'max_total_fee_bps', { min: 0, max: 1500 }) ?? DEFAULT_TOTAL_FEE_BPS;
+      const {
+        settlementLegMaxPlatformFeeBps: maxPlatformFeeBps,
+        settlementLegMaxTradeFeeBps: maxTradeFeeBps,
+        settlementLegMaxTotalFeeBps: maxTotalFeeBps,
+      } = normalizeSettlementFeeCapsBps(
+        {
+          max_platform_fee_bps: expectOptionalInt(args, toolName, 'max_platform_fee_bps', { min: 0, max: 500 }),
+          max_trade_fee_bps: expectOptionalInt(args, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 }),
+          max_total_fee_bps: expectOptionalInt(args, toolName, 'max_total_fee_bps', { min: 0, max: 1500 }),
+        },
+        {
+          defaultPlatformFeeBps: FIXED_PLATFORM_FEE_BPS,
+          defaultTradeFeeBps: DEFAULT_TRADE_FEE_BPS,
+          defaultTotalFeeBps: DEFAULT_TOTAL_FEE_BPS,
+        }
+      );
       const refundPolicy = buildSettlementContext({
         pair,
         refundRaw: {
@@ -3887,8 +3932,8 @@ export class ToolExecutor {
         executor: this,
         toolName,
         pair,
-        requiredAtomic: amountAtomic,
-        totalFeeBps: platformFeeBps + tradeFeeBps,
+        settlementAmountAtomic: amountAtomic,
+        settlementFeeBpsAppliedToSettlementAmount: platformFeeBps + tradeFeeBps,
         context: 'quote',
       });
       const lnInboundCheck = await assertLnInboundLiquidity({
@@ -4256,8 +4301,8 @@ export class ToolExecutor {
         executor: this,
         toolName,
         pair,
-        requiredAtomic: amountAtomic,
-        totalFeeBps: platformFeeBps + tradeFeeBps,
+        settlementAmountAtomic: amountAtomic,
+        settlementFeeBpsAppliedToSettlementAmount: platformFeeBps + tradeFeeBps,
         context: `rfq:${rfqId}`,
       });
       const lnInboundCheck = await assertLnInboundLiquidity({

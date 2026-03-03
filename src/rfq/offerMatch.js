@@ -1,6 +1,7 @@
 import { getSettlementBinding } from '../../settlement/providerFactory.js';
 import { deriveIntercomswapAppHashForBinding } from '../swap/app.js';
 import { KIND, ASSET } from '../swap/constants.js';
+import { normalizeSettlementFeeCapsBps } from '../swap/fees.js';
 import { validateSwapEnvelope } from '../swap/schema.js';
 import {
   DEFAULT_PAIR,
@@ -94,9 +95,22 @@ export function matchOfferAnnouncementEvent(evt, opts = {}) {
   const fallbackPair = normalizePair(opts.fallbackPair || DEFAULT_PAIR);
   const expectedProgramId = String(opts.expectedProgramId || '').trim();
   const taoHtlcAddress = String(opts.taoHtlcAddress || '').trim();
-  const maxPlatformFeeBps = Number(opts.maxPlatformFeeBps ?? 500);
-  const maxTradeFeeBps = Number(opts.maxTradeFeeBps ?? 1000);
-  const maxTotalFeeBps = Number(opts.maxTotalFeeBps ?? 1500);
+  const {
+    settlementLegMaxPlatformFeeBps: maxPlatformFeeBps,
+    settlementLegMaxTradeFeeBps: maxTradeFeeBps,
+    settlementLegMaxTotalFeeBps: maxTotalFeeBps,
+  } = normalizeSettlementFeeCapsBps(
+    {
+      max_platform_fee_bps: Number(opts.maxPlatformFeeBps ?? 500),
+      max_trade_fee_bps: Number(opts.maxTradeFeeBps ?? 1000),
+      max_total_fee_bps: Number(opts.maxTotalFeeBps ?? 1500),
+    },
+    {
+      defaultPlatformFeeBps: 500,
+      defaultTradeFeeBps: 1000,
+      defaultTotalFeeBps: 1500,
+    }
+  );
   const minRefundSec = Number(opts.minRefundSec ?? 72 * 3600);
   const minSettlementRefundSec = Number(opts.minSettlementRefundSec ?? minRefundSec);
   const maxRefundSec = Number(opts.maxRefundSec ?? OFFER_REFUND_MAX_SEC);
@@ -140,9 +154,22 @@ export function matchOfferAnnouncementEvent(evt, opts = {}) {
     const amount = String(getAmountForPair(offer, pair) || '').trim();
     if (!/^[0-9]+$/.test(amount) || BigInt(amount) <= 0n) continue;
 
-    const maxPlat = Number(offer.max_platform_fee_bps);
-    const maxTrade = Number(offer.max_trade_fee_bps);
-    const maxTotal = Number(offer.max_total_fee_bps);
+    const {
+      settlementLegMaxPlatformFeeBps: maxPlat,
+      settlementLegMaxTradeFeeBps: maxTrade,
+      settlementLegMaxTotalFeeBps: maxTotal,
+    } = normalizeSettlementFeeCapsBps(
+      {
+        max_platform_fee_bps: Number(offer.max_platform_fee_bps),
+        max_trade_fee_bps: Number(offer.max_trade_fee_bps),
+        max_total_fee_bps: Number(offer.max_total_fee_bps),
+      },
+      {
+        defaultPlatformFeeBps: 0,
+        defaultTradeFeeBps: 0,
+        defaultTotalFeeBps: 0,
+      }
+    );
     if (!Number.isInteger(maxPlat) || maxPlat < 0 || maxPlat > 500 || maxPlat > maxPlatformFeeBps) continue;
     if (!Number.isInteger(maxTrade) || maxTrade < 0 || maxTrade > 1000 || maxTrade > maxTradeFeeBps) continue;
     if (!Number.isInteger(maxTotal) || maxTotal < 0 || maxTotal > 1500 || maxTotal > maxTotalFeeBps) continue;
