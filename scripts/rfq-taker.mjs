@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import process from 'node:process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from '../src/protocol/signedMessage.js';
@@ -24,6 +25,7 @@ import {
 } from '../src/swap/pairs.js';
 import { normalizeClnNetwork } from '../src/ln/cln.js';
 import { normalizeLndNetwork } from '../src/ln/lnd.js';
+import { decodeBolt11 } from '../src/ln/bolt11.js';
 import { lnPay } from '../src/ln/client.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
@@ -157,6 +159,66 @@ function buildSwapLogFields({ pair, settlementKind, btcSats, amountAtomic }) {
   };
 }
 
+function normalizeNonEmptyTextOrNull(value) {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim();
+  return s ? s : null;
+}
+
+function normalizeHex32PatchValue(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const s = String(value).trim().toLowerCase();
+  return s ? s : null;
+}
+
+export function deriveInvoiceReceiptFields(invoiceBody) {
+  const body = invoiceBody && typeof invoiceBody === 'object' ? invoiceBody : {};
+  const lnInvoiceBolt11 = normalizeNonEmptyTextOrNull(body.bolt11);
+  let paymentHashHex = normalizeHex32PatchValue(body.payment_hash_hex);
+  if (!paymentHashHex && lnInvoiceBolt11) {
+    try {
+      paymentHashHex = normalizeHex32PatchValue(decodeBolt11(lnInvoiceBolt11).payment_hash_hex);
+    } catch (_e) {}
+  }
+  return {
+    ln_invoice_bolt11: lnInvoiceBolt11,
+    ln_payment_hash_hex: paymentHashHex ?? null,
+  };
+}
+
+export function resolveReceiptsDbPath({ receiptsDbPathRaw, peerKeypairPath, env = process.env }) {
+  const explicit = String(receiptsDbPathRaw || '').trim();
+  const envOverride = String(env?.INTERCOMSWAP_RECEIPTS_DB || '').trim();
+  const picked = explicit || envOverride;
+  if (picked) return path.isAbsolute(picked) ? picked : path.resolve(picked);
+  const peerDir = path.dirname(path.resolve(peerKeypairPath));
+  return path.join(peerDir, 'receipts.db');
+}
+
+export function initReceiptsStore({ dbPath, runSwap, allowNoReceipts = false, role = 'taker' }) {
+  const resolved = path.isAbsolute(String(dbPath || '').trim()) ? String(dbPath).trim() : path.resolve(String(dbPath || '').trim());
+  const hint =
+    'Set --receipts-db <path> or INTERCOMSWAP_RECEIPTS_DB=<path>; use --allow-no-receipts 1 to bypass (UNSAFE).';
+  try {
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    const receipts = openTradeReceiptsStore({ dbPath: resolved });
+    receipts.db.exec('BEGIN IMMEDIATE; ROLLBACK;');
+    return {
+      enabled: true,
+      dbPath: receipts.dbPath || resolved,
+      receipts,
+    };
+  } catch (err) {
+    const details = `[receipts] enabled=false db_path=${resolved} error=${err?.message ?? String(err)}`;
+    if (runSwap && !allowNoReceipts) throw new Error(`${details}\n${hint}`);
+    process.stderr.write(`${details}\n`);
+    process.stderr.write(`[receipts] warning: continuing without receipts (role=${role} run_swap=${runSwap ? 1 : 0})\n`);
+    process.stderr.write(`[receipts] hint: ${hint}\n`);
+    return { enabled: false, dbPath: resolved, receipts: null };
+  }
+}
+
 async function main() {
   const { flags } = parseArgs(process.argv.slice(2));
 
@@ -171,8 +233,11 @@ async function main() {
     const list = chans.length > 0 ? chans : [rfqChannel];
     return Array.from(new Set(list.map((c) => String(c || '').trim()).filter(Boolean)));
   })();
-  const receiptsDbPath = flags.get('receipts-db') ? String(flags.get('receipts-db')).trim() : '';
-  const persistPreimage = parseBool(flags.get('persist-preimage'), receiptsDbPath ? true : false);
+  const receiptsDbPath = resolveReceiptsDbPath({
+    receiptsDbPathRaw: flags.get('receipts-db'),
+    peerKeypairPath,
+  });
+  const persistPreimage = parseBool(flags.get('persist-preimage'), true);
   const stopAfterLnPay = parseBool(flags.get('stop-after-ln-pay'), false);
 
   const tradeId = (flags.get('trade-id') && String(flags.get('trade-id')).trim()) || `swap_${crypto.randomUUID()}`;
@@ -207,6 +272,7 @@ async function main() {
   const debug = parseBool(flags.get('debug'), false);
 
   const runSwap = parseBool(flags.get('run-swap'), false);
+  const allowNoReceipts = parseBool(flags.get('allow-no-receipts'), false);
   const swapTimeoutSec = parseIntFlag(flags.get('swap-timeout-sec'), 'swap-timeout-sec', 300);
   const swapResendMs = parseIntFlag(flags.get('swap-resend-ms'), 'swap-resend-ms', 1200);
   // Guardrail: require the Solana refund timelock in TERMS to be far enough in the future
@@ -324,15 +390,39 @@ async function main() {
   let settlementProgramId = null;
   let settlementBinding = null;
   let expectedAppHash = null;
-  let receipts = null;
+  let receiptsRuntime;
+  try {
+    receiptsRuntime = initReceiptsStore({
+      dbPath: receiptsDbPath,
+      runSwap,
+      allowNoReceipts,
+      role: 'taker',
+    });
+  } catch (err) {
+    die(err?.message || String(err));
+  }
+  let receipts = receiptsRuntime.receipts;
+  process.stderr.write(`[receipts] enabled=${receiptsRuntime.enabled} db_path=${receiptsRuntime.dbPath}\n`);
   let sol = null;
 
   const persistTrade = (patch, eventKind = null, eventPayload = null) => {
     if (!receipts) return;
+    const normalizedPatch = {
+      ...patch,
+      ...(Object.prototype.hasOwnProperty.call(patch || {}, 'ln_invoice_bolt11')
+        ? { ln_invoice_bolt11: normalizeNonEmptyTextOrNull(patch.ln_invoice_bolt11) }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(patch || {}, 'ln_payment_hash_hex')
+        ? { ln_payment_hash_hex: normalizeHex32PatchValue(patch.ln_payment_hash_hex) }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(patch || {}, 'ln_preimage_hex')
+        ? { ln_preimage_hex: normalizeHex32PatchValue(patch.ln_preimage_hex) }
+        : {}),
+    };
     try {
       receipts.upsertTrade(tradeId, {
         settlement_kind: settlementKind,
-        ...patch,
+        ...normalizedPatch,
       });
       if (eventKind) receipts.appendEvent(tradeId, eventKind, eventPayload);
     } catch (err) {
@@ -352,7 +442,6 @@ async function main() {
     settlementBinding = settlementCtx.settlementBinding;
     settlementProgramId = settlementBinding.binding_id;
     expectedAppHash = settlementCtx.expectedAppHash;
-    if (!receipts && receiptsDbPath) receipts = openTradeReceiptsStore({ dbPath: receiptsDbPath });
 
     if (runSwap) {
       if (isSolanaSettlement) {
@@ -655,6 +744,8 @@ async function main() {
       swapCtx.waiters.add(waiter);
     });
 
+  let persistSwapMessageCheckpoint = (_msg) => {};
+
   const startSwap = async ({ swapChannel, invite }) => {
     ensureOk(await sc.subscribe([swapChannel]), `subscribe ${swapChannel}`);
 
@@ -677,6 +768,55 @@ async function main() {
       'swap_started',
       { swap_channel: swapChannel }
     );
+
+    persistSwapMessageCheckpoint = (msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
+      const pair = normalizePair(body.pair || rfqPair);
+      if (msg.kind === KIND.TERMS) {
+        const amountAtomic = normalizeNonEmptyTextOrNull(getAmountForPair(body, pair, { allowLegacyTaoFallback: true }));
+        persistTrade({
+          swap_channel: swapChannel,
+          btc_sats: body?.btc_sats ?? btcSats,
+          usdt_amount: isTaoPair(pair) ? null : amountAtomic,
+          ...(isTaoPair(pair) ? { tao_amount_atomic: amountAtomic } : {}),
+          state: swapCtx.trade.state,
+        });
+        return;
+      }
+      if (msg.kind === KIND.LN_INVOICE) {
+        persistTrade({
+          ...deriveInvoiceReceiptFields(body),
+          state: swapCtx.trade.state,
+        });
+        return;
+      }
+      if (msg.kind === KIND.TAO_HTLC_LOCKED) {
+        persistTrade({
+          tao_settlement_id: normalizeNonEmptyTextOrNull(body.settlement_id),
+          tao_htlc_address: normalizeNonEmptyTextOrNull(body.htlc_address),
+          tao_amount_atomic: normalizeNonEmptyTextOrNull(body.amount_atomic),
+          tao_recipient: normalizeNonEmptyTextOrNull(body.recipient),
+          tao_refund: normalizeNonEmptyTextOrNull(body.refund),
+          tao_refund_after_unix: body.refund_after_unix ?? null,
+          tao_lock_tx_id: normalizeNonEmptyTextOrNull(body.tx_id),
+          state: swapCtx.trade.state,
+        });
+        return;
+      }
+      if (msg.kind === KIND.SOL_ESCROW_CREATED) {
+        persistTrade({
+          sol_program_id: normalizeNonEmptyTextOrNull(body.program_id),
+          sol_mint: normalizeNonEmptyTextOrNull(body.mint),
+          sol_recipient: normalizeNonEmptyTextOrNull(body.recipient),
+          sol_refund: normalizeNonEmptyTextOrNull(body.refund),
+          sol_escrow_pda: normalizeNonEmptyTextOrNull(body.escrow_pda),
+          sol_vault_ata: normalizeNonEmptyTextOrNull(body.vault_ata),
+          sol_refund_after_unix: body.refund_after_unix ?? null,
+          state: swapCtx.trade.state,
+        });
+      }
+    };
 
     const clearTimers = () => {
       for (const tmr of swapCtx.timers) clearInterval(tmr);
@@ -908,17 +1048,19 @@ async function main() {
     swapCtx.timers.add(acceptTimer);
 
     // Wait for invoice + settlement lock proof.
-    await waitForSwapMessage((m) => m?.kind === KIND.LN_INVOICE && m?.trade_id === tradeId, {
+    const invoiceMsg = await waitForSwapMessage((m) => m?.kind === KIND.LN_INVOICE && m?.trade_id === tradeId, {
       timeoutMs: swapTimeoutSec * 1000,
       label: 'LN_INVOICE',
     });
-    await waitForSwapMessage((m) => {
+    persistSwapMessageCheckpoint(invoiceMsg);
+    const escrowMsg = await waitForSwapMessage((m) => {
       if (!m || m?.trade_id !== tradeId) return false;
       return isTaoSettlement ? m?.kind === KIND.TAO_HTLC_LOCKED : m?.kind === KIND.SOL_ESCROW_CREATED;
     }, {
       timeoutMs: swapTimeoutSec * 1000,
       label: isTaoSettlement ? 'TAO_HTLC_LOCKED' : 'SOL_ESCROW_CREATED',
     });
+    persistSwapMessageCheckpoint(escrowMsg);
 
     if (swapCtx.trade.invoice) {
       persistTrade(
@@ -989,6 +1131,15 @@ async function main() {
       nowUnix: Math.floor(Date.now() / 1000),
     });
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
+    if (isTaoSettlement && swapCtx.trade.escrow) {
+      persistTrade({
+        tao_settlement_id: normalizeNonEmptyTextOrNull(swapCtx.trade.escrow.settlement_id),
+        tao_htlc_address: normalizeNonEmptyTextOrNull(swapCtx.trade.escrow.htlc_address),
+        tao_amount_atomic: normalizeNonEmptyTextOrNull(swapCtx.trade.escrow.amount_atomic),
+        tao_refund_after_unix: swapCtx.trade.escrow.refund_after_unix ?? null,
+        state: swapCtx.trade.state,
+      });
+    }
     const nowUnix = Math.floor(Date.now() / 1000);
     const timelockSafety = buildSettlementContext({
       timelock: {
@@ -1169,7 +1320,10 @@ async function main() {
         const v = validateSwapEnvelope(msg);
         if (!v.ok) return;
         const r = applySwapEnvelope(swapCtx.trade, msg);
-        if (r.ok) swapCtx.trade = r.trade;
+        if (r.ok) {
+          swapCtx.trade = r.trade;
+          persistSwapMessageCheckpoint(msg);
+        }
         for (const waiter of swapCtx.waiters) {
           try {
             waiter(msg);
@@ -1409,6 +1563,10 @@ async function main() {
           {
             swap_channel: swapChannel,
             maker_peer: msg.body?.owner_pubkey ? String(msg.body.owner_pubkey).trim().toLowerCase() : null,
+            btc_sats: btcSats,
+            usdt_amount: isTaoPair(rfqPair) ? null : usdtAmount,
+            ...(isTaoPair(rfqPair) ? { tao_amount_atomic: usdtAmount } : {}),
+            state: STATE.INIT,
           },
           'swap_joined',
           { swap_channel: swapChannel }
@@ -1436,4 +1594,11 @@ async function main() {
   await new Promise(() => {});
 }
 
-main().catch((err) => die(err?.stack || err?.message || String(err)));
+const isDirectRun = (() => {
+  const entry = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : '';
+  return import.meta.url === entry;
+})();
+
+if (isDirectRun) {
+  main().catch((err) => die(err?.stack || err?.message || String(err)));
+}

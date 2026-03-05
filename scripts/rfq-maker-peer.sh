@@ -35,5 +35,4 @@ exec node scripts/rfq-maker.mjs \
   --url "ws://127.0.0.1:${SC_PORT}" \
   --token "$SC_TOKEN" \
   --peer-keypair "$KEYPAIR_FILE" \
-  --receipts-db "onchain/receipts/rfq-bots/${STORE_NAME}/maker.sqlite" \
   "$@"

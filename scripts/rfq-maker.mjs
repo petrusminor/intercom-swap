@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import process from 'node:process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -180,6 +181,66 @@ function normalizeAmountString(value) {
   return n || '0';
 }
 
+export function resolveReceiptsDbPath({ receiptsDbPathRaw, peerKeypairPath, env = process.env }) {
+  const explicit = String(receiptsDbPathRaw || '').trim();
+  const envOverride = String(env?.INTERCOMSWAP_RECEIPTS_DB || '').trim();
+  const picked = explicit || envOverride;
+  if (picked) return path.isAbsolute(picked) ? picked : path.resolve(picked);
+  const peerDir = path.dirname(path.resolve(peerKeypairPath));
+  return path.join(peerDir, 'receipts.db');
+}
+
+export function initReceiptsStore({ dbPath, runSwap, allowNoReceipts = false, role = 'maker' }) {
+  const resolved = path.isAbsolute(String(dbPath || '').trim()) ? String(dbPath).trim() : path.resolve(String(dbPath || '').trim());
+  const hint =
+    'Set --receipts-db <path> or INTERCOMSWAP_RECEIPTS_DB=<path>; use --allow-no-receipts 1 to bypass (UNSAFE).';
+  try {
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    const receipts = openTradeReceiptsStore({ dbPath: resolved });
+    receipts.db.exec('BEGIN IMMEDIATE; ROLLBACK;');
+    return {
+      enabled: true,
+      dbPath: receipts.dbPath || resolved,
+      receipts,
+    };
+  } catch (err) {
+    const details = `[receipts] enabled=false db_path=${resolved} error=${err?.message ?? String(err)}`;
+    if (runSwap && !allowNoReceipts) throw new Error(`${details}\n${hint}`);
+    process.stderr.write(`${details}\n`);
+    process.stderr.write(`[receipts] warning: continuing without receipts (role=${role} run_swap=${runSwap ? 1 : 0})\n`);
+    process.stderr.write(`[receipts] hint: ${hint}\n`);
+    return { enabled: false, dbPath: resolved, receipts: null };
+  }
+}
+
+export function persistTradeReceipt({
+  receipts,
+  tradeId,
+  settlementKind,
+  patch,
+  eventKind = null,
+  eventPayload = null,
+  onError = null,
+}) {
+  if (!receipts) return false;
+  const normalizedTradeId = String(tradeId || '').trim();
+  if (!normalizedTradeId) return false;
+  try {
+    receipts.upsertTrade(normalizedTradeId, {
+      settlement_kind: settlementKind,
+      ...patch,
+    });
+    if (eventKind) receipts.appendEvent(normalizedTradeId, eventKind, eventPayload);
+    return true;
+  } catch (err) {
+    try {
+      receipts.upsertTrade(normalizedTradeId, { last_error: err?.message ?? String(err) });
+    } catch (_e) {}
+    if (typeof onError === 'function') onError(err);
+    return false;
+  }
+}
+
 function buildRfqLockKey(msg) {
   const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
   const pair = normalizePair(body.pair);
@@ -222,9 +283,13 @@ async function main() {
   const isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
   const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
 
-  const receiptsDbPath = flags.get('receipts-db') ? String(flags.get('receipts-db')).trim() : '';
+  const receiptsDbPath = resolveReceiptsDbPath({
+    receiptsDbPathRaw: flags.get('receipts-db'),
+    peerKeypairPath,
+  });
 
   const runSwap = parseBool(flags.get('run-swap'), false);
+  const allowNoReceipts = parseBool(flags.get('allow-no-receipts'), false);
   const swapTimeoutSec = parseIntFlag(flags.get('swap-timeout-sec'), 'swap-timeout-sec', 300);
   const swapResendMs = parseIntFlag(flags.get('swap-resend-ms'), 'swap-resend-ms', 1200);
   const retryResendMinMs = parseIntFlag(flags.get('retry-resend-min-ms'), 'retry-resend-min-ms', 20_000);
@@ -290,7 +355,19 @@ async function main() {
   const settlementProgramId = settlementBinding.binding_id;
   const expectedAppHash = settlementCtx.expectedAppHash;
 
-  const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
+  let receiptsRuntime;
+  try {
+    receiptsRuntime = initReceiptsStore({
+      dbPath: receiptsDbPath,
+      runSwap,
+      allowNoReceipts,
+      role: 'maker',
+    });
+  } catch (err) {
+    die(err?.message || String(err));
+  }
+  const receipts = receiptsRuntime.receipts;
+  process.stderr.write(`[receipts] enabled=${receiptsRuntime.enabled} db_path=${receiptsRuntime.dbPath}\n`);
 
   if (runSwap) {
     if (isSolanaSettlement) {
@@ -376,19 +453,17 @@ async function main() {
   }, 5_000);
 
   const persistTrade = (tradeId, patch, eventKind = null, eventPayload = null) => {
-    if (!receipts) return;
-    try {
-      receipts.upsertTrade(tradeId, {
-        settlement_kind: settlementKind,
-        ...patch,
-      });
-      if (eventKind) receipts.appendEvent(tradeId, eventKind, eventPayload);
-    } catch (err) {
-      try {
-        receipts.upsertTrade(tradeId, { last_error: err?.message ?? String(err) });
-      } catch (_e) {}
-      if (debug) process.stderr.write(`[maker] receipts persist error: ${err?.message ?? String(err)}\n`);
-    }
+    persistTradeReceipt({
+      receipts,
+      tradeId,
+      settlementKind,
+      patch,
+      eventKind,
+      eventPayload,
+      onError: (err) => {
+        if (debug) process.stderr.write(`[maker] receipts persist error: ${err?.message ?? String(err)}\n`);
+      },
+    });
   };
 
   const sol = runSwap
@@ -932,6 +1007,24 @@ async function main() {
         const rfqUnsigned = stripSignature(msg);
         const rfqId = hashUnsignedEnvelope(rfqUnsigned);
         const pair = normalizePair(msg.body?.pair || PAIR.BTC_LN__USDT_SOL);
+        const rfqAmountAtomic = normalizeAmountString(getAmountForPair(msg.body, pair, { allowLegacyTaoFallback: true }));
+        persistTrade(
+          String(msg.trade_id || '').trim(),
+          {
+            role: 'maker',
+            rfq_channel: rfqChannel,
+            maker_peer: makerPubkey,
+            taker_peer: String(msg.signer || '').trim().toLowerCase() || null,
+            btc_sats: msg.body?.btc_sats ?? null,
+            usdt_amount: isTaoPair(pair) ? null : rfqAmountAtomic,
+            ...(isTaoPair(pair) ? { tao_amount_atomic: rfqAmountAtomic } : {}),
+            sol_mint: String(msg.body?.sol_mint || '').trim() || null,
+            sol_recipient: String(msg.body?.sol_recipient || '').trim() || null,
+            state: STATE.INIT,
+          },
+          'rfq_received',
+          msg
+        );
         process.stderr.write(
           `[maker] rfq_received rfq_id=${rfqId} trade_id=${String(msg.trade_id || '').trim() || 'n/a'} ` +
             `rfq_channel=${rfqChannel} settlement_kind=${String(msg.body?.settlement_kind || '').trim() || 'n/a'} ` +
