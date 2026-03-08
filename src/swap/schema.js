@@ -72,7 +72,13 @@ function validatePairAmount(body, label, pair) {
   return { ok: true, error: null };
 }
 
-function validateRefundConstraints(body, label, pair) {
+function validateRefundConstraints(body, label, pair, opts = {}) {
+  const minSettlementRefundSec = Number.isFinite(opts?.minSettlementRefundSec)
+    ? Number(opts.minSettlementRefundSec)
+    : 3600;
+  const maxSettlementRefundSec = Number.isFinite(opts?.maxSettlementRefundSec)
+    ? Number(opts.maxSettlementRefundSec)
+    : 7 * 24 * 3600;
   if (isTaoPair(pair)) {
     const refundField = getQuoteRefundFieldForPair(pair);
     if (body.min_sol_refund_window_sec !== undefined || body.max_sol_refund_window_sec !== undefined) {
@@ -85,11 +91,11 @@ function validateRefundConstraints(body, label, pair) {
       if (!isUint(body[refundField])) {
         return { ok: false, error: `${label}.${refundField} must be an integer >= 0` };
       }
-      if (Number(body[refundField]) < 3600) {
-        return { ok: false, error: `${label}.${refundField} must be >= 3600` };
+      if (Number(body[refundField]) < minSettlementRefundSec) {
+        return { ok: false, error: `${label}.${refundField} must be >= ${minSettlementRefundSec}` };
       }
-      if (Number(body[refundField]) > 7 * 24 * 3600) {
-        return { ok: false, error: `${label}.${refundField} must be <= 604800` };
+      if (Number(body[refundField]) > maxSettlementRefundSec) {
+        return { ok: false, error: `${label}.${refundField} must be <= ${maxSettlementRefundSec}` };
       }
     }
     return { ok: true, error: null };
@@ -140,11 +146,11 @@ function validateRefundConstraints(body, label, pair) {
       if (!isUint(body[quoteRefundField])) {
         return { ok: false, error: `${label}.${quoteRefundField} must be an integer >= 0` };
       }
-      if (Number(body[quoteRefundField]) < 3600) {
-        return { ok: false, error: `${label}.${quoteRefundField} must be >= 3600` };
+      if (Number(body[quoteRefundField]) < minSettlementRefundSec) {
+        return { ok: false, error: `${label}.${quoteRefundField} must be >= ${minSettlementRefundSec}` };
       }
-      if (Number(body[quoteRefundField]) > 7 * 24 * 3600) {
-        return { ok: false, error: `${label}.${quoteRefundField} must be <= 604800` };
+      if (Number(body[quoteRefundField]) > maxSettlementRefundSec) {
+        return { ok: false, error: `${label}.${quoteRefundField} must be <= ${maxSettlementRefundSec}` };
       }
     }
   }
@@ -171,7 +177,7 @@ export function validateSwapEnvelopeShape(envelope) {
   return { ok: true, error: null };
 }
 
-export function validateSwapBody(kind, body) {
+export function validateSwapBody(kind, body, opts = {}) {
   if (!isObject(body)) return { ok: false, error: 'Body must be an object' };
 
   switch (kind) {
@@ -249,7 +255,7 @@ export function validateSwapBody(kind, body) {
           return { ok: false, error: 'rfq.max_total_fee_bps exceeds 1500 bps cap' };
         }
       }
-      const refundCheck = validateRefundConstraints(body, 'rfq', pair);
+      const refundCheck = validateRefundConstraints(body, 'rfq', pair, opts);
       if (!refundCheck.ok) return refundCheck;
       if (body.sol_mint !== undefined && body.sol_mint !== null) {
         if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'rfq.sol_mint must be base58 or 0x address' };
@@ -319,7 +325,7 @@ export function validateSwapBody(kind, body) {
           return { ok: false, error: 'quote.trade_fee_collector must be base58 or 0x address' };
         }
       }
-      const refundCheck = validateRefundConstraints(body, 'quote', pair);
+      const refundCheck = validateRefundConstraints(body, 'quote', pair, opts);
       if (!refundCheck.ok) return refundCheck;
       if (body.sol_mint !== undefined && body.sol_mint !== null) {
         if (!isSettlementAddress(body.sol_mint)) return { ok: false, error: 'quote.sol_mint must be base58 or 0x address' };
@@ -547,8 +553,8 @@ export function validateSwapBody(kind, body) {
   }
 }
 
-export function validateSwapEnvelope(envelope) {
+export function validateSwapEnvelope(envelope, opts = {}) {
   const base = validateSwapEnvelopeShape(envelope);
   if (!base.ok) return base;
-  return validateSwapBody(envelope.kind, envelope.body);
+  return validateSwapBody(envelope.kind, envelope.body, opts);
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import process from 'node:process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -28,7 +29,12 @@ import { decodeBolt11 } from '../src/ln/bolt11.js';
 import { lnInvoice } from '../src/ln/client.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
-import { resolveSettlementRefundAfterSec } from '../src/rfq/cliFlags.js';
+import {
+  DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+  resolveSettlementRefundAfterSec,
+  resolveUnsafeMinSettlementRefundAfterSec,
+} from '../src/rfq/cliFlags.js';
+import { computeTaoSwapIdFromLockInputs } from '../settlement/tao-evm/TaoEvmSettlementProvider.js';
 import {
   getSettlementProvider,
   normalizeSettlementKind,
@@ -97,6 +103,73 @@ export function resolveLnInvoiceExpirySec(value) {
   return expirySec;
 }
 
+function normalizeHex32WithOptional0x(value, label) {
+  const raw = String(value || '').trim();
+  const noPrefix = raw.startsWith('0x') || raw.startsWith('0X') ? raw.slice(2) : raw;
+  if (!/^[0-9a-fA-F]{64}$/.test(noPrefix)) {
+    throw new Error(`${label} must be 32-byte hex`);
+  }
+  return `0x${noPrefix.toLowerCase()}`;
+}
+
+function normalizeAtomicAmountString(value, label) {
+  const s = String(value ?? '').trim();
+  if (!/^[0-9]+$/.test(s) || BigInt(s) <= 0n) throw new Error(`${label} must be a positive base-unit integer`);
+  return s;
+}
+
+function normalizeUnixSec(value, label) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) throw new Error(`${label} must be unix seconds`);
+  return n;
+}
+
+export function deriveDeterministicTaoClientSalt({ tradeId, rfqId, quoteId }) {
+  const seed = [
+    'intercomswap:tao-client-salt:v1',
+    String(tradeId || '').trim().toLowerCase(),
+    String(rfqId || '').trim().toLowerCase(),
+    String(quoteId || '').trim().toLowerCase(),
+  ].join('|');
+  const digestHex = crypto.createHash('sha256').update(seed).digest('hex');
+  return `0x${digestHex}`;
+}
+
+export function buildTaoLockCheckpoint({
+  tradeId,
+  rfqId,
+  quoteId,
+  sender,
+  receiver,
+  amountAtomic,
+  refundAfterUnix,
+  paymentHashHex,
+  htlcAddress,
+}) {
+  const clientSalt = deriveDeterministicTaoClientSalt({ tradeId, rfqId, quoteId });
+  const hashlock = normalizeHex32WithOptional0x(paymentHashHex, 'paymentHashHex');
+  const normalizedAmountAtomic = normalizeAtomicAmountString(amountAtomic, 'amountAtomic');
+  const normalizedRefundAfterUnix = normalizeUnixSec(refundAfterUnix, 'refundAfterUnix');
+  const settlementId = computeTaoSwapIdFromLockInputs({
+    sender,
+    receiver,
+    value: normalizedAmountAtomic,
+    refundAfter: normalizedRefundAfterUnix,
+    hashlock,
+    clientSalt,
+  });
+  return {
+    clientSalt,
+    settlementId,
+    hashlock,
+    amountAtomic: normalizedAmountAtomic,
+    refundAfterUnix: normalizedRefundAfterUnix,
+    recipient: String(receiver || '').trim(),
+    refundAddress: String(sender || '').trim(),
+    htlcAddress: String(htlcAddress || '').trim() || null,
+  };
+}
+
 function parseSignedEnvelopeLike(value) {
   if (!value) return null;
   if (typeof value === 'string') {
@@ -153,6 +226,130 @@ export async function maybeReuseExistingQuote({
   return { reused: true, sent: true, cleared: false, reason: 'resend_existing_quote' };
 }
 
+export function shouldSkipMissingSolRecipient({
+  runSwap,
+  makerSettlementKind,
+  pair,
+  solRecipient,
+}) {
+  if (!runSwap) return false;
+  if (normalizeSettlementKind(makerSettlementKind) !== SETTLEMENT_KIND.SOLANA) return false;
+  const normalizedPair = normalizePair(pair);
+  if (getPairSettlementKind(normalizedPair) !== SETTLEMENT_KIND.SOLANA) return false;
+  return !String(solRecipient || '').trim();
+}
+
+export function resolveMakerSettlementRefundConfig({
+  settlementRefundAfterSecRaw,
+  legacySolanaRefundAfterSecRaw,
+  unsafeMinSettlementRefundAfterSecRaw,
+  fallbackSec = 72 * 3600,
+  defaultSafeMinSec = DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+  minSec = 3600,
+  maxSec = 7 * 24 * 3600,
+}) {
+  const unsafeMinConfig = resolveUnsafeMinSettlementRefundAfterSec({
+    unsafeMinSettlementRefundAfterSecRaw,
+    fallbackSec: defaultSafeMinSec,
+    maxSec,
+    roleLabel: 'maker',
+  });
+  const refundConfig = resolveSettlementRefundAfterSec({
+    settlementRefundAfterSecRaw,
+    legacySolanaRefundAfterSecRaw,
+    fallbackSec,
+    minSec: unsafeMinConfig.effectiveMinSettlementRefundAfterSec,
+    maxSec,
+  });
+  return {
+    settlementRefundAfterSec: refundConfig.settlementRefundAfterSec,
+    effectiveMinSettlementRefundAfterSec: unsafeMinConfig.effectiveMinSettlementRefundAfterSec,
+    unsafeMinProvided: unsafeMinConfig.unsafeMinProvided,
+    warnings: unsafeMinConfig.warnings.concat(refundConfig.warnings),
+  };
+}
+
+export function resolveMakerCleanupPersistence(ctx, { reason = null } = {}) {
+  const txId = String(ctx?.taoLockTxId || '').trim();
+  const lockPhase = String(ctx?.taoLockPhase || '').trim().toLowerCase();
+  let state = String(ctx?.trade?.state || '').trim() || null;
+  if (isTaoPair(ctx?.pair)) {
+    if (txId) state = STATE.ESCROW;
+    else if (lockPhase === 'locking') state = 'locking';
+  }
+  const lastLockError = String(ctx?.lastLockError || '').trim();
+  return {
+    state,
+    last_error: lastLockError || (reason ? String(reason) : null),
+  };
+}
+
+export function handleMakerTaoLockStage({
+  ctx,
+  stage,
+  details = {},
+  persistTrade = null,
+  log = null,
+}) {
+  const normalizedStage = String(stage || '').trim().toLowerCase();
+  const tradeId = String(ctx?.tradeId || '').trim() || null;
+  const settlementId =
+    String(details.settlementId || details.settlement_id || ctx?.taoSettlementId || '').trim() || null;
+  const txId = String(details.txId || details.tx_id || ctx?.taoLockTxId || '').trim() || null;
+  const errorMessage = String(details.error || '').trim() || null;
+
+  if (normalizedStage === 'prepare' || normalizedStage === 'rpc_send') {
+    ctx.taoLockPhase = 'locking';
+  }
+  if (settlementId) ctx.taoSettlementId = settlementId;
+  if (txId) ctx.taoLockTxId = txId;
+  if (errorMessage) ctx.lastLockError = errorMessage;
+
+  const eventKindByStage = {
+    prepare: 'tao_lock_prepare',
+    rpc_send: 'tao_lock_rpc_send',
+    tx_hash: 'tao_lock_tx_hash',
+    wait_confirm: 'tao_lock_wait_confirm',
+    error: 'tao_lock_error',
+  };
+  const eventKind = eventKindByStage[normalizedStage] || null;
+  const patch =
+    normalizedStage === 'error'
+      ? {
+          state: resolveMakerCleanupPersistence(ctx).state,
+          last_error: ctx.lastLockError || null,
+          ...(ctx.taoSettlementId ? { tao_settlement_id: ctx.taoSettlementId } : {}),
+          ...(ctx.taoLockTxId ? { tao_lock_tx_id: ctx.taoLockTxId } : {}),
+        }
+      : null;
+  const eventPayload = {
+    trade_id: tradeId,
+    stage: normalizedStage,
+    settlement_id: settlementId,
+    tx_id: txId,
+    error: errorMessage,
+    ...details,
+  };
+
+  if (typeof log === 'function') {
+    log(
+      JSON.stringify({
+        type: 'tao_lock_stage',
+        trade_id: tradeId,
+        stage: normalizedStage,
+        settlement_id: settlementId,
+        tx_id: txId,
+        error: errorMessage,
+      })
+    );
+  }
+  if (tradeId && eventKind && typeof persistTrade === 'function') {
+    persistTrade(tradeId, patch || {}, eventKind, eventPayload);
+  }
+
+  return { eventKind, patch, eventPayload };
+}
+
 function stripSignature(envelope) {
   if (!envelope || typeof envelope !== 'object') return envelope;
   const { sig: _sig, signer: _signer, ...unsigned } = envelope;
@@ -165,10 +362,16 @@ function ensureOk(res, label) {
   return res;
 }
 
-function signSwapEnvelope(unsignedEnvelope, { pubHex, secHex }) {
+export function validateLocalMakerEnvelope(envelope, { effectiveMinSettlementRefundAfterSec } = {}) {
+  return validateSwapEnvelope(envelope, {
+    minSettlementRefundSec: effectiveMinSettlementRefundAfterSec,
+  });
+}
+
+function signSwapEnvelope(unsignedEnvelope, { pubHex, secHex }, validationOptions = {}) {
   const sigHex = signUnsignedEnvelopeHex(unsignedEnvelope, secHex);
   const signed = attachSignature(unsignedEnvelope, { signerPubKeyHex: pubHex, sigHex });
-  const v = validateSwapEnvelope(signed);
+  const v = validateLocalMakerEnvelope(signed, validationOptions);
   if (!v.ok) throw new Error(`Internal error: signed envelope invalid: ${v.error}`);
   return signed;
 }
@@ -302,16 +505,20 @@ async function main() {
   const SETTLEMENT_REFUND_MIN_SEC = 3600; // 1h
   const SETTLEMENT_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
   let settlementRefundAfterSec = 72 * 3600;
+  let effectiveMinSettlementRefundAfterSec = DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC;
   try {
-    const settlementRefund = resolveSettlementRefundAfterSec({
+    const settlementRefund = resolveMakerSettlementRefundConfig({
       settlementRefundAfterSecRaw: flags.get('settlement-refund-after-sec'),
       legacySolanaRefundAfterSecRaw: flags.get('solana-refund-after-sec'),
+      unsafeMinSettlementRefundAfterSecRaw: flags.get('unsafe-min-settlement-refund-after-sec'),
       fallbackSec: 72 * 3600,
+      defaultSafeMinSec: DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
       minSec: SETTLEMENT_REFUND_MIN_SEC,
       maxSec: SETTLEMENT_REFUND_MAX_SEC,
     });
     settlementRefundAfterSec = settlementRefund.settlementRefundAfterSec;
-    for (const warning of settlementRefund.warnings) process.stderr.write(`${warning}\n`);
+    effectiveMinSettlementRefundAfterSec = settlementRefund.effectiveMinSettlementRefundAfterSec;
+    for (const warning of settlementRefund.warnings) process.stderr.write(`Warning: ${warning}\n`);
   } catch (err) {
     die(err?.message || String(err));
   }
@@ -453,7 +660,7 @@ async function main() {
   }, 5_000);
 
   const persistTrade = (tradeId, patch, eventKind = null, eventPayload = null) => {
-    persistTradeReceipt({
+    return persistTradeReceipt({
       receipts,
       tradeId,
       settlementKind,
@@ -501,6 +708,7 @@ async function main() {
 
   let done = false;
   let shuttingDown = false;
+  let signalShutdownScheduled = false;
 
   const safeShutdown = async (reason = 'shutdown') => {
     if (shuttingDown) return;
@@ -531,6 +739,24 @@ async function main() {
         await sc.leave(swapChannel);
       } catch (_e) {}
     }
+    if (receipts) {
+      const seenTradeIds = new Set();
+      for (const ctx of Array.from(swaps.values())) {
+        const tradeId = String(ctx?.tradeId || '').trim();
+        if (!tradeId || seenTradeIds.has(tradeId)) continue;
+        seenTradeIds.add(tradeId);
+        persistTrade(
+          tradeId,
+          { state: String(ctx?.trade?.state || '').trim() || null },
+          'shutdown',
+          {
+            reason: String(reason || 'shutdown'),
+            trade_id: tradeId,
+            swap_channel: String(ctx?.swapChannel || '').trim() || null,
+          }
+        );
+      }
+    }
     try {
       receipts?.close();
     } catch (_e) {}
@@ -541,14 +767,18 @@ async function main() {
   };
 
   process.on('SIGINT', () => {
+    if (signalShutdownScheduled) return;
+    signalShutdownScheduled = true;
     void (async () => {
-      await safeShutdown('sigint');
+      await Promise.race([safeShutdown('sigint'), new Promise((resolve) => setTimeout(resolve, 1500))]);
       process.exit(130);
     })();
   });
   process.on('SIGTERM', () => {
+    if (signalShutdownScheduled) return;
+    signalShutdownScheduled = true;
     void (async () => {
-      await safeShutdown('sigterm');
+      await Promise.race([safeShutdown('sigterm'), new Promise((resolve) => setTimeout(resolve, 1500))]);
       process.exit(143);
     })();
   });
@@ -579,7 +809,7 @@ async function main() {
         tradeId: ctx.tradeId,
         body: { reason: String(reason || 'canceled') },
       });
-      const cancelSigned = signSwapEnvelope(cancelUnsigned, signing);
+      const cancelSigned = signSwapEnvelope(cancelUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
       await sc.send(ctx.swapChannel, cancelSigned, { invite: ctx.invite || null });
     } catch (_e) {}
   };
@@ -602,12 +832,10 @@ async function main() {
       // Best-effort: cancellation is only accepted before escrow creation.
       await cancelSwap(ctx, reason || 'swap timeout');
     }
+    const cleanupPatch = resolveMakerCleanupPersistence(ctx, { reason });
     persistTrade(
       ctx.tradeId,
-      {
-        state: ctx.trade.state,
-        last_error: reason ? String(reason) : null,
-      },
+      cleanupPatch,
       'swap_cleanup',
       { trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, reason: reason ? String(reason) : null }
     );
@@ -659,7 +887,7 @@ async function main() {
         terms_valid_until_unix: nowSec + termsValidSec,
       },
     });
-    const signed = signSwapEnvelope(termsUnsigned, signing);
+    const signed = signSwapEnvelope(termsUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
     const applied = applySwapEnvelope(ctx.trade, signed);
     if (!applied.ok) throw new Error(applied.error);
     ctx.trade = applied.trade;
@@ -726,7 +954,7 @@ async function main() {
         expires_at_unix: decoded.expires_at_unix,
       },
     });
-    const lnInvSigned = signSwapEnvelope(lnInvUnsigned, signing);
+    const lnInvSigned = signSwapEnvelope(lnInvUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
     {
       const r = applySwapEnvelope(ctx.trade, lnInvSigned);
       if (!r.ok) throw new Error(r.error);
@@ -751,18 +979,156 @@ async function main() {
     // Solana escrow (locks net + platform fee + trade fee; terms.usdt_amount is the net amount).
     const refundAfterUnix = Number(ctx.trade.terms.sol_refund_after_unix);
     if (!Number.isFinite(refundAfterUnix) || refundAfterUnix <= 0) throw new Error('Invalid sol_refund_after_unix');
+    const taoLockCheckpoint = isTaoSettlement
+      ? buildTaoLockCheckpoint({
+          tradeId: ctx.tradeId,
+          rfqId: ctx.rfqId,
+          quoteId: ctx.quoteId,
+          sender: sol.refundAddress,
+          receiver: ctx.solRecipient,
+          amountAtomic: String(ctx.usdtAmount),
+          refundAfterUnix,
+          paymentHashHex,
+          htlcAddress: sol.programId,
+        })
+      : null;
+    if (isTaoSettlement) {
+      const preLockPersisted = persistTrade(
+        ctx.tradeId,
+        {
+          ln_payment_hash_hex: paymentHashHex,
+          tao_settlement_id: taoLockCheckpoint.settlementId,
+          tao_htlc_address: taoLockCheckpoint.htlcAddress,
+          tao_amount_atomic: taoLockCheckpoint.amountAtomic,
+          tao_recipient: taoLockCheckpoint.recipient,
+          tao_refund: taoLockCheckpoint.refundAddress,
+          tao_refund_after_unix: taoLockCheckpoint.refundAfterUnix,
+          state: 'locking',
+        },
+        'tao_locking',
+        {
+          payment_hash_hex: paymentHashHex,
+          settlement_id: taoLockCheckpoint.settlementId,
+          htlc_address: taoLockCheckpoint.htlcAddress,
+          amount_atomic: taoLockCheckpoint.amountAtomic,
+          recipient: taoLockCheckpoint.recipient,
+          refund: taoLockCheckpoint.refundAddress,
+          refund_after_unix: taoLockCheckpoint.refundAfterUnix,
+          client_salt: taoLockCheckpoint.clientSalt,
+        }
+      );
+      if (receipts && !preLockPersisted) {
+        throw new Error('Failed to persist TAO lock checkpoint before broadcast');
+      }
+      ctx.taoLockPhase = 'locking';
+      ctx.taoSettlementId = taoLockCheckpoint.settlementId;
+      ctx.taoLockTxId = null;
+      ctx.lastLockError = null;
+      handleMakerTaoLockStage({
+        ctx,
+        stage: 'prepare',
+        details: {
+          payment_hash_hex: paymentHashHex,
+          settlement_id: taoLockCheckpoint.settlementId,
+          htlc_address: taoLockCheckpoint.htlcAddress,
+          amount_atomic: taoLockCheckpoint.amountAtomic,
+          refund_after_unix: taoLockCheckpoint.refundAfterUnix,
+          recipient: taoLockCheckpoint.recipient,
+          refund: taoLockCheckpoint.refundAddress,
+        },
+        persistTrade,
+        log: (line) => process.stderr.write(`${line}\n`),
+      });
+    }
+    const termsForLock = isTaoSettlement
+      ? { ...(ctx.trade.terms || {}), client_salt: taoLockCheckpoint.clientSalt }
+      : ctx.trade.terms;
 
-    const lock = await sol.settlement.lock({
-      paymentHashHex,
-      amountAtomic: String(ctx.usdtAmount),
-      recipient: ctx.solRecipient,
-      refundAddress: sol.refundAddress,
-      refundAfterUnix,
-      terms: ctx.trade.terms,
-    });
+    let lock;
+    try {
+      lock = await sol.settlement.lock({
+        paymentHashHex,
+        amountAtomic: String(ctx.usdtAmount),
+        recipient: ctx.solRecipient,
+        refundAddress: sol.refundAddress,
+        refundAfterUnix,
+        terms: termsForLock,
+        ...(isTaoSettlement
+          ? {
+              onStage: ({ stage, ...details }) => {
+                handleMakerTaoLockStage({
+                  ctx,
+                  stage,
+                  details,
+                  persistTrade,
+                  log: (line) => process.stderr.write(`${line}\n`),
+                });
+              },
+              onBroadcast: ({ txId, settlementId, clientSalt }) => {
+                ctx.taoLockTxId = txId;
+                const persisted = persistTrade(
+                  ctx.tradeId,
+                  {
+                    tao_settlement_id: settlementId,
+                    tao_lock_tx_id: txId,
+                    state: STATE.ESCROW,
+                  },
+                  'tao_lock_broadcast',
+                  {
+                    payment_hash_hex: paymentHashHex,
+                    settlement_id: settlementId,
+                    tx_id: txId,
+                    client_salt: clientSalt || taoLockCheckpoint.clientSalt,
+                  }
+                );
+                if (receipts && !persisted) {
+                  throw new Error('Failed to persist TAO lock tx_id immediately after broadcast');
+                }
+              },
+            }
+          : {}),
+      });
+    } catch (err) {
+      if (isTaoSettlement && !ctx.lastLockError) {
+        handleMakerTaoLockStage({
+          ctx,
+          stage: 'error',
+          details: {
+            error: err?.message ?? String(err),
+          },
+          persistTrade,
+          log: (line) => process.stderr.write(`${line}\n`),
+        });
+      }
+      throw err;
+    }
     const settlementId = lock.settlementId;
     const settlementTxId = lock.txId;
     const lockMeta = lock?.metadata && typeof lock.metadata === 'object' ? lock.metadata : {};
+    if (isTaoSettlement && taoLockCheckpoint && String(settlementId).toLowerCase() !== String(taoLockCheckpoint.settlementId).toLowerCase()) {
+      throw new Error(
+        `deterministic settlement_id mismatch (computed=${taoLockCheckpoint.settlementId} provider=${settlementId})`
+      );
+    }
+    if (isTaoSettlement) {
+      const persisted = persistTrade(
+        ctx.tradeId,
+        {
+          tao_settlement_id: settlementId,
+          tao_lock_tx_id: settlementTxId,
+          state: STATE.ESCROW,
+        },
+        'tao_lock_ack',
+        {
+          payment_hash_hex: paymentHashHex,
+          settlement_id: settlementId,
+          tx_id: settlementTxId,
+        }
+      );
+      if (receipts && !persisted) {
+        throw new Error('Failed to persist TAO lock acknowledgement');
+      }
+    }
 
     const escrowUnsigned = isTaoSettlement
       ? createUnsignedEnvelope({
@@ -812,7 +1178,7 @@ async function main() {
           });
         })();
 
-    const solEscrowSigned = signSwapEnvelope(escrowUnsigned, signing);
+    const solEscrowSigned = signSwapEnvelope(escrowUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
     {
       const r = applySwapEnvelope(ctx.trade, solEscrowSigned);
       if (!r.ok) throw new Error(r.error);
@@ -927,7 +1293,7 @@ async function main() {
         const ctx = swaps.get(evt.channel);
         if (!ctx) return;
         ctx.lastRemoteActivityAtMs = Date.now();
-        const v = validateSwapEnvelope(msg);
+        const v = validateLocalMakerEnvelope(msg, { effectiveMinSettlementRefundAfterSec });
         if (!v.ok) return;
         const r = applySwapEnvelope(ctx.trade, msg);
         if (!r.ok) {
@@ -976,7 +1342,7 @@ async function main() {
       }
 
       if (msg.kind === KIND.RFQ) {
-        const v = validateSwapEnvelope(msg);
+        const v = validateLocalMakerEnvelope(msg, { effectiveMinSettlementRefundAfterSec });
         const logRfqEarlyReturn = (reason, extra = {}) => {
           const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
           process.stderr.write(
@@ -1041,7 +1407,14 @@ async function main() {
         }
 
         const solRecipient = msg.body?.sol_recipient ? String(msg.body.sol_recipient).trim() : '';
-        if (runSwap && !solRecipient) {
+        if (
+          shouldSkipMissingSolRecipient({
+            runSwap,
+            makerSettlementKind: settlementKind,
+            pair,
+            solRecipient,
+          })
+        ) {
           logRfqEarlyReturn('missing_sol_recipient', { rfq_id: rfqId });
           if (debug) process.stderr.write(`[maker] skip rfq missing sol_recipient trade_id=${msg.trade_id} rfq_id=${rfqId}\n`);
           return;
@@ -1280,7 +1653,7 @@ async function main() {
           },
         });
         const quoteId = hashUnsignedEnvelope(quoteUnsigned);
-        const signed = signSwapEnvelope(quoteUnsigned, signing);
+        const signed = signSwapEnvelope(quoteUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
         process.stderr.write(
           `[maker] new_quote begin rfq_id=${rfqId} quote_id=${quoteId} settlement_kind=${settlementKind} ` +
             `settlement_refund_after_sec=${isTaoPair(pair) ? settlementRefundAfterSec : 'n/a'}\n`
@@ -1400,7 +1773,7 @@ async function main() {
             welcome,
           },
         });
-        const swapInviteSigned = signSwapEnvelope(swapInviteUnsigned, signing);
+        const swapInviteSigned = signSwapEnvelope(swapInviteUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
         // Recovery for duplicate quote_accept while in-flight:
         // resend invite/terms with hard throttling so taker recovery works without flooding.
         if (isRetry) {

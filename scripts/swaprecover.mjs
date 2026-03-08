@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import process from 'node:process';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
   getSettlementProvider,
@@ -111,7 +113,9 @@ function resolveEffectiveSettlementKind(trade, requestedKind) {
 function getSettlementIdForTrade(trade, settlementKind) {
   if (settlementKind === SETTLEMENT_KIND.TAO_EVM) {
     const id = String(trade?.tao_settlement_id || '').trim();
-    if (!id) die('Trade missing tao_settlement_id');
+    if (!id) {
+      die('Trade missing tao_settlement_id; receipts missing tao_settlement_id; upgrade maker persistence');
+    }
     return id;
   }
   const id = String(trade?.sol_escrow_pda || '').trim();
@@ -176,11 +180,21 @@ function eqLowerTrim(a, b) {
   return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
 }
 
-function pickExpectedState({ settlementKind, verifyPrePay, trade }) {
-  if (verifyPrePay?.ok) return 'active';
-
+function pickLocalTerminalState({ settlementKind, trade }) {
   const receiptState = String(trade?.state || '').trim().toLowerCase();
   if (receiptState === 'claimed' || receiptState === 'refunded' || receiptState === 'canceled') return receiptState;
+
+  if (settlementKind === SETTLEMENT_KIND.TAO_EVM) {
+    if (trade?.tao_claim_tx_id) return 'claimed';
+    if (trade?.tao_refund_tx_id) return 'refunded';
+  }
+  return null;
+}
+
+function pickExpectedState({ settlementKind, verifyPrePay, trade }) {
+  const localTerminal = pickLocalTerminalState({ settlementKind, trade });
+  if (localTerminal) return localTerminal;
+  if (verifyPrePay?.ok) return 'active';
 
   if (settlementKind === SETTLEMENT_KIND.TAO_EVM) {
     if (trade?.tao_claim_tx_id) return 'claimed';
@@ -189,6 +203,28 @@ function pickExpectedState({ settlementKind, verifyPrePay, trade }) {
   }
 
   return 'inactive_or_missing';
+}
+
+export function persistRefundRecovery({ store, trade, settlementKind, hash, settlementId, txId }) {
+  if (!store || !trade?.trade_id) throw new Error('persistRefundRecovery requires store and trade.trade_id');
+  if (settlementKind === SETTLEMENT_KIND.TAO_EVM) {
+    store.upsertTrade(trade.trade_id, {
+      state: 'refunded',
+      settlement_kind: SETTLEMENT_KIND.TAO_EVM,
+      ln_payment_hash_hex: hash,
+      tao_settlement_id: settlementId,
+      tao_refund_tx_id: txId,
+      last_error: null,
+    });
+    return;
+  }
+  store.upsertTrade(trade.trade_id, {
+    state: 'refunded',
+    settlement_kind: SETTLEMENT_KIND.SOLANA,
+    ln_payment_hash_hex: hash,
+    sol_escrow_pda: settlementId,
+    last_error: null,
+  });
 }
 
 function maybeBuildVerifySwapInput({ settlementKind, settlementId, paymentHashHex, trade }) {
@@ -227,13 +263,35 @@ function maybeBuildVerifySwapInput({ settlementKind, settlementId, paymentHashHe
   return null;
 }
 
+function buildPartialStatusForMissingPaymentHash({ trade, settlementKind, command }) {
+  const isTao = settlementKind === SETTLEMENT_KIND.TAO_EVM;
+  return {
+    type: 'status_partial',
+    command,
+    trade_id: trade.trade_id,
+    settlement_kind: settlementKind,
+    state: trade.state || null,
+    swap_channel: trade.swap_channel || null,
+    tao_settlement_id: trade.tao_settlement_id || null,
+    tao_lock_tx_id: trade.tao_lock_tx_id || null,
+    refund_after_unix: isTao ? trade.tao_refund_after_unix || null : trade.sol_refund_after_unix || null,
+    last_error: trade.last_error || null,
+    hint: 'waiting for LN invoice/payment hash (ln_payment_hash_hex is null or invalid)',
+  };
+}
+
 async function runStatus({ settlement, settlementKind, trade, settlementId, paymentHashHex }) {
   const nowUnix = Math.floor(Date.now() / 1000);
-  const verifyPrePay = await settlement.verifyPrePay({
-    settlementId,
-    paymentHashHex,
-    nowUnix,
-  });
+  let verifyPrePay;
+  try {
+    verifyPrePay = await settlement.verifyPrePay({
+      settlementId,
+      paymentHashHex,
+      nowUnix,
+    });
+  } catch (err) {
+    verifyPrePay = { ok: false, error: err?.message ?? String(err) };
+  }
 
   const verifySwapInput = maybeBuildVerifySwapInput({
     settlementKind,
@@ -241,9 +299,14 @@ async function runStatus({ settlement, settlementKind, trade, settlementId, paym
     paymentHashHex,
     trade,
   });
-  const verifySwapPrePay = verifySwapInput
-    ? await settlement.verifySwapPrePayOnchain({ ...verifySwapInput, nowUnix })
-    : null;
+  let verifySwapPrePay = null;
+  if (verifySwapInput) {
+    try {
+      verifySwapPrePay = await settlement.verifySwapPrePayOnchain({ ...verifySwapInput, nowUnix });
+    } catch (err) {
+      verifySwapPrePay = { ok: false, error: err?.message ?? String(err) };
+    }
+  }
 
   const status = pickExpectedState({ settlementKind, verifyPrePay, trade });
 
@@ -324,7 +387,14 @@ async function main() {
       const trade = pickTrade(store, { tradeId: tradeId || null, paymentHashHex: paymentHashHex || null });
       const requestedSettlementKind = readRequestedSettlementKind(flags);
       const settlementKind = resolveEffectiveSettlementKind(trade, requestedSettlementKind);
-      const hash = normalizeHex32(trade.ln_payment_hash_hex, 'ln_payment_hash_hex');
+      const rawHash = String(trade.ln_payment_hash_hex || '').trim().toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(rawHash)) {
+        process.stdout.write(
+          `${JSON.stringify(buildPartialStatusForMissingPaymentHash({ trade, settlementKind, command: cmd }), null, 2)}\n`
+        );
+        return;
+      }
+      const hash = rawHash;
       const settlementId = getSettlementIdForTrade(trade, settlementKind);
       const settlement = buildSettlementProvider({ settlementKind, flags, trade, command: cmd });
 
@@ -428,13 +498,7 @@ async function main() {
       await settlement.waitForConfirmation(txId);
 
       if (settlementKind === SETTLEMENT_KIND.TAO_EVM) {
-        store.upsertTrade(trade.trade_id, {
-          state: 'refunded',
-          settlement_kind: SETTLEMENT_KIND.TAO_EVM,
-          ln_payment_hash_hex: hash,
-          tao_settlement_id: settlementId,
-          tao_refund_tx_id: txId,
-        });
+        persistRefundRecovery({ store, trade, settlementKind, hash, settlementId, txId });
         store.appendEvent(trade.trade_id, 'recovery_refund', {
           payment_hash_hex: hash,
           settlement_id: settlementId,
@@ -446,12 +510,7 @@ async function main() {
         return;
       }
 
-      store.upsertTrade(trade.trade_id, {
-        state: 'refunded',
-        settlement_kind: SETTLEMENT_KIND.SOLANA,
-        ln_payment_hash_hex: hash,
-        sol_escrow_pda: settlementId,
-      });
+      persistRefundRecovery({ store, trade, settlementKind, hash, settlementId, txId });
       store.appendEvent(trade.trade_id, 'recovery_refund', {
         payment_hash_hex: hash,
         escrow_pda: settlementId,
@@ -469,4 +528,11 @@ async function main() {
   }
 }
 
-main().catch((err) => die(err?.stack || err?.message || String(err)));
+const isDirectRun = (() => {
+  const entry = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : '';
+  return import.meta.url === entry;
+})();
+
+if (isDirectRun) {
+  main().catch((err) => die(err?.stack || err?.message || String(err)));
+}

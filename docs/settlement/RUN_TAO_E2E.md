@@ -153,7 +153,7 @@ scripts/rfq-taker-peer.sh swap-taker 49223 \
   --tao-amount-atomic 100000000
 ```
 
-For local testing only, the taker can lower its normally safe 72h minimum TAO refund window with:
+For local testing only, the maker or taker can lower the normally safe 72h minimum settlement refund window with:
 
 ```bash
 --unsafe-min-settlement-refund-after-sec 1

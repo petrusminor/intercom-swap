@@ -1,4 +1,5 @@
 import {
+  AbiCoder,
   Contract,
   JsonRpcProvider,
   Wallet,
@@ -6,6 +7,7 @@ import {
   getAddress,
   hexlify,
   isAddress,
+  keccak256,
   randomBytes,
 } from 'ethers';
 import { getAmountForPair, normalizePair } from '../../src/swap/pairs.js';
@@ -138,6 +140,37 @@ function normalizeSwapId(value) {
   return normalizeHex32(value, 'settlementId');
 }
 
+function parseUint256Like(value, label) {
+  try {
+    const n = BigInt(value);
+    if (n < 0n) throw new Error(`${label} must be >= 0`);
+    return n;
+  } catch (_e) {
+    throw new Error(`${label} must be uint256`);
+  }
+}
+
+export function computeTaoSwapIdFromLockInputs({
+  sender,
+  receiver,
+  value,
+  refundAfter,
+  hashlock,
+  clientSalt,
+}) {
+  const senderAddress = normalizeAddress(sender, 'sender');
+  const receiverAddress = normalizeAddress(receiver, 'receiver');
+  const amount = parseUint256Like(value, 'value');
+  const refundAfterUnix = parseUint256Like(refundAfter, 'refundAfter');
+  const normalizedHashlock = normalizeHex32(hashlock, 'hashlock');
+  const normalizedClientSalt = normalizeHex32(clientSalt, 'clientSalt');
+  const encoded = AbiCoder.defaultAbiCoder().encode(
+    ['address', 'address', 'uint256', 'uint256', 'bytes32', 'bytes32'],
+    [senderAddress, receiverAddress, amount, refundAfterUnix, normalizedHashlock, normalizedClientSalt]
+  );
+  return keccak256(encoded).toLowerCase();
+}
+
 /**
  * EVM settlement provider for TAO EVM.
  *
@@ -267,37 +300,83 @@ export class TaoEvmSettlementProvider {
       throw new Error(`refundAfterUnix too soon (need >= now + ${minRefundSafetySec}s)`);
     }
     const clientSalt = this._resolveClientSalt(input?.terms);
+    const settlementId = normalizeSwapId(
+      computeTaoSwapIdFromLockInputs({
+        sender: signerAddress,
+        receiver,
+        value: amount,
+        refundAfter,
+        hashlock,
+        clientSalt,
+      })
+    );
 
-    const swapId = await htlc.lock.staticCall(receiver, hashlock, refundAfter, clientSalt, {
-      value: amount,
-    });
+    const emitStage = async (stage, details = {}) => {
+      if (typeof input?.onStage !== 'function') return;
+      await input.onStage({
+        stage,
+        settlementId,
+        clientSalt,
+        ...details,
+      });
+    };
 
-    const tx = await htlc.lock(receiver, hashlock, refundAfter, clientSalt, {
-      value: amount,
-    });
-    await tx.wait(this.confirmations);
+    let tx = null;
+    let txId = null;
+    try {
+      await emitStage('rpc_send', {
+        hashlock,
+        refund_after_unix: Number(refundAfter),
+        amount_atomic: amount.toString(),
+        recipient: receiver,
+        refund: refundAddress,
+        htlc_address: this.htlcAddress,
+      });
 
-    const settlementId = normalizeSwapId(swapId);
-    this._setMetadata(settlementId, {
-      settlement_id: settlementId,
-      tx_id: tx.hash,
-      tx_hash: tx.hash,
-      swap_id: settlementId,
-      hashlock,
-      sender: signerAddress,
-      receiver,
-      amount_atomic: amount.toString(),
-      refund_after_unix: Number(refundAfter),
-      contract_address: this.htlcAddress,
-      htlc_address: this.htlcAddress,
-      recipient: receiver,
-      refund: refundAddress,
-      client_salt: clientSalt,
-    });
+      tx = await htlc.lock(receiver, hashlock, refundAfter, clientSalt, {
+        value: amount,
+      });
+      txId = normalizeTxHash(tx.hash);
+      await emitStage('tx_hash', { txId });
+
+      this._setMetadata(settlementId, {
+        settlement_id: settlementId,
+        tx_id: txId,
+        tx_hash: txId,
+        swap_id: settlementId,
+        hashlock,
+        sender: signerAddress,
+        receiver,
+        amount_atomic: amount.toString(),
+        refund_after_unix: Number(refundAfter),
+        contract_address: this.htlcAddress,
+        htlc_address: this.htlcAddress,
+        recipient: receiver,
+        refund: refundAddress,
+        client_salt: clientSalt,
+      });
+      if (typeof input?.onBroadcast === 'function') {
+        await input.onBroadcast({
+          settlementId,
+          txId,
+          clientSalt,
+          metadata: this._getMetadata(settlementId),
+        });
+      }
+
+      await emitStage('wait_confirm', { txId, confirmations: this.confirmations });
+      await tx.wait(this.confirmations);
+    } catch (err) {
+      await emitStage('error', {
+        txId,
+        error: err?.message ?? String(err),
+      });
+      throw err;
+    }
 
     return {
       settlementId,
-      txId: tx.hash,
+      txId,
       metadata: this._getMetadata(settlementId),
     };
   }

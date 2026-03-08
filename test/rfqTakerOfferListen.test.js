@@ -8,6 +8,7 @@ import { DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC, resolveUnsafeMinSettlemen
 import { deriveIntercomswapAppHash, deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
 import { ASSET, KIND, PAIR, DIR } from '../src/swap/constants.js';
 import { getSettlementBinding, SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID } from '../settlement/providerFactory.js';
+import { resolveEffectiveQuoteMinRefundWindowSec } from '../scripts/rfq-taker.mjs';
 
 const TAO_HTLC_ADDRESS = '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653';
 const RFQ_CHANNEL = '0000intercomswapbtctao';
@@ -210,4 +211,17 @@ test('rfq taker unsafe min settlement refund override is runtime-only', () => {
   });
   assert.equal(defaulted.effectiveMinSettlementRefundAfterSec, DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC);
   assert.equal(defaulted.unsafeMinProvided, false);
+});
+
+test('rfq taker quote min uses unsafe override value for TAO pair', () => {
+  const min = resolveEffectiveQuoteMinRefundWindowSec({
+    quotePair: PAIR.BTC_LN__TAO_EVM,
+    effectiveMinSettlementRefundAfterSec: 1,
+    minSolRefundWindowSec: 72 * 3600,
+    maxSolRefundWindowSec: 7 * 24 * 3600,
+    settlementRefundAfterSec: 72 * 3600,
+    minSec: 3600,
+    maxSec: 7 * 24 * 3600,
+  });
+  assert.equal(min, 1);
 });

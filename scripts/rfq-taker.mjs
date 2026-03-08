@@ -109,6 +109,14 @@ function parsePositiveIntEnv(name, fallback) {
   return n;
 }
 
+function parsePositiveIntLike(value, fallback) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return fallback;
+  return n;
+}
+
 function splitCsv(value) {
   const s = String(value ?? '').trim();
   if (!s) return [];
@@ -130,10 +138,16 @@ function ensureOk(res, label) {
   return res;
 }
 
-function signSwapEnvelope(unsignedEnvelope, { pubHex, secHex }) {
+export function validateLocalTakerEnvelope(envelope, { effectiveMinSettlementRefundAfterSec } = {}) {
+  return validateSwapEnvelope(envelope, {
+    minSettlementRefundSec: effectiveMinSettlementRefundAfterSec,
+  });
+}
+
+function signSwapEnvelope(unsignedEnvelope, { pubHex, secHex }, validationOptions = {}) {
   const sigHex = signUnsignedEnvelopeHex(unsignedEnvelope, secHex);
   const signed = attachSignature(unsignedEnvelope, { signerPubKeyHex: pubHex, sigHex });
-  const v = validateSwapEnvelope(signed);
+  const v = validateLocalTakerEnvelope(signed, validationOptions);
   if (!v.ok) throw new Error(`Internal error: signed envelope invalid: ${v.error}`);
   return signed;
 }
@@ -170,6 +184,130 @@ function normalizeHex32PatchValue(value) {
   if (value === null) return null;
   const s = String(value).trim().toLowerCase();
   return s ? s : null;
+}
+
+export function resolveEffectiveQuoteMinRefundWindowSec({
+  quotePair,
+  effectiveMinSettlementRefundAfterSec,
+  minSolRefundWindowSec,
+  maxSolRefundWindowSec,
+  settlementRefundAfterSec,
+  minSec = 3600,
+  maxSec = 7 * 24 * 3600,
+}) {
+  const normalizedQuotePair = normalizePair(quotePair);
+  if (isTaoPair(normalizedQuotePair)) {
+    return Number(effectiveMinSettlementRefundAfterSec);
+  }
+  const quoteMinPolicy = buildSettlementContext({
+    pair: normalizedQuotePair,
+    refundRaw: {
+      min_sol_refund_window_sec: minSolRefundWindowSec,
+      max_sol_refund_window_sec: maxSolRefundWindowSec,
+    },
+    refundDefaults: {
+      minSec,
+      maxSec,
+      defaultQuoteRefundSec: settlementRefundAfterSec,
+      defaultMinRefundSec: minSolRefundWindowSec,
+      defaultMaxRefundSec: maxSolRefundWindowSec,
+    },
+  }).refundPolicy;
+  return quoteMinPolicy.minRefundSec;
+}
+
+export function resolveTakerSettlementRefundConfig({
+  settlementRefundAfterSecRaw,
+  legacySolanaRefundAfterSecRaw,
+  unsafeMinSettlementRefundAfterSecRaw,
+  fallbackSec = 72 * 3600,
+  defaultSafeMinSec = DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
+  minSec = 3600,
+  maxSec = 7 * 24 * 3600,
+}) {
+  const unsafeMinConfig = resolveUnsafeMinSettlementRefundAfterSec({
+    unsafeMinSettlementRefundAfterSecRaw,
+    fallbackSec: defaultSafeMinSec,
+    maxSec,
+    roleLabel: 'taker',
+  });
+  const refundConfig = resolveSettlementRefundAfterSec({
+    settlementRefundAfterSecRaw,
+    legacySolanaRefundAfterSecRaw,
+    fallbackSec,
+    minSec: unsafeMinConfig.effectiveMinSettlementRefundAfterSec,
+    maxSec,
+  });
+  return {
+    settlementRefundAfterSec: refundConfig.settlementRefundAfterSec,
+    effectiveMinSettlementRefundAfterSec: unsafeMinConfig.effectiveMinSettlementRefundAfterSec,
+    unsafeMinProvided: unsafeMinConfig.unsafeMinProvided,
+    warnings: unsafeMinConfig.warnings.concat(refundConfig.warnings),
+  };
+}
+
+export function resolveTakerRefundAfterMarginConfig({
+  env = process.env,
+  fallbackSec = 900,
+}) {
+  const unsafeOverrideRaw = String(env?.INTERCOMSWAP_MIN_REFUND_AFTER_MARGIN_SEC || '').trim();
+  if (unsafeOverrideRaw) {
+    const invoiceExpirySafetyMarginSec = parsePositiveIntLike(unsafeOverrideRaw, null);
+    if (!Number.isFinite(invoiceExpirySafetyMarginSec) || invoiceExpirySafetyMarginSec < 1) {
+      throw new Error('Invalid INTERCOMSWAP_MIN_REFUND_AFTER_MARGIN_SEC (must be >= 1)');
+    }
+    return {
+      invoiceExpirySafetyMarginSec,
+      unsafeOverrideProvided: true,
+      warnings: [
+        `UNSAFE: lowering taker refund-after vs invoice-expiry margin to ${invoiceExpirySafetyMarginSec}s for this process only`,
+      ],
+    };
+  }
+
+  const legacyRaw = String(env?.INTERCOMSWAP_INVOICE_EXPIRY_SAFETY_MARGIN_SEC || '').trim();
+  return {
+    invoiceExpirySafetyMarginSec: parsePositiveIntLike(legacyRaw, fallbackSec),
+    unsafeOverrideProvided: false,
+    warnings: [],
+  };
+}
+
+export function resolveTakerMinTimelockConfig({
+  env = process.env,
+  fallbackSec = 3600,
+}) {
+  const raw = String(env?.INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC || '').trim();
+  const minTimelockRemainingSec = parsePositiveIntLike(raw, fallbackSec);
+  const unsafeOverrideProvided = raw !== '' && minTimelockRemainingSec < fallbackSec;
+  return {
+    minTimelockRemainingSec,
+    unsafeOverrideProvided,
+    warnings: unsafeOverrideProvided
+      ? [
+          `UNSAFE: lowering taker minimum timelock remaining to ${minTimelockRemainingSec}s for this process only`,
+        ]
+      : [],
+  };
+}
+
+export function evaluateLocalTakerPrePayTimelockSafety({
+  refundAfterUnix,
+  invoiceExpiryUnix,
+  nowUnix,
+  minTimelockRemainingSec,
+  invoiceExpirySafetyMarginSec,
+}) {
+  return buildSettlementContext({
+    timelock: {
+      refundAfterUnix,
+      invoiceExpiryUnix,
+      nowUnix,
+      minTimelockRemainingSec,
+      invoiceExpirySafetyMarginSec,
+      requireRefundAfterGreaterThanInvoiceExpiryPlusMin: false,
+    },
+  }).timelockSafety;
 }
 
 export function deriveInvoiceReceiptFields(invoiceBody) {
@@ -310,27 +448,19 @@ async function main() {
   if (maxTradeFeeBpsCfg > 1000) die('Invalid --max-trade-fee-bps (must be <= 1000)');
   if (maxTotalFeeBpsCfg > 1500) die('Invalid --max-total-fee-bps (must be <= 1500)');
   try {
-    const refundConfig = resolveSettlementRefundAfterSec({
+    const refundConfig = resolveTakerSettlementRefundConfig({
       settlementRefundAfterSecRaw: flags.get('settlement-refund-after-sec'),
       legacySolanaRefundAfterSecRaw: flags.get('solana-refund-after-sec'),
+      unsafeMinSettlementRefundAfterSecRaw: flags.get('unsafe-min-settlement-refund-after-sec'),
       fallbackSec: DEFAULT_SETTLEMENT_REFUND_AFTER_SEC,
+      defaultSafeMinSec: DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
       minSec: SETTLEMENT_REFUND_MIN_SEC,
       maxSec: SETTLEMENT_REFUND_MAX_SEC,
     });
     settlementRefundAfterSec = refundConfig.settlementRefundAfterSec;
-    for (const warning of refundConfig.warnings) process.stderr.write(`${warning}\n`);
-  } catch (err) {
-    die(err?.message || String(err));
-  }
-  try {
-    const unsafeMinConfig = resolveUnsafeMinSettlementRefundAfterSec({
-      unsafeMinSettlementRefundAfterSecRaw: flags.get('unsafe-min-settlement-refund-after-sec'),
-      fallbackSec: DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
-      maxSec: SETTLEMENT_REFUND_MAX_SEC,
-    });
-    effectiveMinSettlementRefundAfterSec = unsafeMinConfig.effectiveMinSettlementRefundAfterSec;
-    unsafeMinSettlementRefundAfterSecProvided = unsafeMinConfig.unsafeMinProvided;
-    for (const warning of unsafeMinConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
+    effectiveMinSettlementRefundAfterSec = refundConfig.effectiveMinSettlementRefundAfterSec;
+    unsafeMinSettlementRefundAfterSecProvided = refundConfig.unsafeMinProvided;
+    for (const warning of refundConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
   } catch (err) {
     die(err?.message || String(err));
   }
@@ -342,8 +472,18 @@ async function main() {
   let maxPlatformFeeBps = maxPlatformFeeBpsCfg;
   let maxTradeFeeBps = maxTradeFeeBpsCfg;
   let maxTotalFeeBps = maxTotalFeeBpsCfg;
-  const minTimelockRemainingSec = parsePositiveIntEnv('INTERCOMSWAP_MIN_TIMELOCK_REMAINING_SEC', 3600);
-  const invoiceExpirySafetyMarginSec = parsePositiveIntEnv('INTERCOMSWAP_INVOICE_EXPIRY_SAFETY_MARGIN_SEC', 900);
+  const timelockConfig = resolveTakerMinTimelockConfig({
+    env: process.env,
+    fallbackSec: 3600,
+  });
+  const minTimelockRemainingSec = timelockConfig.minTimelockRemainingSec;
+  for (const warning of timelockConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
+  const invoiceExpiryMarginConfig = resolveTakerRefundAfterMarginConfig({
+    env: process.env,
+    fallbackSec: 900,
+  });
+  const invoiceExpirySafetyMarginSec = invoiceExpiryMarginConfig.invoiceExpirySafetyMarginSec;
+  for (const warning of invoiceExpiryMarginConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
 
   const solRpcUrl = (flags.get('solana-rpc-url') && String(flags.get('solana-rpc-url')).trim()) || 'http://127.0.0.1:8899';
   const solKeypairPath = flags.get('solana-keypair') ? String(flags.get('solana-keypair')).trim() : '';
@@ -626,7 +766,9 @@ async function main() {
     `[taker] rfq settlement_refund_after_sec=${rfqUnsigned?.body?.settlement_refund_after_sec} rfq_id=${rfqUnsigned?.body?.rfq_id ?? 'n/a'} trade_id=${rfqUnsigned?.tradeId ?? 'n/a'}\n`
   );
   const rfqId = hashUnsignedEnvelope(rfqUnsigned);
-  const rfqSigned = signSwapEnvelope(rfqUnsigned, signing);
+  const rfqSigned = signSwapEnvelope(rfqUnsigned, signing, {
+    effectiveMinSettlementRefundAfterSec,
+  });
   ensureOk(await sc.send(rfqChannel, rfqSigned), 'send rfq');
 
   persistTrade(
@@ -1141,16 +1283,13 @@ async function main() {
       });
     }
     const nowUnix = Math.floor(Date.now() / 1000);
-    const timelockSafety = buildSettlementContext({
-      timelock: {
-        refundAfterUnix: swapCtx.trade.escrow?.refund_after_unix,
-        invoiceExpiryUnix: swapCtx.trade.invoice?.expires_at_unix,
-        nowUnix,
-        minTimelockRemainingSec,
-        invoiceExpirySafetyMarginSec,
-        requireRefundAfterGreaterThanInvoiceExpiryPlusMin: false,
-      },
-    }).timelockSafety;
+    const timelockSafety = evaluateLocalTakerPrePayTimelockSafety({
+      refundAfterUnix: swapCtx.trade.escrow?.refund_after_unix,
+      invoiceExpiryUnix: swapCtx.trade.invoice?.expires_at_unix,
+      nowUnix,
+      minTimelockRemainingSec,
+      invoiceExpirySafetyMarginSec,
+    });
     if (timelockSafety.code === 'refund_after_invalid') {
       throw new Error('verify-prepay failed: escrow refund_after_unix missing/invalid');
     }
@@ -1348,7 +1487,7 @@ async function main() {
           );
           return;
         }
-        const v = validateSwapEnvelope(msg);
+        const v = validateLocalTakerEnvelope(msg, { effectiveMinSettlementRefundAfterSec });
         if (!v.ok) {
           process.stderr.write(
             `[taker] quote_reject reason=invalid_envelope trade_id=${tradeId} rfq_id=${String(msg?.body?.rfq_id || 'n/a')} error=${v.error || 'unknown'}\n`
@@ -1416,23 +1555,15 @@ async function main() {
         // Pre-filtering: require explicit refund/claim window advertised in QUOTE (seconds).
         const quotePair = normalizePair(msg.body?.pair || rfqPair);
         const quoteRefundWindowSec = Number(msg.body?.[getQuoteRefundFieldForPair(quotePair)]);
-        const quoteMinPolicy = buildSettlementContext({
-          pair: quotePair,
-          refundRaw: isTaoPair(quotePair)
-            ? { settlement_refund_after_sec: effectiveMinSettlementRefundAfterSec }
-            : {
-                min_sol_refund_window_sec: minSolRefundWindowSec,
-                max_sol_refund_window_sec: maxSolRefundWindowSec,
-              },
-          refundDefaults: {
-            minSec: SETTLEMENT_REFUND_MIN_SEC,
-            maxSec: SETTLEMENT_REFUND_MAX_SEC,
-            defaultQuoteRefundSec: settlementRefundAfterSec,
-            defaultMinRefundSec: minSolRefundWindowSec,
-            defaultMaxRefundSec: maxSolRefundWindowSec,
-          },
-        }).refundPolicy;
-        const effectiveQuoteMinRefundWindowSec = quoteMinPolicy.minRefundSec;
+        const effectiveQuoteMinRefundWindowSec = resolveEffectiveQuoteMinRefundWindowSec({
+          quotePair,
+          effectiveMinSettlementRefundAfterSec,
+          minSolRefundWindowSec,
+          maxSolRefundWindowSec,
+          settlementRefundAfterSec,
+          minSec: SETTLEMENT_REFUND_MIN_SEC,
+          maxSec: SETTLEMENT_REFUND_MAX_SEC,
+        });
         if (!Number.isFinite(quoteRefundWindowSec) || quoteRefundWindowSec <= 0) {
           process.stderr.write(
             `[taker] quote_reject reason=invalid_refund_window quote_id=${quoteId} pair=${quotePair} ` +

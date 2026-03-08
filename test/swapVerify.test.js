@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { verifySwapPrePay } from '../src/swap/verify.js';
-import { TaoEvmSettlementProvider } from '../settlement/tao-evm/TaoEvmSettlementProvider.js';
+import {
+  TaoEvmSettlementProvider,
+  computeTaoSwapIdFromLockInputs,
+} from '../settlement/tao-evm/TaoEvmSettlementProvider.js';
 
 test('swap verify: payer pre-pay checks (invoice + escrow + terms)', () => {
   const bolt11 =
@@ -90,6 +93,18 @@ test('swap verify: payer pre-pay checks (invoice + escrow + terms)', () => {
   assert.match(badInvoice.error, /invoice invalid/i);
 });
 
+test('tao provider swapId derivation matches Solidity abi.encode fixture', () => {
+  const swapId = computeTaoSwapIdFromLockInputs({
+    sender: '0x1111111111111111111111111111111111111111',
+    receiver: '0x2222222222222222222222222222222222222222',
+    value: '123456789',
+    refundAfter: 1700003600,
+    hashlock: `0x${'33'.repeat(32)}`,
+    clientSalt: `0x${'44'.repeat(32)}`,
+  });
+  assert.equal(swapId, '0xc03231f0357e14ef58515752a6266673cf32932e1e712b8f02723a736534ae17');
+});
+
 test('tao provider lock: rejects malformed hash, zero amount, and unsafe refund window before chain calls', async () => {
   let chainCalls = 0;
   const lockFn = async () => {
@@ -134,6 +149,45 @@ test('tao provider lock: rejects malformed hash, zero amount, and unsafe refund 
     /refundAfterUnix too soon/i
   );
   assert.equal(chainCalls, 0, 'validation failures should happen before any on-chain call');
+});
+
+test('tao provider lock: emits stage callbacks and preserves broadcast callback behavior when tx hash is returned', async () => {
+  const stages = [];
+  const broadcasts = [];
+  const lockFn = async () => ({
+    hash: `0x${'ab'.repeat(32)}`,
+    wait: async () => {},
+  });
+  const mock = {
+    _ensureReady: async () => {},
+    _requireHtlc: () => ({ lock: lockFn }),
+    wallet: { getAddress: async () => '0x1111111111111111111111111111111111111111' },
+    _resolveClientSalt: () => `0x${'ef'.repeat(32)}`,
+    _setMetadata: () => {},
+    _getMetadata: () => ({ settlement_id: `0x${'cd'.repeat(32)}` }),
+    confirmations: 1,
+    htlcAddress: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
+  };
+  const lock = TaoEvmSettlementProvider.prototype.lock;
+
+  const res = await lock.call(mock, {
+    recipient: '0x2222222222222222222222222222222222222222',
+    refundAddress: '0x1111111111111111111111111111111111111111',
+    paymentHashHex: '11'.repeat(32),
+    amountAtomic: '1000',
+    refundAfterUnix: Math.floor(Date.now() / 1000) + 7200,
+    terms: {},
+    onStage: async (evt) => stages.push(evt),
+    onBroadcast: async (evt) => broadcasts.push(evt),
+  });
+
+  assert.equal(res.txId, `0x${'ab'.repeat(32)}`);
+  assert.equal(broadcasts.length, 1);
+  assert.equal(broadcasts[0].txId, `0x${'ab'.repeat(32)}`);
+  assert.deepEqual(
+    stages.map((s) => s.stage),
+    ['rpc_send', 'tx_hash', 'wait_confirm']
+  );
 });
 
 test('tao provider verifySwapPrePayOnchain: refund_after must be strictly greater than invoice expiry + min timelock', async () => {

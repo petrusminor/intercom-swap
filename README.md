@@ -409,6 +409,7 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--terms-valid-sec <n>` | Terms validity window (default `300`) |
 | `--settlement-refund-after-sec <n>` | Settlement refund timelock from terms send time (default `259200` = 72h) |
 | `--solana-refund-after-sec <n>` | Deprecated alias for `--settlement-refund-after-sec` |
+| `--unsafe-min-settlement-refund-after-sec <n>` | UNSAFE maker-only override for the local minimum settlement refund window check (default safe minimum `259200` = 72h; local testing only) |
 | `--ln-invoice-expiry-sec <n>` | LN invoice expiry seconds (default `3600`) |
 
 ##### Solana

@@ -46,6 +46,7 @@ export function resolveUnsafeMinSettlementRefundAfterSec({
   unsafeMinSettlementRefundAfterSecRaw,
   fallbackSec = DEFAULT_SAFE_MIN_SETTLEMENT_REFUND_AFTER_SEC,
   maxSec,
+  roleLabel = 'taker',
 }) {
   const unsafeMin = parseOptionalIntFlag(
     unsafeMinSettlementRefundAfterSecRaw,
@@ -68,7 +69,7 @@ export function resolveUnsafeMinSettlementRefundAfterSec({
     effectiveMinSettlementRefundAfterSec: unsafeMin,
     unsafeMinProvided: true,
     warnings: [
-      `UNSAFE: lowering taker minimum settlement refund window to ${unsafeMin}s for this process only`,
+      `UNSAFE: lowering ${String(roleLabel || 'operator')} minimum settlement refund window to ${unsafeMin}s for this process only`,
     ],
   };
 }
