@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { injectMissingOfferAppHashes } from '../scripts/swapctl.mjs';
+import { injectMissingOfferAppHashes, parseZeroOneFlag } from '../scripts/swapctl.mjs';
 import { deriveIntercomswapAppHashForBinding } from '../src/swap/app.js';
 import { getSettlementBinding, SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID } from '../settlement/providerFactory.js';
 
@@ -40,4 +40,11 @@ test('swapctl svc-announce autofills missing offer app_hash from settlement bind
       getSettlementBinding('solana', { solanaProgramId: SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID })
     )
   );
+});
+
+test('swapctl parseZeroOneFlag rejects malformed join values and accepts 0/1', () => {
+  assert.equal(parseZeroOneFlag('1', 'join', false), true);
+  assert.equal(parseZeroOneFlag('0', 'join', true), false);
+  assert.throws(() => parseZeroOneFlag('1c', 'join', true), /Invalid --join \(expected 0 or 1\)/i);
+  assert.throws(() => parseZeroOneFlag(true, 'join', true), /Invalid --join \(expected 0 or 1\)/i);
 });

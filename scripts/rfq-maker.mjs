@@ -176,6 +176,7 @@ function parseSignedEnvelopeLike(value) {
     try {
       return JSON.parse(value);
     } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
       return null;
     }
   }
@@ -301,6 +302,9 @@ export function handleMakerTaoLockStage({
   if (normalizedStage === 'prepare' || normalizedStage === 'rpc_send') {
     ctx.taoLockPhase = 'locking';
   }
+  if (normalizedStage === 'confirmed') {
+    ctx.taoLockPhase = 'escrow';
+  }
   if (settlementId) ctx.taoSettlementId = settlementId;
   if (txId) ctx.taoLockTxId = txId;
   if (errorMessage) ctx.lastLockError = errorMessage;
@@ -310,6 +314,7 @@ export function handleMakerTaoLockStage({
     rpc_send: 'tao_lock_rpc_send',
     tx_hash: 'tao_lock_tx_hash',
     wait_confirm: 'tao_lock_wait_confirm',
+    confirmed: 'tao_lock_confirmed',
     error: 'tao_lock_error',
   };
   const eventKind = eventKindByStage[normalizedStage] || null;
@@ -333,14 +338,8 @@ export function handleMakerTaoLockStage({
 
   if (typeof log === 'function') {
     log(
-      JSON.stringify({
-        type: 'tao_lock_stage',
-        trade_id: tradeId,
-        stage: normalizedStage,
-        settlement_id: settlementId,
-        tx_id: txId,
-        error: errorMessage,
-      })
+      `[maker] tao_lock_stage trade_id=${tradeId || 'n/a'} stage=${normalizedStage || 'n/a'} ` +
+        `settlement_id=${settlementId || 'n/a'} tx_id=${txId || 'n/a'}${errorMessage ? ` error=${JSON.stringify(errorMessage)}` : ''}`
     );
   }
   if (tradeId && eventKind && typeof persistTrade === 'function') {
@@ -438,7 +437,9 @@ export function persistTradeReceipt({
   } catch (err) {
     try {
       receipts.upsertTrade(normalizedTradeId, { last_error: err?.message ?? String(err) });
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
     if (typeof onError === 'function') onError(err);
     return false;
   }
@@ -668,7 +669,7 @@ async function main() {
       eventKind,
       eventPayload,
       onError: (err) => {
-        if (debug) process.stderr.write(`[maker] receipts persist error: ${err?.message ?? String(err)}\n`);
+        process.stderr.write(`[maker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
       },
     });
   };
@@ -716,11 +717,15 @@ async function main() {
     if (debug) process.stderr.write(`[maker] shutdown start reason=${reason}\n`);
     try {
       clearInterval(lockPruneTimer);
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
     for (const ctx of Array.from(swaps.values())) {
       try {
         if (ctx?.resender) clearInterval(ctx.resender);
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
     }
     try {
       const st = await sc.stats();
@@ -730,14 +735,20 @@ async function main() {
         if (channel.startsWith('swap:')) {
           try {
             await sc.leave(channel);
-          } catch (_e) {}
+          } catch (_e) {
+            process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+          }
         }
       }
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
     for (const swapChannel of Array.from(swaps.keys())) {
       try {
         await sc.leave(swapChannel);
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
     }
     if (receipts) {
       const seenTradeIds = new Set();
@@ -759,10 +770,14 @@ async function main() {
     }
     try {
       receipts?.close();
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
     try {
       sc.close();
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
     if (debug) process.stderr.write(`[maker] shutdown done reason=${reason}\n`);
   };
 
@@ -798,7 +813,9 @@ async function main() {
   const leaveSidechannel = async (channel) => {
     try {
       await sc.leave(channel);
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
   };
 
   const cancelSwap = async (ctx, reason) => {
@@ -811,7 +828,9 @@ async function main() {
       });
       const cancelSigned = signSwapEnvelope(cancelUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
       await sc.send(ctx.swapChannel, cancelSigned, { invite: ctx.invite || null });
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
   };
 
   const cleanupSwap = async (ctx, { reason = null, sendCancel = false } = {}) => {
@@ -820,10 +839,14 @@ async function main() {
     if (ctx.resender) clearInterval(ctx.resender);
     try {
       swaps.delete(ctx.swapChannel);
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
     try {
       pendingSwaps.delete(ctx.swapChannel);
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
     {
       const lockKey = swapChannelToLockKey.get(ctx.swapChannel) || tradeIdToLockKey.get(ctx.tradeId) || null;
       clearRfqLock(lockKey, reason || 'swap_cleanup');
@@ -924,16 +947,84 @@ async function main() {
   };
 
   const createInvoiceAndEscrow = async (ctx) => {
-    if (ctx.startedSettlement) return;
+    if (ctx.startedSettlement) {
+      process.stderr.write(`[maker] SKIP settlement already started trade_id=${ctx.tradeId}\n`);
+      return;
+    }
     ctx.startedSettlement = true;
+    process.stderr.write(`[maker] execution_start trade_id=${ctx.tradeId}\n`);
+
+    const isRetryableSettlementError = (err) => {
+      const message = String(err?.message ?? err ?? '').toLowerCase();
+      if (!message) return false;
+      const permanentMarkers = [
+        'missing ',
+        'invalid ',
+        'mismatch',
+        'must ',
+        'requires ',
+        'failed to persist',
+        'signed envelope invalid',
+        'deterministic settlement_id mismatch',
+        'refundafterunix too soon',
+        'too soon',
+        'already exists',
+        'duplicate',
+        'label',
+      ];
+      if (permanentMarkers.some((marker) => message.includes(marker))) return false;
+      const transientMarkers = [
+        'timeout',
+        'timed out',
+        'temporar',
+        'econn',
+        'connection reset',
+        'connection closed',
+        'disconnected',
+        'network',
+        'socket',
+        '429',
+        '503',
+        '502',
+        '504',
+        'unavailable',
+        'rate limit',
+        'transport',
+        'rpc',
+      ];
+      return transientMarkers.some((marker) => message.includes(marker));
+    };
+    const retryDelayMs = [1000, 2000, 3000];
+
+    if (!ctx.trade?.terms) throw new Error('Missing terms');
+    if (ctx.trade?.invoice || ctx.sent.invoice) throw new Error('LN invoice already exists before settlement start');
+    if (ctx.trade?.escrow || ctx.sent.escrow) throw new Error('Settlement lock already exists before settlement start');
 
     const sats = ctx.btcSats;
-    const invoice = await lnInvoice(ln, {
-      amountMsat: (BigInt(String(sats)) * 1000n).toString(),
-      label: ctx.tradeId,
-      description: 'swap',
-      expirySec: lnInvoiceExpirySec,
-    });
+    if (lnInvoiceExpirySec < 60 || lnInvoiceExpirySec > 3600) {
+      process.stderr.write(`[maker] WARN unusual LN invoice expiry trade_id=${ctx.tradeId} expiry_sec=${lnInvoiceExpirySec}\n`);
+    }
+    let invoice = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        process.stderr.write(`[maker] ln_invoice_create trade_id=${ctx.tradeId} sats=${ctx.btcSats} attempt=${attempt + 1}\n`);
+        invoice = await lnInvoice(ln, {
+          amountMsat: (BigInt(String(sats)) * 1000n).toString(),
+          label: ctx.tradeId,
+          description: 'swap',
+          expirySec: lnInvoiceExpirySec,
+        });
+        break;
+      } catch (err) {
+        const retryable = !ctx.trade?.invoice && !ctx.sent.invoice && attempt < 2 && isRetryableSettlementError(err);
+        process.stderr.write(
+          `[maker] ERROR: ln_invoice attempt=${attempt + 1} trade_id=${ctx.tradeId} retry=${retryable ? 1 : 0} ` +
+            `${err?.stack || err?.message || String(err)}\n`
+        );
+        if (!retryable) throw err;
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs[attempt]));
+      }
+    }
 
     const bolt11 = String(invoice?.bolt11 || '').trim();
     const paymentHashHex = String(invoice?.payment_hash || '').trim().toLowerCase();
@@ -943,6 +1034,9 @@ async function main() {
     ctx.paymentHashHex = paymentHashHex;
 
     const decoded = decodeBolt11(bolt11);
+    process.stderr.write(
+      `[maker] ln_invoice_created trade_id=${ctx.tradeId} payment_hash_hex=${paymentHashHex} expires_at_unix=${decoded.expires_at_unix}\n`
+    );
     const lnInvUnsigned = createUnsignedEnvelope({
       v: 1,
       kind: KIND.LN_INVOICE,
@@ -961,11 +1055,7 @@ async function main() {
       ctx.trade = r.trade;
     }
     ctx.sent.invoice = lnInvSigned;
-    await sc.send(ctx.swapChannel, lnInvSigned, { invite: ctx.invite || null });
-    ctx.lastInvoiceSendAtMs = Date.now();
-    process.stdout.write(`${JSON.stringify({ type: 'ln_invoice_sent', trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, payment_hash_hex: paymentHashHex })}\n`);
-
-    persistTrade(
+    const invoicePersisted = persistTrade(
       ctx.tradeId,
       {
         ln_invoice_bolt11: bolt11,
@@ -975,8 +1065,16 @@ async function main() {
       'ln_invoice_sent',
       lnInvSigned
     );
+    if (receipts && !invoicePersisted) {
+      throw new Error('Failed to persist LN invoice before send');
+    }
+    await sc.send(ctx.swapChannel, lnInvSigned, { invite: ctx.invite || null });
+    ctx.lastInvoiceSendAtMs = Date.now();
+    process.stdout.write(`${JSON.stringify({ type: 'ln_invoice_sent', trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, payment_hash_hex: paymentHashHex })}\n`);
 
-    // Solana escrow (locks net + platform fee + trade fee; terms.usdt_amount is the net amount).
+    if (!ctx.paymentHashHex) throw new Error('Missing paymentHashHex');
+    if (!ctx.trade?.terms) throw new Error('Missing terms');
+    if (!ctx.trade?.terms?.sol_refund_after_unix) throw new Error('Missing refund timing');
     const refundAfterUnix = Number(ctx.trade.terms.sol_refund_after_unix);
     if (!Number.isFinite(refundAfterUnix) || refundAfterUnix <= 0) throw new Error('Invalid sol_refund_after_unix');
     const taoLockCheckpoint = isTaoSettlement
@@ -1045,62 +1143,83 @@ async function main() {
       : ctx.trade.terms;
 
     let lock;
-    try {
-      lock = await sol.settlement.lock({
-        paymentHashHex,
-        amountAtomic: String(ctx.usdtAmount),
-        recipient: ctx.solRecipient,
-        refundAddress: sol.refundAddress,
-        refundAfterUnix,
-        terms: termsForLock,
-        ...(isTaoSettlement
-          ? {
-              onStage: ({ stage, ...details }) => {
-                handleMakerTaoLockStage({
-                  ctx,
-                  stage,
-                  details,
-                  persistTrade,
-                  log: (line) => process.stderr.write(`${line}\n`),
-                });
-              },
-              onBroadcast: ({ txId, settlementId, clientSalt }) => {
-                ctx.taoLockTxId = txId;
-                const persisted = persistTrade(
-                  ctx.tradeId,
-                  {
-                    tao_settlement_id: settlementId,
-                    tao_lock_tx_id: txId,
-                    state: STATE.ESCROW,
-                  },
-                  'tao_lock_broadcast',
-                  {
-                    payment_hash_hex: paymentHashHex,
-                    settlement_id: settlementId,
-                    tx_id: txId,
-                    client_salt: clientSalt || taoLockCheckpoint.clientSalt,
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        if (ctx.taoLockTxId) throw new Error('TAO lock tx already exists before retry');
+        if (ctx.trade?.escrow || ctx.sent.escrow) throw new Error('Settlement lock proof already exists before retry');
+        if (isTaoSettlement) {
+          process.stderr.write(
+            `[maker] tao_lock_start trade_id=${ctx.tradeId} amount=${ctx.usdtAmount} recipient=${ctx.solRecipient} attempt=${attempt + 1}\n`
+          );
+        }
+        lock = await sol.settlement.lock({
+          paymentHashHex,
+          amountAtomic: String(ctx.usdtAmount),
+          recipient: ctx.solRecipient,
+          refundAddress: sol.refundAddress,
+          refundAfterUnix,
+          terms: termsForLock,
+          ...(isTaoSettlement
+            ? {
+                onStage: ({ stage, ...details }) => {
+                  handleMakerTaoLockStage({
+                    ctx,
+                    stage,
+                    details,
+                    persistTrade,
+                    log: (line) => process.stderr.write(`${line}\n`),
+                  });
+                },
+                onBroadcast: ({ txId, settlementId, clientSalt }) => {
+                  ctx.taoLockTxId = txId;
+                  const persisted = persistTrade(
+                    ctx.tradeId,
+                    {
+                      tao_settlement_id: settlementId,
+                      tao_lock_tx_id: txId,
+                      state: STATE.ESCROW,
+                    },
+                    'tao_lock_broadcast',
+                    {
+                      payment_hash_hex: paymentHashHex,
+                      settlement_id: settlementId,
+                      tx_id: txId,
+                      client_salt: clientSalt || taoLockCheckpoint.clientSalt,
+                    }
+                  );
+                  if (receipts && !persisted) {
+                    throw new Error('Failed to persist TAO lock tx_id immediately after broadcast');
                   }
-                );
-                if (receipts && !persisted) {
-                  throw new Error('Failed to persist TAO lock tx_id immediately after broadcast');
-                }
-              },
-            }
-          : {}),
-      });
-    } catch (err) {
-      if (isTaoSettlement && !ctx.lastLockError) {
-        handleMakerTaoLockStage({
-          ctx,
-          stage: 'error',
-          details: {
-            error: err?.message ?? String(err),
-          },
-          persistTrade,
-          log: (line) => process.stderr.write(`${line}\n`),
+                },
+              }
+            : {}),
         });
+        break;
+      } catch (err) {
+        if (isTaoSettlement && !ctx.lastLockError) {
+          handleMakerTaoLockStage({
+            ctx,
+            stage: 'error',
+            details: {
+              error: err?.message ?? String(err),
+            },
+            persistTrade,
+            log: (line) => process.stderr.write(`${line}\n`),
+          });
+        }
+        const retryable =
+          !ctx.taoLockTxId &&
+          !ctx.trade?.escrow &&
+          !ctx.sent.escrow &&
+          attempt < 2 &&
+          isRetryableSettlementError(err);
+        process.stderr.write(
+          `[maker] ERROR: tao_lock attempt=${attempt + 1} trade_id=${ctx.tradeId} retry=${retryable ? 1 : 0} ` +
+            `${err?.stack || err?.message || String(err)}\n`
+        );
+        if (!retryable) throw err;
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs[attempt]));
       }
-      throw err;
     }
     const settlementId = lock.settlementId;
     const settlementTxId = lock.txId;
@@ -1184,6 +1303,40 @@ async function main() {
       if (!r.ok) throw new Error(r.error);
       ctx.trade = r.trade;
     }
+    const escrowPersisted = isTaoSettlement
+      ? persistTrade(
+          ctx.tradeId,
+          {
+            tao_htlc_address: solEscrowSigned.body.htlc_address,
+            tao_settlement_id: solEscrowSigned.body.settlement_id,
+            tao_amount_atomic: solEscrowSigned.body.amount_atomic,
+            tao_refund_after_unix: solEscrowSigned.body.refund_after_unix,
+            tao_recipient: solEscrowSigned.body.recipient,
+            tao_refund: solEscrowSigned.body.refund,
+            tao_lock_tx_id: solEscrowSigned.body.tx_id,
+            state: ctx.trade.state,
+          },
+          'tao_htlc_locked_sent',
+          solEscrowSigned
+        )
+      : persistTrade(
+          ctx.tradeId,
+          {
+            sol_program_id: solEscrowSigned.body.program_id,
+            sol_mint: solEscrowSigned.body.mint,
+            sol_escrow_pda: solEscrowSigned.body.escrow_pda,
+            sol_vault_ata: solEscrowSigned.body.vault_ata,
+            sol_refund_after_unix: solEscrowSigned.body.refund_after_unix,
+            sol_recipient: solEscrowSigned.body.recipient,
+            sol_refund: solEscrowSigned.body.refund,
+            state: ctx.trade.state,
+          },
+          'sol_escrow_sent',
+          solEscrowSigned
+        );
+    if (receipts && !escrowPersisted) {
+      throw new Error('Failed to persist settlement lock proof before send');
+    }
     ctx.sent.escrow = solEscrowSigned;
     await sc.send(ctx.swapChannel, solEscrowSigned, { invite: ctx.invite || null });
     ctx.lastEscrowSendAtMs = Date.now();
@@ -1196,40 +1349,6 @@ async function main() {
         tx_sig: isTaoSettlement ? undefined : settlementTxId,
       })}\n`
     );
-
-    if (isTaoSettlement) {
-      persistTrade(
-        ctx.tradeId,
-        {
-          tao_htlc_address: solEscrowSigned.body.htlc_address,
-          tao_settlement_id: solEscrowSigned.body.settlement_id,
-          tao_amount_atomic: solEscrowSigned.body.amount_atomic,
-          tao_refund_after_unix: solEscrowSigned.body.refund_after_unix,
-          tao_recipient: solEscrowSigned.body.recipient,
-          tao_refund: solEscrowSigned.body.refund,
-          tao_lock_tx_id: solEscrowSigned.body.tx_id,
-          state: ctx.trade.state,
-        },
-        'tao_htlc_locked_sent',
-        solEscrowSigned
-      );
-    } else {
-      persistTrade(
-        ctx.tradeId,
-        {
-          sol_program_id: solEscrowSigned.body.program_id,
-          sol_mint: solEscrowSigned.body.mint,
-          sol_escrow_pda: solEscrowSigned.body.escrow_pda,
-          sol_vault_ata: solEscrowSigned.body.vault_ata,
-          sol_refund_after_unix: solEscrowSigned.body.refund_after_unix,
-          sol_recipient: solEscrowSigned.body.recipient,
-          sol_refund: solEscrowSigned.body.refund,
-          state: ctx.trade.state,
-        },
-        'sol_escrow_sent',
-        solEscrowSigned
-      );
-    }
   };
 
   const startSwapResender = (ctx) => {
@@ -1243,7 +1362,9 @@ async function main() {
           await cleanupSwap(ctx, { reason, sendCancel: true });
           try {
             clearInterval(ctx.resender);
-          } catch (_e) {}
+          } catch (_e) {
+            process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+          }
           ctx.resender = null;
           swaps.delete(ctx.swapChannel);
           // Once-mode should never hang indefinitely.
@@ -1278,7 +1399,9 @@ async function main() {
           await sc.send(ctx.swapChannel, ctx.sent.escrow, { invite: ctx.invite || null });
           ctx.lastEscrowSendAtMs = nowMs;
         }
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[maker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
     }, Math.max(swapResendMs, 200));
   };
 
@@ -1287,6 +1410,7 @@ async function main() {
       if (evt?.channel !== rfqChannel && !swaps.has(evt?.channel)) return;
       const msg = evt?.message;
       if (!msg || typeof msg !== 'object') return;
+      process.stderr.write(`[maker] msg kind=${msg?.kind} trade_id=${msg?.trade_id} channel=${evt?.channel}\n`);
 
       // Swap channel traffic
       if (swaps.has(evt.channel)) {
@@ -1294,13 +1418,35 @@ async function main() {
         if (!ctx) return;
         ctx.lastRemoteActivityAtMs = Date.now();
         const v = validateLocalMakerEnvelope(msg, { effectiveMinSettlementRefundAfterSec });
-        if (!v.ok) return;
+        if (!v.ok) {
+          process.stderr.write(`[maker] envelope rejected kind=${msg?.kind} error=${v.error}\n`);
+          return;
+        }
+        if (msg.kind === KIND.ACCEPT && ctx.trade?.state === STATE.ACCEPTED && ctx.startedSettlement) {
+          if (!ctx.duplicateAcceptLogged) {
+            process.stderr.write(`[maker] SKIP duplicate ACCEPT trade_id=${ctx.tradeId}\n`);
+            ctx.duplicateAcceptLogged = true;
+          }
+          return;
+        }
+        const prevState = ctx.trade?.state;
         const r = applySwapEnvelope(ctx.trade, msg);
         if (!r.ok) {
-          if (debug) process.stderr.write(`[maker] swap apply error: ${r.error}\n`);
+          process.stderr.write(`[maker] applySwapEnvelope rejected kind=${msg?.kind} prev_state=${prevState} error=${r.error}\n`);
           return;
         }
         ctx.trade = r.trade;
+        process.stderr.write(`[maker] state transition kind=${msg?.kind} ${prevState} -> ${ctx.trade.state}\n`);
+        if (msg.kind === KIND.LN_PAID) {
+          process.stderr.write(
+            `[maker] ln_paid_received trade_id=${ctx.tradeId} payment_hash_hex=${String(msg.body?.payment_hash_hex || 'n/a')}\n`
+          );
+        }
+        if (msg.kind === KIND.TAO_CLAIMED) {
+          process.stderr.write(
+            `[maker] tao_claimed_received trade_id=${ctx.tradeId} settlement_id=${String(msg.body?.settlement_id || 'n/a')} tx_id=${String(msg.body?.tx_id || 'n/a')}\n`
+          );
+        }
 
         // Taker can join and send STATUS before it has seen TERMS due delivery races.
         // On STATUS, force a TERMS re-send so both peers converge deterministically.
@@ -1308,6 +1454,9 @@ async function main() {
           await sc.send(ctx.swapChannel, ctx.sent.terms, { invite: ctx.invite || null });
         }
 
+        process.stderr.write(
+          `[maker] gate check kind=${msg.kind} state=${ctx.trade.state} runSwap=${runSwap} started=${ctx.startedSettlement}\n`
+        );
         if (msg.kind === KIND.ACCEPT && ctx.trade.state === STATE.ACCEPTED && runSwap) {
           await createInvoiceAndEscrow(ctx);
         }
@@ -1740,6 +1889,34 @@ async function main() {
           }
         }
 
+        if (isRetry) {
+          const nowMs = Date.now();
+          const resendFloorMs = Math.max(5_000, retryResendMinMs);
+          let resent = 0;
+          if (existing?.sent?.swap_invite && nowMs - Number(existing.lastInviteSendAtMs || 0) >= resendFloorMs) {
+            ensureOk(await sc.send(rfqChannel, existing.sent.swap_invite), 'resend swap_invite');
+            existing.lastInviteSendAtMs = nowMs;
+            resent += 1;
+            process.stdout.write(
+              `${JSON.stringify({ type: 'swap_invite_resent', trade_id: tradeId, rfq_id: rfqId, quote_id: quoteId, swap_channel: swapChannel })}\n`
+            );
+          }
+          if (existing?.sent?.terms && nowMs - Number(existing.lastTermsSendAtMs || 0) >= resendFloorMs) {
+            ensureOk(await sc.send(swapChannel, existing.sent.terms, { invite: existing.invite || null }), 'resend terms');
+            existing.lastTermsSendAtMs = nowMs;
+            resent += 1;
+            process.stdout.write(
+              `${JSON.stringify({ type: 'terms_resent', trade_id: tradeId, swap_channel: swapChannel })}\n`
+            );
+          }
+          const duplicateQuoteAcceptLogTarget = existing || lock || known;
+          if (duplicateQuoteAcceptLogTarget && !duplicateQuoteAcceptLogTarget.duplicateQuoteAcceptLogged) {
+            process.stderr.write(`[maker] SKIP duplicate QUOTE_ACCEPT trade_id=${tradeId} swap_channel=${swapChannel} resent=${resent}\n`);
+            duplicateQuoteAcceptLogTarget.duplicateQuoteAcceptLogged = true;
+          }
+          return;
+        }
+
         // Build welcome + invite signed by this peer (local keypair signing).
         const issuedAt = Date.now();
         const welcome = createSignedWelcome(
@@ -1774,35 +1951,6 @@ async function main() {
           },
         });
         const swapInviteSigned = signSwapEnvelope(swapInviteUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
-        // Recovery for duplicate quote_accept while in-flight:
-        // resend invite/terms with hard throttling so taker recovery works without flooding.
-        if (isRetry) {
-          const nowMs = Date.now();
-          const resendFloorMs = Math.max(5_000, retryResendMinMs);
-          let resent = 0;
-          if (existing?.sent?.swap_invite && nowMs - Number(existing.lastInviteSendAtMs || 0) >= resendFloorMs) {
-            ensureOk(await sc.send(rfqChannel, existing.sent.swap_invite), 'resend swap_invite');
-            existing.lastInviteSendAtMs = nowMs;
-            resent += 1;
-            process.stdout.write(
-              `${JSON.stringify({ type: 'swap_invite_resent', trade_id: tradeId, rfq_id: rfqId, quote_id: quoteId, swap_channel: swapChannel })}\n`
-            );
-          }
-          if (existing?.sent?.terms && nowMs - Number(existing.lastTermsSendAtMs || 0) >= resendFloorMs) {
-            ensureOk(await sc.send(swapChannel, existing.sent.terms, { invite: existing.invite || null }), 'resend terms');
-            existing.lastTermsSendAtMs = nowMs;
-            resent += 1;
-            process.stdout.write(
-              `${JSON.stringify({ type: 'terms_resent', trade_id: tradeId, swap_channel: swapChannel })}\n`
-            );
-          }
-          if (debug) {
-            process.stderr.write(
-              `[maker] duplicate quote_accept in-flight trade_id=${tradeId} swap_channel=${swapChannel} resent=${resent}\n`
-            );
-          }
-          return;
-        }
 
         try {
           ensureOk(await sc.send(rfqChannel, swapInviteSigned), 'send swap_invite');
@@ -1897,7 +2045,7 @@ async function main() {
         }
       }
     } catch (err) {
-      if (debug) process.stderr.write(`[maker] error: ${err?.message ?? String(err)}\n`);
+      process.stderr.write(`[maker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
     }
   });
 

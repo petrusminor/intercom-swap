@@ -168,6 +168,8 @@ test('receipts store: settlement kind mismatch protection blocks cross-settlemen
       () => store.upsertTrade('tao-guard', { settlement_kind: 'solana' }),
       /settlement_kind mismatch/i
     );
+    store.upsertTrade('tao-guard', { sol_recipient: '0x1111111111111111111111111111111111111111' });
+    assert.equal(store.getTrade('tao-guard').sol_recipient, '0x1111111111111111111111111111111111111111');
 
     store.upsertTrade('sol-guard', {
       settlement_kind: 'solana',

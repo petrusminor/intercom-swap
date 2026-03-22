@@ -186,7 +186,7 @@ test('tao provider lock: emits stage callbacks and preserves broadcast callback 
   assert.equal(broadcasts[0].txId, `0x${'ab'.repeat(32)}`);
   assert.deepEqual(
     stages.map((s) => s.stage),
-    ['rpc_send', 'tx_hash', 'wait_confirm']
+    ['rpc_send', 'tx_hash', 'wait_confirm', 'confirmed']
   );
 });
 

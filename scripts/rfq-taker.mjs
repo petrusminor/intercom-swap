@@ -158,6 +158,7 @@ function asBigIntAmount(value) {
     if (!s) return null;
     return BigInt(s);
   } catch (_e) {
+    process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
     return null;
   }
 }
@@ -317,7 +318,9 @@ export function deriveInvoiceReceiptFields(invoiceBody) {
   if (!paymentHashHex && lnInvoiceBolt11) {
     try {
       paymentHashHex = normalizeHex32PatchValue(decodeBolt11(lnInvoiceBolt11).payment_hash_hex);
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
   }
   return {
     ln_invoice_bolt11: lnInvoiceBolt11,
@@ -568,8 +571,10 @@ async function main() {
     } catch (err) {
       try {
         receipts.upsertTrade(tradeId, { last_error: err?.message ?? String(err) });
-      } catch (_e) {}
-      if (debug) process.stderr.write(`[taker] receipts persist error: ${err?.message ?? String(err)}\n`);
+      } catch (_e) {
+        process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
+      process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
     }
   };
 
@@ -809,7 +814,9 @@ async function main() {
     setTimeout(() => {
       try {
         receipts?.close();
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
       sc.close();
       process.exit(0);
     }, delay);
@@ -818,7 +825,9 @@ async function main() {
   const leaveSidechannel = async (channel) => {
     try {
       await sc.leave(channel);
-    } catch (_e) {}
+    } catch (_e) {
+      process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+    }
   };
 
   const resendRfqTimer = setInterval(async () => {
@@ -828,7 +837,7 @@ async function main() {
       ensureOk(await sc.send(rfqChannel, rfqSigned), 'resend rfq');
       if (debug) process.stderr.write(`[taker] resend rfq trade_id=${tradeId}\n`);
     } catch (err) {
-      if (debug) process.stderr.write(`[taker] resend rfq error: ${err?.message ?? String(err)}\n`);
+      process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
     }
   }, Math.max(rfqResendMs, 200));
 
@@ -842,7 +851,7 @@ async function main() {
       ensureOk(await sc.send(rfqChannel, quoteAcceptSigned), 'resend quote_accept');
       if (debug) process.stderr.write(`[taker] resend quote_accept trade_id=${tradeId} quote_id=${chosen.quote_id}\n`);
     } catch (err) {
-      if (debug) process.stderr.write(`[taker] resend quote_accept error: ${err?.message ?? String(err)}\n`);
+      process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
     }
   }, Math.max(acceptResendMs, 200));
 
@@ -1002,7 +1011,9 @@ async function main() {
         if (swapCtx.done) return;
         if (swapCtx.trade.state !== STATE.INIT) return;
         await sc.send(swapChannel, readySigned, { invite });
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
     }, Math.max(swapResendMs, 200));
     swapCtx.timers.add(readyTimer);
 
@@ -1185,7 +1196,9 @@ async function main() {
         if (swapCtx.trade.state !== STATE.ACCEPTED && swapCtx.trade.state !== STATE.INIT && swapCtx.trade.state !== STATE.TERMS) return;
         if (swapCtx.trade.invoice) return;
         await sc.send(swapChannel, acceptSigned);
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
     }, Math.max(swapResendMs, 200));
     swapCtx.timers.add(acceptTimer);
 
@@ -1373,7 +1386,9 @@ async function main() {
       await leaveSidechannel(swapChannel);
       try {
         receipts?.close();
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
       sc.close();
       process.exit(0);
     }
@@ -1439,7 +1454,9 @@ async function main() {
       await new Promise((r) => setTimeout(r, 250));
       try {
         await sc.send(swapChannel, solClaimedSigned);
-      } catch (_e) {}
+      } catch (_e) {
+        process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
     }
 
     swapCtx.done = true;
@@ -1466,7 +1483,9 @@ async function main() {
         for (const waiter of swapCtx.waiters) {
           try {
             waiter(msg);
-          } catch (_e) {}
+          } catch (_e) {
+            process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+          }
         }
         return;
       }
@@ -1717,7 +1736,7 @@ async function main() {
         });
       }
     } catch (err) {
-      if (debug) process.stderr.write(`[taker] error: ${err?.message ?? String(err)}\n`);
+      process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
     }
   });
 

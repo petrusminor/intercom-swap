@@ -536,6 +536,7 @@ export class TradeReceiptsStore {
     }
     if (effectiveKind === SETTLEMENT_KIND_TAO_EVM) {
       for (const field of SOLANA_SETTLEMENT_FIELDS) {
+        if (field === 'sol_recipient') continue;
         if (hasPatchedFieldChange(existing, patch, field)) {
           throw new Error(`trade ${id}: settlement_kind=tao-evm cannot update ${field}`);
         }

@@ -366,6 +366,7 @@ export class TaoEvmSettlementProvider {
 
       await emitStage('wait_confirm', { txId, confirmations: this.confirmations });
       await tx.wait(this.confirmations);
+      await emitStage('confirmed', { txId });
     } catch (err) {
       await emitStage('error', {
         txId,

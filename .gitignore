@@ -1,5 +1,7 @@
 .nvmrc
-stores
+stores/
+*.db
+*.sqlite
 node_modules
 ui/**/node_modules
 ui/**/dist
@@ -33,3 +35,4 @@ llama.cpp/
 .venv-vllm/
 ui/**/.npm-cache/
 RUN.md
+lnd/

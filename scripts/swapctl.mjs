@@ -113,6 +113,15 @@ function parseBoolFlag(value, fallback = false) {
   return ['1', 'true', 'yes', 'on'].includes(s);
 }
 
+export function parseZeroOneFlag(value, label, fallback = false) {
+  if (value === undefined || value === null) return fallback;
+  if (value === true) throw new Error(`Invalid --${label} (expected 0 or 1)`);
+  const s = String(value).trim();
+  if (s === '1') return true;
+  if (s === '0') return false;
+  throw new Error(`Invalid --${label} (expected 0 or 1)`);
+}
+
 export function injectMissingOfferAppHashes(offers, { solanaProgramId, taoHtlcAddress } = {}) {
   if (!Array.isArray(offers)) return offers;
   return offers.map((offer, index) => {
@@ -478,7 +487,7 @@ async function main() {
       (flags.get('trade-id') && String(flags.get('trade-id')).trim()) ||
       `svc:${name.replaceAll(/\s+/g, '-').slice(0, 64)}`;
 
-    const join = parseBoolFlag(flags.get('join'), true);
+    const join = parseZeroOneFlag(flags.get('join'), 'join', true);
 
     const unsigned = createUnsignedEnvelope({
       v: 1,
@@ -522,7 +531,7 @@ async function main() {
     const tradeId = flags.get('trade-id') ? String(flags.get('trade-id')).trim() : '';
 
     const watch = parseBoolFlag(flags.get('watch'), true);
-    const join = parseBoolFlag(flags.get('join'), true);
+    const join = parseZeroOneFlag(flags.get('join'), 'join', true);
 
     const configRaw = flags.get('config');
     if (!configRaw || configRaw === true) die('svc-announce-loop requires --config');
