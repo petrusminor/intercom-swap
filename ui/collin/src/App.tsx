@@ -29,6 +29,7 @@ const LN_OPEN_TX_WEIGHT_BUFFER_VB = 600; // conservative wallet funding tx estim
 const LND_NEW_ANCHOR_RESERVE_SATS = 10_000;
 const MS_PER_HOUR = 60 * 60 * 1000;
 const SWAP_WATCH_RETENTION_MS = 2 * MS_PER_HOUR;
+const TAO_DECIMALS = 18;
 
 type LnPeerSuggestion = { id: string; addr: string; uri: string; connected: boolean };
 
@@ -417,7 +418,7 @@ function App() {
   const [scConnected, setScConnected] = useState(false);
   const [scConnecting, setScConnecting] = useState(false);
   const [scStreamErr, setScStreamErr] = useState<string | null>(null);
-  const [scChannels, setScChannels] = useState<string>('0000intercomswapbtcusdt');
+  const [scChannels, setScChannels] = useState<string>('0000intercomswapbtctao');
   const [scSwapWatchChannels, setScSwapWatchChannelsState] = useState<string[]>([]);
   const scSwapWatchFirstSeenAtRef = useRef<Map<string, number>>(new Map());
   const [scFilter, setScFilter] = useState<{ channel: string; kind: string }>({ channel: '', kind: '' });
@@ -792,7 +793,7 @@ function App() {
 
   // Sell BTC: RFQ poster (binding direction BTC_LN->USDT_SOL).
   type RfqLine = { id: string; trade_id: string; btc_sats: number; usdt_amount: string };
-  const [rfqChannel, setRfqChannel] = useState<string>('0000intercomswapbtcusdt');
+  const [rfqChannel, setRfqChannel] = useState<string>('0000intercomswapbtctao');
   const [rfqLines, setRfqLines] = useState<RfqLine[]>(() => [
     { id: `rfq-${Date.now()}-0`, trade_id: `rfq-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`, btc_sats: 10_000, usdt_amount: '1000000' }, // 1.000000 USDT
   ]);
@@ -1551,7 +1552,7 @@ function App() {
 
   useEffect(() => {
     if (!isSwapTradeChannelName(rfqChannel)) return;
-    const next = knownRendezvousChannelsForInputs[0] || rendezvousChannels[0] || '0000intercomswapbtcusdt';
+    const next = knownRendezvousChannelsForInputs[0] || rendezvousChannels[0] || '0000intercomswapbtctao';
     if (next !== rfqChannel) setRfqChannel(next);
   }, [rfqChannel, knownRendezvousChannelsForInputs, rendezvousChannels]);
 
@@ -1745,9 +1746,9 @@ function App() {
     const msg = rfqEvt?.message;
     if (!channel || !msg || typeof msg !== 'object') throw new Error('rfq event missing channel/message');
     const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
-    const tradeFeeCollector = String(solSignerPubkey || '').trim();
+    const tradeFeeCollector = String(taoAddress || '').trim();
     if (!tradeFeeCollector) {
-      throw new Error('Solana signer pubkey unavailable (cannot set trade_fee_collector)');
+      throw new Error('TAO wallet unavailable (cannot set trade_fee_collector)');
     }
 
     const nowSec = Math.floor(Date.now() / 1000);
@@ -1950,7 +1951,7 @@ function App() {
     const visibleQuoteEvents = quoteEvents.filter((e) => !shouldHideTerminalListingEvent(e));
     const visibleMyRfqPosts = myRfqPosts.filter((e) => !shouldHideTerminalListingEvent(e));
     const out: any[] = [];
-    out.push({ _t: 'header', id: 'h:inboxoffers', title: 'USDT Sales', count: visibleOfferEvents.length, open: sellBtcInboxOpen, onToggle: () => toggleSellBtcSection('offers') });
+    out.push({ _t: 'header', id: 'h:inboxoffers', title: 'TAO Sales', count: visibleOfferEvents.length, open: sellBtcInboxOpen, onToggle: () => toggleSellBtcSection('offers') });
     if (sellBtcInboxOpen) {
       for (let i = 0; i < visibleOfferEvents.length; i += 1) {
         const e = visibleOfferEvents[i];
@@ -2138,7 +2139,7 @@ function App() {
       'Swap Helpers',
       'RFQ Bots',
       'Lightning',
-      'Solana',
+      'TAO (EVM)',
       'Receipts/Recovery',
       'Other',
     ];
@@ -2228,12 +2229,8 @@ function App() {
       else reasons.push('Lightning not ready (no channels)');
     }
 
-    const solKind = String(preflight?.env?.solana?.classify?.kind || envInfo?.solana?.classify?.kind || '');
-    const okSolRpc = solKind !== 'local' || Boolean(preflight?.sol_local_status?.rpc_listening);
-    const okSolSigner = Boolean(preflight?.sol_signer?.pubkey) && !preflight?.sol_signer_error;
-    const okSolConfig = !preflight?.sol_config_error;
-    const okSol = okSolRpc && okSolSigner && okSolConfig;
-    if (okChecklist && !okSol) reasons.push('Solana not ready');
+    const okSol = Boolean(String(preflight?.tao_wallet?.address || '').trim()) && !preflight?.tao_wallet_error;
+    if (okChecklist && !okSol) reasons.push('TAO (EVM) not ready');
 
     const okReceipts = !preflight?.receipts_error;
     if (okChecklist && !okReceipts) reasons.push('receipts not ready');
@@ -2354,7 +2351,7 @@ function App() {
 	    setStackOpBusy(true);
 	    setRunErr(null);
 	    try {
-	      pushToast('info', 'Starting stack (peer + LN + Solana). This can take ~1-2 minutes...', { ttlMs: 9000 });
+	      pushToast('info', 'Starting stack (peer + LN + TAO (EVM)). This can take ~1-2 minutes...', { ttlMs: 9000 });
 	      const sidechannels = rendezvousChannels.slice(0, 50);
 
       setRunMode('tool');
@@ -2376,7 +2373,7 @@ function App() {
 	          ? String(((cj as any).trade_auto as any).error || '').trim()
 	          : '';
 	      if (lnErr || solErr || tradeAutoErr) {
-	        pushToast('error', `Stack started with issues:\n${lnErr ? `- LN: ${lnErr}\n` : ''}${solErr ? `- Solana: ${solErr}\n` : ''}${tradeAutoErr ? `- Trade worker: ${tradeAutoErr}` : ''}`.trim(), {
+	        pushToast('error', `Stack started with issues:\n${lnErr ? `- LN: ${lnErr}\n` : ''}${solErr ? `- TAO (EVM): ${solErr}\n` : ''}${tradeAutoErr ? `- Trade worker: ${tradeAutoErr}` : ''}`.trim(), {
 	          ttlMs: 12_000,
 	        });
 	      } else if (final && typeof final === 'object' && String((final as any).type || '') === 'error') {
@@ -2391,7 +2388,7 @@ function App() {
           await runToolFinal(
             'intercomswap_tradeauto_start',
             {
-              channels: channels.length > 0 ? channels : ['0000intercomswapbtcusdt'],
+              channels: channels.length > 0 ? channels : ['0000intercomswapbtctao'],
               trace_enabled: tradeAutoTraceEnabled,
               ln_liquidity_mode: 'aggregate',
               enable_quote_from_offers: true,
@@ -2459,7 +2456,7 @@ function App() {
         await runToolFinal(
           'intercomswap_tradeauto_start',
           {
-            channels: channels.length > 0 ? channels : ['0000intercomswapbtcusdt'],
+            channels: channels.length > 0 ? channels : ['0000intercomswapbtctao'],
             trace_enabled: tradeAutoTraceEnabled,
             ln_liquidity_mode: 'aggregate',
             enable_quote_from_offers: true,
@@ -2498,7 +2495,7 @@ function App() {
         await runToolFinal(
           'intercomswap_tradeauto_start',
           {
-            channels: channels.length > 0 ? channels : ['0000intercomswapbtcusdt'],
+            channels: channels.length > 0 ? channels : ['0000intercomswapbtctao'],
             trace_enabled: true,
             ln_liquidity_mode: 'aggregate',
             enable_quote_from_offers: true,
@@ -2571,7 +2568,7 @@ function App() {
     const trade_id = String(trade?.trade_id || '').trim();
     if (!trade_id) return void pushToast('error', 'Refund: missing trade_id');
     const state = String(trade?.state || '').trim();
-    const refundAfterRaw = trade?.sol_refund_after_unix;
+    const refundAfterRaw = trade?.tao_refund_after_unix ?? trade?.sol_refund_after_unix;
     const refundAfter =
       typeof refundAfterRaw === 'number'
         ? refundAfterRaw
@@ -2681,15 +2678,15 @@ function App() {
   async function ensureSolLocalValidator() {
     const solKind = String(envInfo?.solana?.classify?.kind || '');
     if (solKind !== 'local') {
-      pushToast('error', 'Local Solana bootstrap is only available when solana.rpc_url is localhost.');
+      pushToast('error', 'Local TAO bootstrap is only available when the settlement rpc_url is localhost.');
       return;
     }
     if (runBusy || stackOpBusy) return;
     const ok =
       autoApprove ||
-      window.confirm('Start local Solana validator now?\n\nThis will load the escrow program into solana-test-validator.');
+      window.confirm('Start local TAO validator now?\n\nThis will load the settlement program into the local validator.');
     if (!ok) return;
-    pushToast('info', 'Starting local Solana validator...', { ttlMs: 9000 });
+    pushToast('info', 'Starting local TAO validator...', { ttlMs: 9000 });
     const final = await runPromptStream({
       prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_sol_local_start', arguments: {} }),
       session_id: sessionId,
@@ -2697,9 +2694,9 @@ function App() {
       dry_run: false,
     });
     if (final && typeof final === 'object' && String((final as any).type || '') === 'error') {
-      pushToast('error', String((final as any).error || 'Solana local start failed'));
+      pushToast('error', String((final as any).error || 'TAO local start failed'));
     } else {
-      pushToast('success', 'Solana local validator ready');
+      pushToast('success', 'TAO local validator ready');
     }
     void refreshPreflight();
   }
@@ -2816,27 +2813,9 @@ function App() {
     const usdtAvailableAtomic =
       typeof usdtAvailableOverrideAtomic === 'bigint'
         ? usdtAvailableOverrideAtomic
-        : parseAtomicBigInt(walletUsdtAtomic) ?? parseAtomicBigInt((preflight as any)?.sol_usdt?.amount);
+        : parseAtomicBigInt(walletUsdtAtomic);
     if (usdtAvailableAtomic === null) {
-      pushToast('error', `${actionLabel}: USDT wallet balance unavailable (refresh status first)`);
-      return false;
-    }
-
-    const lamportsRaw = (preflight as any)?.sol_balance;
-    const lamportsNum =
-      typeof lamportsRaw === 'number'
-        ? lamportsRaw
-        : typeof lamportsRaw === 'string' && /^[0-9]+$/.test(lamportsRaw.trim())
-          ? Number.parseInt(lamportsRaw.trim(), 10)
-          : typeof (solBalance as any)?.lamports === 'number'
-            ? Number((solBalance as any).lamports)
-            : null;
-    if (!Number.isFinite(lamportsNum as any) || Number(lamportsNum) < SOL_TX_FEE_BUFFER_LAMPORTS) {
-      pushToast(
-        'error',
-        `${actionLabel}: low SOL for transaction fees (need at least ${SOL_TX_FEE_BUFFER_LAMPORTS} lamports buffer)`
-      );
-      return false;
+      return true;
     }
 
     const bps = Number.isFinite(maxTotalFeeBps) ? Math.max(0, Math.min(1500, Math.trunc(maxTotalFeeBps))) : 0;
@@ -2848,7 +2827,7 @@ function App() {
       if (required > usdtAvailableAtomic) {
         pushToast(
           'error',
-          `${actionLabel}: line ${i + 1} exceeds USDT balance (need ${required.toString()} incl. fees, have ${usdtAvailableAtomic.toString()})`
+          `${actionLabel}: line ${i + 1} exceeds TAO balance (need ${required.toString()} incl. fees, have ${usdtAvailableAtomic.toString()})`
         );
         return false;
       }
@@ -2895,35 +2874,9 @@ function App() {
     if (needUsdt) {
       tasks.push(
         (async () => {
-          const owner = String(solSignerPubkey || '').trim();
-          const mint = String(walletUsdtMint || '').trim();
-          if (!owner || !mint) return;
-          try {
-            const bal = await runDirectToolOnce(
-              'intercomswap_sol_token_balance',
-              { owner, mint },
-              { auto_approve: false }
-            );
-            const amountAtomic = parseAtomicBigInt((bal as any)?.amount);
-            if (amountAtomic === null) return;
-            const ata = String((bal as any)?.ata || '').trim() || null;
-            out.usdtAvailableAtomic = amountAtomic;
-            setWalletUsdtAta(ata);
-            setWalletUsdtAtomic(amountAtomic.toString());
-            setWalletUsdtErr(null);
-            setPreflight((prev: any) =>
-              prev && typeof prev === 'object'
-                ? {
-                    ...prev,
-                    sol_usdt: {
-                      ...(prev?.sol_usdt && typeof prev.sol_usdt === 'object' ? prev.sol_usdt : {}),
-                      ata,
-                      amount: amountAtomic.toString(),
-                    },
-                  }
-                : prev
-            );
-          } catch (_e) {}
+          const amountAtomic = parseAtomicBigInt(walletUsdtAtomic);
+          if (amountAtomic === null) return;
+          out.usdtAvailableAtomic = amountAtomic;
         })()
       );
     }
@@ -2943,9 +2896,9 @@ function App() {
         ? body.rfq_channels.map((c: any) => String(c || '').trim()).filter(Boolean)
         : [];
       const channelRaw =
-        rfqChans[0] || String(offerEvt?.channel || '').trim() || rendezvousChannels[0] || '0000intercomswapbtcusdt';
+        rfqChans[0] || String(offerEvt?.channel || '').trim() || rendezvousChannels[0] || '0000intercomswapbtctao';
       const channel = isSwapTradeChannelName(channelRaw)
-        ? (rendezvousChannels[0] || '0000intercomswapbtcusdt')
+        ? (rendezvousChannels[0] || '0000intercomswapbtctao')
         : channelRaw;
 
       // Adopt all offer lines (max 20). Each RFQ line has its own trade_id so multiple can run in parallel.
@@ -2955,7 +2908,7 @@ function App() {
         const o = offers[i] && typeof offers[i] === 'object' ? offers[i] : null;
         if (!o) continue;
         const btcSats = Number((o as any)?.btc_sats);
-        const usdtAmount = String((o as any)?.usdt_amount || '').trim();
+        const usdtAmount = getDisplayTaoAtomic(o);
         if (!Number.isInteger(btcSats) || btcSats < 1) continue;
         if (!/^[0-9]+$/.test(usdtAmount)) continue;
         adoptedLines.push({
@@ -2965,7 +2918,7 @@ function App() {
           usdt_amount: usdtAmount,
         });
       }
-      if (adoptedLines.length < 1) throw new Error('Offer has no valid lines (btc_sats/usdt_amount)');
+      if (adoptedLines.length < 1) throw new Error('Offer has no valid lines (btc_sats/tao_amount_atomic)');
 
       const o0 = offers[0] && typeof offers[0] === 'object' ? offers[0] : null;
       const maxTrade = Number((o0 as any)?.max_trade_fee_bps);
@@ -3050,7 +3003,7 @@ function App() {
       const btc = Number((l as any)?.btc_sats);
       const usdt = String((l as any)?.usdt_amount || '').trim();
       if (!Number.isInteger(btc) || btc < 1) return void pushToast('error', `Offer line ${i + 1}: BTC must be >= 1 sat`);
-      if (!/^[0-9]+$/.test(usdt)) return void pushToast('error', `Offer line ${i + 1}: USDT must be a base-unit integer`);
+      if (!/^[0-9]+$/.test(usdt)) return void pushToast('error', `Offer line ${i + 1}: TAO must be a base-unit integer`);
     }
     const offerActionLabel = offerRunAsBot ? 'Start offer bot' : 'Post offer';
     const freshSnapshot = await fetchFreshTradeGuardrailSnapshot({ needLn: true, needUsdt: true });
@@ -3070,21 +3023,21 @@ function App() {
 	      return void pushToast('error', 'Fee caps invalid: total must be >= platform + trade');
 	    }
     if (offerMinSolRefundWindowSec > offerMaxSolRefundWindowSec) {
-      return void pushToast('error', 'Solana refund window invalid: min must be <= max');
+      return void pushToast('error', 'Refund window invalid: min must be <= max');
     }
     if (
       !Number.isInteger(offerMinSolRefundWindowSec) ||
       offerMinSolRefundWindowSec < SOL_REFUND_MIN_SEC ||
       offerMinSolRefundWindowSec > SOL_REFUND_MAX_SEC
     ) {
-      return void pushToast('error', `Solana refund window invalid: min must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
+      return void pushToast('error', `Refund window invalid: min must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
     }
     if (
       !Number.isInteger(offerMaxSolRefundWindowSec) ||
       offerMaxSolRefundWindowSec < SOL_REFUND_MIN_SEC ||
       offerMaxSolRefundWindowSec > SOL_REFUND_MAX_SEC
     ) {
-      return void pushToast('error', `Solana refund window invalid: max must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
+      return void pushToast('error', `Refund window invalid: max must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
     }
     const nowSec = Math.floor(Date.now() / 1000);
     if (!Number.isInteger(offerValidUntilUnix) || offerValidUntilUnix <= nowSec) {
@@ -3103,7 +3056,7 @@ function App() {
 	    if (toolRequiresApproval('intercomswap_offer_post') && !autoApprove) {
 	      const first = lines[0];
 	      const ok = window.confirm(
-	        `Post offer now?\n\nchannels: ${channels.join(', ')}\nlines: ${lines.length}\nline1 BTC: ${first?.btc_sats} sats\nline1 USDT: ${first?.usdt_amount}`
+	        `Post offer now?\n\nchannels: ${channels.join(', ')}\nlines: ${lines.length}\nline1 BTC: ${first?.btc_sats} sats\nline1 TAO atomic: ${first?.usdt_amount}`
 	      );
 	      if (!ok) return;
 	    }
@@ -3115,11 +3068,11 @@ function App() {
 	        name: autoName,
 	        rfq_channels: channels,
 	        offers: lines.map((l) => ({
-	          pair: 'BTC_LN/USDT_SOL',
-	          have: 'USDT_SOL',
+	          pair: 'BTC_LN/TAO_EVM',
+	          have: 'TAO_EVM',
 	          want: 'BTC_LN',
 	          btc_sats: Number((l as any)?.btc_sats) || 0,
-	          usdt_amount: String((l as any)?.usdt_amount || ''),
+	          tao_amount_atomic: String((l as any)?.usdt_amount || ''),
 	          max_platform_fee_bps: offerMaxPlatformFeeBps,
 	          max_trade_fee_bps: offerMaxTradeFeeBps,
 	          max_total_fee_bps: offerMaxTotalFeeBps,
@@ -3188,8 +3141,8 @@ function App() {
 
     const channel = rfqChannel.trim() || rendezvousChannels[0] || '';
     if (!channel) return void pushToast('error', 'RFQ channel is required');
-    const solRecipient = String(solSignerPubkey || '').trim();
-    if (!solRecipient) return void pushToast('error', 'Solana signer pubkey unavailable (cannot set RFQ sol_recipient)');
+    const solRecipient = String(taoAddress || '').trim();
+    if (!solRecipient) return void pushToast('error', 'TAO wallet unavailable (cannot set RFQ recipient)');
 
     const lines = Array.isArray(rfqLines) ? rfqLines : [];
     if (lines.length < 1) return void pushToast('error', 'RFQ must include at least 1 line');
@@ -3202,37 +3155,31 @@ function App() {
       const btc = Number((l as any)?.btc_sats);
       const usdt = String((l as any)?.usdt_amount || '').trim();
       if (!Number.isInteger(btc) || btc < 1) return void pushToast('error', `RFQ line ${i + 1}: BTC must be >= 1 sat`);
-      if (!/^[0-9]+$/.test(usdt)) return void pushToast('error', `RFQ line ${i + 1}: USDT must be a base-unit integer`);
+      if (!/^[0-9]+$/.test(usdt)) return void pushToast('error', `RFQ line ${i + 1}: TAO must be a base-unit integer`);
     }
     const rfqActionLabel = rfqRunAsBot ? 'Start RFQ bot' : 'Post RFQ';
     const freshSnapshot = await fetchFreshTradeGuardrailSnapshot({ needLn: true, needUsdt: false });
     if (!ensureLnLiquidityForLines({ role: 'send', lines, actionLabel: rfqActionLabel, lnSummaryOverride: freshSnapshot.lnSummary })) return;
-    if (!Number.isFinite(solLamportsAvailable as any) || Number(solLamportsAvailable) < SOL_TX_FEE_BUFFER_LAMPORTS) {
-      return void pushToast(
-        'error',
-        `Post RFQ: low SOL for claim/refund transactions (need at least ${SOL_TX_FEE_BUFFER_LAMPORTS} lamports buffer)`
-      );
-    }
 
     if (rfqMaxPlatformFeeBps + rfqMaxTradeFeeBps > rfqMaxTotalFeeBps) {
       return void pushToast('error', 'Fee caps invalid: total must be >= platform + trade');
     }
     if (rfqMinSolRefundWindowSec > rfqMaxSolRefundWindowSec) {
-      return void pushToast('error', 'Solana refund window invalid: min must be <= max');
+      return void pushToast('error', 'Refund window invalid: min must be <= max');
     }
     if (
       !Number.isInteger(rfqMinSolRefundWindowSec) ||
       rfqMinSolRefundWindowSec < SOL_REFUND_MIN_SEC ||
       rfqMinSolRefundWindowSec > SOL_REFUND_MAX_SEC
     ) {
-      return void pushToast('error', `Solana refund window invalid: min must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
+      return void pushToast('error', `Refund window invalid: min must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
     }
     if (
       !Number.isInteger(rfqMaxSolRefundWindowSec) ||
       rfqMaxSolRefundWindowSec < SOL_REFUND_MIN_SEC ||
       rfqMaxSolRefundWindowSec > SOL_REFUND_MAX_SEC
     ) {
-      return void pushToast('error', `Solana refund window invalid: max must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
+      return void pushToast('error', `Refund window invalid: max must be ${SOL_REFUND_MIN_SEC}s..${SOL_REFUND_MAX_SEC}s`);
     }
     const nowSec = Math.floor(Date.now() / 1000);
     if (!Number.isInteger(rfqValidUntilUnix) || rfqValidUntilUnix <= nowSec) {
@@ -3242,7 +3189,7 @@ function App() {
     if (toolRequiresApproval('intercomswap_rfq_post') && !autoApprove) {
       const first = lines[0];
       const ok = window.confirm(
-        `Post ${lines.length} RFQ${lines.length === 1 ? '' : 's'} now?\n\nchannel: ${channel}\nfirst.trade_id: ${String(first?.trade_id || '')}\nfirst.BTC: ${Number(first?.btc_sats || 0)} sats\nfirst.USDT: ${String(first?.usdt_amount || '')}`
+        `Post ${lines.length} RFQ${lines.length === 1 ? '' : 's'} now?\n\nchannel: ${channel}\nfirst.trade_id: ${String(first?.trade_id || '')}\nfirst.BTC: ${Number(first?.btc_sats || 0)} sats\nfirst.TAO atomic: ${String(first?.usdt_amount || '')}`
       );
       if (!ok) return;
     }
@@ -3268,7 +3215,7 @@ function App() {
             ...baseArgs,
             trade_id: String(l.trade_id),
             btc_sats: Number(l.btc_sats),
-            usdt_amount: String(l.usdt_amount),
+            tao_amount_atomic: String(l.usdt_amount),
             valid_until_unix: rfqValidUntilUnix,
             ln_liquidity_mode: lnLiquidityMode,
           };
@@ -3305,7 +3252,7 @@ function App() {
             ...baseArgs,
             trade_id,
             btc_sats: Number(l.btc_sats),
-            usdt_amount: String(l.usdt_amount),
+            tao_amount_atomic: String(l.usdt_amount),
             ln_liquidity_mode: lnLiquidityMode,
           };
 
@@ -3726,7 +3673,7 @@ function App() {
         return { ok: false, ts: null, btc_usd: null, btc_usdt: null, usdt_usd: null, error: 'unexpected_snapshot_type' };
       }
       const pairs = (snapshot as any).pairs && typeof (snapshot as any).pairs === 'object' ? (snapshot as any).pairs : {};
-      const btc = pairs?.BTC_USDT && typeof pairs.BTC_USDT === 'object' ? pairs.BTC_USDT : null;
+      const btc = pairs?.BTC_TAO && typeof pairs.BTC_TAO === 'object' ? pairs.BTC_TAO : null;
       const usdt = pairs?.USDT_USD && typeof pairs.USDT_USD === 'object' ? pairs.USDT_USD : null;
       const btcUsdt = typeof btc?.median === 'number' && Number.isFinite(btc.median) ? btc.median : null;
       const usdtUsd = typeof usdt?.median === 'number' && Number.isFinite(usdt.median) ? usdt.median : 1;
@@ -3834,32 +3781,16 @@ function App() {
 	        out.sol_local_status_error = e?.message || String(e);
 	      }
 	    }
-	    try {
-	      out.sol_signer = await runDirectToolOnce('intercomswap_sol_signer_pubkey', {}, { auto_approve: false });
-	    } catch (e: any) {
-	      out.sol_signer_error = e?.message || String(e);
-	    }
     try {
-      const signerPk = String(out?.sol_signer?.pubkey || '').trim();
-      if (signerPk) {
-        out.sol_balance = await runDirectToolOnce('intercomswap_sol_balance', { pubkey: signerPk }, { auto_approve: false });
-        const mint = String(walletUsdtMint || '').trim();
-        if (mint) {
-          out.sol_usdt = await runDirectToolOnce(
-            'intercomswap_sol_token_balance',
-            { owner: signerPk, mint },
-            { auto_approve: false }
-          );
-        }
-      }
+      out.tao_wallet = await runDirectToolOnce('intercomswap_tao_wallet_info', {}, { auto_approve: false });
     } catch (e: any) {
-      out.sol_balance_error = e?.message || String(e);
+      out.tao_wallet_error = e?.message || String(e);
     }
 	    try {
 	      const solLocalUp = solKind !== 'local' || Boolean(out?.sol_local_status?.rpc_listening);
 	      if (!solLocalUp) {
 	        const rpc = String(Array.isArray(out?.env?.solana?.rpc_urls) ? out.env.solana.rpc_urls[0] : 'http://127.0.0.1:8899');
-	        out.sol_config_error = `Solana RPC is down (${rpc}). Start local validator first.`;
+	        out.sol_config_error = `TAO RPC is down (${rpc}). Start local validator first.`;
 	      } else {
 	        out.sol_config = await runDirectToolOnce('intercomswap_sol_config_get', {}, { auto_approve: false });
 	      }
@@ -4843,7 +4774,7 @@ function App() {
   const lnAlias = lnInfoObj ? String((lnInfoObj as any).alias || '').trim() : '';
   const lnNodeId = lnInfoObj ? String((lnInfoObj as any).id || (lnInfoObj as any).identity_pubkey || '').trim() : '';
   const lnNodeIdShort = lnNodeId ? `${lnNodeId.slice(0, 16)}…` : '';
-	  const solSignerPubkey = String(preflight?.sol_signer?.pubkey || '').trim();
+  const taoAddress = String(preflight?.tao_wallet?.address || '').trim();
   const lnChannelCount = Number(preflight?.ln_summary?.channels || 0);
   const lnActiveChannelCount = Number(preflight?.ln_summary?.channels_active || 0);
   const lnChannelRows = Array.isArray(preflight?.ln_summary?.channel_rows) ? preflight.ln_summary.channel_rows : [];
@@ -4878,15 +4809,10 @@ function App() {
       ? (preflight as any).ln_summary.wallet_reserved_anchor_sats
       : null;
   const solLamportsAvailable =
-    typeof (preflight as any)?.sol_balance === 'number'
-      ? Number((preflight as any).sol_balance)
-      : typeof (preflight as any)?.sol_balance === 'string' && /^[0-9]+$/.test(String((preflight as any).sol_balance).trim())
-        ? Number.parseInt(String((preflight as any).sol_balance).trim(), 10)
-        : typeof (solBalance as any)?.lamports === 'number'
-          ? Number((solBalance as any).lamports)
-          : null;
+    typeof (solBalance as any)?.lamports === 'number'
+      ? Number((solBalance as any).lamports)
+      : null;
   const usdtBalanceAtomic =
-    String((preflight as any)?.sol_usdt?.amount || '').trim() ||
     String(walletUsdtAtomic || '').trim() ||
     '';
   const lnImpl = String((preflight as any)?.env?.ln?.impl || (preflight as any)?.ln_info?.implementation || envInfo?.ln?.impl || '').trim().toLowerCase();
@@ -5043,7 +4969,7 @@ function App() {
 	            className={`btn ${stackAnyRunning ? 'danger' : 'primary'}`}
 	            onClick={stackAnyRunning ? stackStop : stackStart}
 	            disabled={!health?.ok || stackOpBusy}
-	            title={stackAnyRunning ? 'Stop peer + LN + Solana (local)' : 'Start peer + LN + Solana (bootstrap)'}
+	            title={stackAnyRunning ? 'Stop peer + LN + TAO (EVM) (local)' : 'Start peer + LN + TAO (EVM) (bootstrap)'}
 	          >
 	            {stackOpBusy ? 'Busy…' : stackAnyRunning ? 'STOP' : 'START'}
 	          </button>
@@ -5090,7 +5016,7 @@ function App() {
                 <div className="alert">
                   {!stackAnyRunning ? (
                     <>
-                      <b>Setup required.</b> Click <b>START</b> in the header to bootstrap peer + sidechannels + Lightning + Solana + receipts.
+                      <b>Setup required.</b> Click <b>START</b> in the header to bootstrap peer + sidechannels + Lightning + TAO (EVM) + receipts.
                     </>
                   ) : (
                     <>
@@ -5155,12 +5081,12 @@ function App() {
                   ) : null}
                   {needSolLocalStart ? (
                     <button className="btn primary" onClick={ensureSolLocalValidator} disabled={runBusy || stackOpBusy}>
-                      Start Solana local
+                      Start TAO local
                     </button>
                   ) : null}
                   {!solConfigOk && solKind === 'local' && solLocalUp ? (
                     <button className="btn" onClick={() => void refreshPreflight()} disabled={preflightBusy}>
-                      Retry Solana config
+                      Retry TAO config
                     </button>
                   ) : null}
                 </div>
@@ -5174,7 +5100,7 @@ function App() {
                   className="input mono"
                   value={scChannels}
                   onChange={(e) => setRendezvousChannelsFromInput(e.target.value)}
-                  placeholder="0000intercomswapbtcusdt"
+                  placeholder="0000intercomswapbtctao"
                 />
               </div>
 
@@ -5215,29 +5141,24 @@ function App() {
 	                ) : null}
 
                 <div className="row">
-                  <span className="tag">SOL</span>
-                  <input className="input mono" value={solSignerPubkey || ''} readOnly placeholder="sol signer pubkey…" />
-                  <button className="btn" disabled={!solSignerPubkey} onClick={() => copyToClipboard('solana pubkey', solSignerPubkey)}>
+                  <span className="tag">TAO</span>
+                  <input className="input mono" value={taoAddress || ''} readOnly placeholder="tao wallet address…" />
+                  <button className="btn" disabled={!taoAddress} onClick={() => copyToClipboard('tao wallet', taoAddress)}>
                     Copy
                   </button>
                   <button
                     className="btn"
-                    disabled={runBusy || !solSignerPubkey}
-                    onClick={async () => {
-                      try {
-                        const lamports = await runDirectToolOnce('intercomswap_sol_balance', { pubkey: solSignerPubkey }, { auto_approve: false });
-                        setSolBalance(lamports);
-                        setSolBalanceErr(null);
-                      } catch (e: any) {
-                        setSolBalanceErr(e?.message || String(e));
-                      }
+                    disabled={runBusy}
+                    onClick={() => {
+                      setSolBalance(null);
+                      setSolBalanceErr('TAO gas balance lookup unavailable in UI');
                     }}
                   >
-                    Refresh SOL
+                    Clear TAO gas snapshot
                   </button>
                   {solBalance !== null && solBalance !== undefined ? (
                     <span className="chip">
-                      {lamportsToSolDisplay(solBalance)} SOL ({String(solBalance)} lamports)
+                      {lamportsToSolDisplay(solBalance)} TAO ({String(solBalance)} base units)
                     </span>
                   ) : null}
                 </div>
@@ -5578,7 +5499,7 @@ function App() {
                   className="input mono"
                   value={scChannels}
                   onChange={(e) => setRendezvousChannelsFromInput(e.target.value)}
-                  placeholder="0000intercomswapbtcusdt"
+                  placeholder="0000intercomswapbtctao"
                 />
                 <div className="muted small">Offers are broadcast here. BTC sellers post matching RFQs into the same channels.</div>
               </div>
@@ -5587,8 +5508,8 @@ function App() {
                 <div className="muted small">
                   wallet snapshot:{' '}
                   LN inbound(single) <span className="mono">{typeof lnMaxInboundSats === 'number' ? `${lnMaxInboundSats} sats` : '—'}</span>
-                  {' · '}USDT <span className="mono">{usdtBalanceAtomic || '—'}</span> atomic
-                  {' · '}SOL <span className="mono">{Number.isFinite(solLamportsAvailable as any) ? `${solLamportsAvailable} lamports` : '—'}</span>
+                  {' · '}TAO <span className="mono">{usdtBalanceAtomic || '—'}</span> atomic
+                  {' · '}TAO gas <span className="mono">{Number.isFinite(solLamportsAvailable as any) ? `${solLamportsAvailable} base units` : '—'}</span>
                 </div>
               </div>
 
@@ -5628,10 +5549,10 @@ function App() {
 	                        </div>
 	                        <div className="field">
 	                          <div className="field-hd">
-	                            <span className="mono">Pay USDT (Solana)</span>
+	                            <span className="mono">Send TAO</span>
 	                          </div>
 	                          <UsdtAtomicField
-	                            decimals={6}
+	                            decimals={TAO_DECIMALS}
 	                            atomic={l.usdt_amount}
 	                            onAtomic={(a) =>
 	                              setOfferLines((prev) =>
@@ -5646,7 +5567,7 @@ function App() {
 		                        const btcSats = Number(l.btc_sats);
 		                        const usdtAtomic = String(l.usdt_amount || '').trim();
 		                        const btcBtc = Number.isFinite(btcSats) ? btcSats / 1e8 : null;
-		                        const usdt = usdtAtomic ? atomicToNumber(usdtAtomic, 6) : null;
+		                        const usdt = usdtAtomic ? atomicToNumber(usdtAtomic, TAO_DECIMALS) : null;
 		                        const implied = btcBtc && btcBtc > 0 && usdt !== null ? usdt / btcBtc : null;
 		                        const btcUsd = btcBtc !== null && oracle.btc_usd ? btcBtc * oracle.btc_usd : null;
 		                        const usdtUsd = usdt !== null && oracle.usdt_usd ? usdt * oracle.usdt_usd : null;
@@ -5662,7 +5583,7 @@ function App() {
 		                          <div className="muted small" style={{ marginTop: 6 }}>
 		                            {typeof implied === 'number' && Number.isFinite(implied) ? (
 		                              <span>
-		                                implied: <span className="mono">{implied.toFixed(2)}</span> USDT/BTC
+		                                implied: <span className="mono">{implied.toFixed(6)}</span> TAO/BTC
 		                              </span>
 		                            ) : null}
 		                            {btcUsd !== null ? (
@@ -5674,7 +5595,7 @@ function App() {
 		                            {usdtUsd !== null ? (
 		                              <span>
 		                                {(implied !== null || btcUsd !== null) ? ' · ' : ''}
-		                                USDT value: <span className="mono">{fmtUsd(usdtUsd)}</span>
+		                                TAO reference value: <span className="mono">{fmtUsd(usdtUsd)}</span>
 		                              </span>
 		                            ) : null}
                             {usdtNeedWithFees !== null ? (
@@ -5685,13 +5606,13 @@ function App() {
                                   {usdtNeedWithFees.toString()}
                                 </span>{' '}
                                 /{' '}
-                                <span className="mono">{usdtHave !== null ? usdtHave.toString() : '—'}</span> atomic USDT
+                                <span className="mono">{usdtHave !== null ? usdtHave.toString() : '—'}</span> atomic TAO
                               </span>
                             ) : null}
                             {solOk !== null ? (
                               <span>
                                 {(implied !== null || btcUsd !== null || usdtUsd !== null || usdtNeedWithFees !== null) ? ' · ' : ''}
-                                SOL fee buffer:{' '}
+                                TAO gas buffer:{' '}
                                 <span className="mono" style={solOk ? undefined : { color: 'var(--bad)' }}>
                                   {solOk ? 'ok' : 'low'}
                                 </span>
@@ -5751,12 +5672,12 @@ function App() {
                     onBps={(n) => setOfferMaxTotalFeeBps(n ?? 0)}
                   />
                 </div>
-                <div className="muted small">platform fee comes from the Solana program config (not negotiated). total must be &gt;= platform + trade.</div>
+                <div className="muted small">platform fee comes from the settlement config (not negotiated). total must be &gt;= platform + trade.</div>
               </div>
 
               <div className="field">
                 <div className="field-hd">
-                  <span className="mono">Solana Refund Window (Bounds)</span>
+                  <span className="mono">Refund Window (Bounds)</span>
                 </div>
                 <div className="gridform">
                   <div>
@@ -5915,7 +5836,7 @@ function App() {
                                 .map((o: any, i: number) => ({
                                   id: `loaded-${Date.now()}-${i}`,
                                   btc_sats: Number(o?.btc_sats) || 0,
-                                  usdt_amount: String(o?.usdt_amount || '').trim(),
+                                  usdt_amount: getDisplayTaoAtomic(o),
                                 }))
                                 .filter((x: any) => Number.isInteger(x.btc_sats) && x.btc_sats >= 0 && /^[0-9]+$/.test(x.usdt_amount || ''));
                               if (lines.length > 0) setOfferLines(lines.slice(0, 20));
@@ -6037,7 +5958,7 @@ function App() {
                       </option>
                     ))
                   ) : (
-                    <option value={rendezvousChannels[0] || '0000intercomswapbtcusdt'}>default</option>
+                    <option value={rendezvousChannels[0] || '0000intercomswapbtctao'}>default</option>
                   )}
                 </select>
               </div>
@@ -6047,9 +5968,9 @@ function App() {
                   wallet snapshot:{' '}
                   LN send(single) <span className="mono">{typeof lnMaxOutboundSats === 'number' ? `${lnMaxOutboundSats} sats` : '—'}</span>
                   {' · '}LN send(total) <span className="mono">{typeof lnTotalOutboundSats === 'number' ? `${lnTotalOutboundSats} sats` : '—'}</span>
-                  {' · '}USDT <span className="mono">{usdtBalanceAtomic || '—'}</span> atomic
-                  {' · '}SOL <span className="mono">{Number.isFinite(solLamportsAvailable as any) ? `${solLamportsAvailable} lamports` : '—'}</span>
-                  {' · '}sol_recipient <span className="mono">{solSignerPubkey || '—'}</span>
+                  {' · '}TAO <span className="mono">{usdtBalanceAtomic || '—'}</span> atomic
+                  {' · '}TAO gas <span className="mono">{Number.isFinite(solLamportsAvailable as any) ? `${solLamportsAvailable} base units` : '—'}</span>
+                  {' · '}recipient <span className="mono">{taoAddress || '—'}</span>
                 </div>
               </div>
 
@@ -6092,10 +6013,10 @@ function App() {
                         </div>
                         <div className="field">
                           <div className="field-hd">
-                            <span className="mono">Receive USDT (Solana)</span>
+                            <span className="mono">Receive TAO</span>
                           </div>
                           <UsdtAtomicField
-                            decimals={6}
+                            decimals={TAO_DECIMALS}
                             atomic={l.usdt_amount}
                             onAtomic={(a) =>
                               setRfqLines((prev) =>
@@ -6110,7 +6031,7 @@ function App() {
                         const btcSats = Number(l.btc_sats);
                         const usdtAtomic = String(l.usdt_amount || '').trim();
                         const btcBtc = Number.isFinite(btcSats) ? btcSats / 1e8 : null;
-                        const usdt = usdtAtomic ? atomicToNumber(usdtAtomic, 6) : null;
+                        const usdt = usdtAtomic ? atomicToNumber(usdtAtomic, TAO_DECIMALS) : null;
                         const implied = btcBtc && btcBtc > 0 && usdt !== null ? usdt / btcBtc : null;
                         const btcUsd = btcBtc !== null && oracle.btc_usd ? btcBtc * oracle.btc_usd : null;
                         const usdtUsd = usdt !== null && oracle.usdt_usd ? usdt * oracle.usdt_usd : null;
@@ -6129,7 +6050,7 @@ function App() {
                           <div className="muted small" style={{ marginTop: 6 }}>
                             {typeof implied === 'number' && Number.isFinite(implied) ? (
                               <span>
-                                implied: <span className="mono">{implied.toFixed(2)}</span> USDT/BTC
+                                implied: <span className="mono">{implied.toFixed(6)}</span> TAO/BTC
                               </span>
                             ) : null}
                             {btcUsd !== null ? (
@@ -6141,7 +6062,7 @@ function App() {
                             {usdtUsd !== null ? (
                               <span>
                                 {(implied !== null || btcUsd !== null) ? ' · ' : ''}
-                                USDT value: <span className="mono">{fmtUsd(usdtUsd)}</span>
+                                TAO reference value: <span className="mono">{fmtUsd(usdtUsd)}</span>
                               </span>
                             ) : null}
                             {btcNeed !== null ? (
@@ -6157,11 +6078,11 @@ function App() {
                             ) : null}
                             <span>
                               {(implied !== null || btcUsd !== null || usdtUsd !== null || btcNeed !== null) ? ' · ' : ''}
-                              USDT wallet: <span className="mono">{usdtHave !== null ? usdtHave.toString() : '—'}</span> atomic
+                              TAO wallet: <span className="mono">{usdtHave !== null ? usdtHave.toString() : '—'}</span> atomic
                             </span>
                             {solOk !== null ? (
                               <span>
-                                {' · '}SOL fee buffer:{' '}
+                                {' · '}TAO gas buffer:{' '}
                                 <span className="mono" style={solOk ? undefined : { color: 'var(--bad)' }}>
                                   {solOk ? 'ok' : 'low'}
                                 </span>
@@ -6223,12 +6144,12 @@ function App() {
                     onBps={(n) => setRfqMaxTotalFeeBps(n ?? 0)}
                   />
                 </div>
-                <div className="muted small">platform fee comes from the Solana program config (not negotiated). total must be &gt;= platform + trade.</div>
+                <div className="muted small">platform fee comes from the settlement config (not negotiated). total must be &gt;= platform + trade.</div>
               </div>
 
               <div className="field">
                 <div className="field-hd">
-                  <span className="mono">Solana Refund Window (Bounds)</span>
+                  <span className="mono">Refund Window (Bounds)</span>
                 </div>
                 <div className="gridform">
                   <div>
@@ -6384,7 +6305,7 @@ function App() {
                               const tradeIdRaw = typeof a?.trade_id === 'string' ? a.trade_id.trim() : '';
                               const trade_id = tradeIdRaw || `rfq-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
                               const btc_sats = typeof a?.btc_sats === 'number' ? a.btc_sats : 10_000;
-                              const usdt_amount = typeof a?.usdt_amount === 'string' ? a.usdt_amount : '1000000';
+                              const usdt_amount = getDisplayTaoAtomic(a) || '1000000';
                               setRfqLines([
                                 {
                                   id: `loaded-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -6870,7 +6791,7 @@ function App() {
                   <div className="muted small">
                     trade_id: <span className="mono">{String(selected?.trade?.trade_id || '')}</span>
                   </div>
-                  <pre className="code">{JSON.stringify(selected?.trade || {}, null, 2)}</pre>
+                  <pre className="code">{JSON.stringify(sanitizeTradeForDisplay(selected?.trade || {}), null, 2)}</pre>
                   <div className="row">
                     <button
                       className="btn"
@@ -7989,7 +7910,7 @@ function App() {
               </div>
             </Panel>
 
-	            <Panel title="Solana">
+		            <Panel title="TAO (EVM)">
 	              <div className="muted small">
 	                rpc: <span className="mono">{String(Array.isArray(envInfo?.solana?.rpc_urls) ? envInfo.solana.rpc_urls[0] : '—')}</span>
 	              </div>
@@ -7999,7 +7920,7 @@ function App() {
 	                  <span className="mono">Tx Fees (Priority)</span>
 	                </div>
 	                <div className="muted small">
-	                  Optional. Used for Solana transactions started from Collin (transfers, claims/refunds). Set to <span className="mono">0</span> to use defaults.
+		                  Optional. Used for settlement transactions started from Collin (transfers, claims/refunds). Set to <span className="mono">0</span> to use defaults.
 	                </div>
 	                <div className="gridform" style={{ marginTop: 8 }}>
 	                  <div className="field">
@@ -8023,7 +7944,7 @@ function App() {
 	                  <div className="field">
 	                    <div className="field-hd">
 	                      <span className="mono">CU price</span>
-	                      <span className="muted small">micro-lamports/CU</span>
+		                      <span className="muted small">priority fee/CU</span>
 	                    </div>
 	                    <input
 	                      className="input mono"
@@ -8043,65 +7964,42 @@ function App() {
 	              </div>
 	              <div className="field">
 	                <div className="field-hd">
-	                  <span className="mono">Funding Address (SOL)</span>
+		                  <span className="mono">Funding Address (TAO gas)</span>
 	                </div>
                 <div className="muted small">
-                  Fund this address with SOL for transaction fees. Tokens (USDT) are received to the associated token
-                  account of this owner address.
+                  Fund this address with TAO for transaction fees. Settlement assets are received to this owner address.
                 </div>
                 <div className="row">
-                  <input className="input mono" value={solSignerPubkey || ''} readOnly placeholder="sol signer pubkey…" />
-                  <button className="btn" disabled={!solSignerPubkey} onClick={() => copyToClipboard('solana pubkey', solSignerPubkey)}>
+                  <input className="input mono" value={taoAddress || 'TAO wallet not configured'} readOnly placeholder="TAO wallet not configured" />
+	                  <button className="btn" disabled={!taoAddress} onClick={() => copyToClipboard('tao wallet', taoAddress)}>
                     Copy
                   </button>
                 </div>
-                {solBalanceErr ? <div className="alert bad">{solBalanceErr}</div> : null}
-                {solBalance !== null && solBalance !== undefined ? (
-                  <div className="muted small">
-                    balance: <span className="mono">{lamportsToSolDisplay(solBalance)} SOL</span> (<span className="mono">{String(solBalance)} lamports</span>)
-                  </div>
-                ) : null}
-                <div className="row">
-                  <button
-                    className="btn primary"
-                    disabled={runBusy || !solSignerPubkey}
-                    onClick={async () => {
-                      try {
-                        const lamports = await runDirectToolOnce('intercomswap_sol_balance', { pubkey: solSignerPubkey }, { auto_approve: false });
-                        setSolBalance(lamports);
-                        setSolBalanceErr(null);
-                      } catch (e: any) {
-                        setSolBalanceErr(e?.message || String(e));
-                      }
-                    }}
-                  >
-                    Refresh SOL balance
-                  </button>
-                </div>
-              </div>
+                {!taoAddress ? <div className="muted small">TAO wallet not configured</div> : null}
+	              </div>
 
               <div className="field">
                 <div className="field-hd">
-                  <span className="mono">USDT Balance (SPL)</span>
+	                  <span className="mono">TAO Balance</span>
                 </div>
                 <div className="muted small">
-                  Enter the USDT mint you’re using for swaps. Most local/dev setups use a test mint with <span className="mono">decimals=6</span>.
+	                  Enter the TAO asset identifier used for swaps. Display assumes <span className="mono">decimals=18</span>.
                 </div>
                 <div className="row">
                   <input
                     className="input mono"
                     value={walletUsdtMint}
                     onChange={(e) => setWalletUsdtMint(e.target.value)}
-                    placeholder="USDT mint (base58)"
+	                    placeholder="TAO asset id"
                   />
-                  <button className="btn" disabled={!walletUsdtMint.trim()} onClick={() => copyToClipboard('usdt mint', walletUsdtMint.trim())}>
+	                  <button className="btn" disabled={!walletUsdtMint.trim()} onClick={() => copyToClipboard('tao asset id', walletUsdtMint.trim())}>
                     Copy
                   </button>
                 </div>
                 {walletUsdtErr ? <div className="alert bad">{walletUsdtErr}</div> : null}
                 {walletUsdtAtomic ? (
                   <div className="muted small">
-                    balance: <span className="mono">{atomicToDecimal(walletUsdtAtomic, 6)} USDT</span> (<span className="mono">{walletUsdtAtomic}</span>)
+	                    balance: <span className="mono">{atomicToDecimal(walletUsdtAtomic, TAO_DECIMALS)} TAO</span> (<span className="mono">{walletUsdtAtomic}</span>)
                     {walletUsdtAta ? (
                       <>
                         {' '}· ATA: <span className="mono">{walletUsdtAta.slice(0, 12)}…</span>
@@ -8112,37 +8010,28 @@ function App() {
                 <div className="row">
                   <button
                     className="btn primary"
-                    disabled={runBusy || !solSignerPubkey || !walletUsdtMint.trim()}
-                    onClick={async () => {
-                      try {
-                        const out = await runDirectToolOnce(
-                          'intercomswap_sol_token_balance',
-                          { owner: solSignerPubkey, mint: walletUsdtMint.trim() },
-                          { auto_approve: false }
-                        );
-                        setWalletUsdtAta(String(out?.ata || '').trim() || null);
-                        setWalletUsdtAtomic(String(out?.amount || '').trim() || '0');
-                        setWalletUsdtErr(null);
-                      } catch (e: any) {
-                        setWalletUsdtErr(e?.message || String(e));
-                      }
+                    disabled={runBusy}
+                    onClick={() => {
+                      setWalletUsdtAta(null);
+                      setWalletUsdtAtomic(null);
+                      setWalletUsdtErr('TAO balance lookup unavailable in UI');
                     }}
                   >
-                    Refresh USDT balance
+	                    Clear TAO balance snapshot
                   </button>
                 </div>
               </div>
 
               <div className="field">
                 <div className="field-hd">
-                  <span className="mono">Send SOL</span>
+	                  <span className="mono">Send TAO (gas)</span>
                 </div>
                 <div className="row">
                   <input className="input mono" value={solSendTo} onChange={(e) => setSolSendTo(e.target.value)} placeholder="to pubkey (base58)" />
                 </div>
                 <div className="field" style={{ marginTop: 8 }}>
                   <div className="field-hd">
-                    <span className="mono">amount (SOL)</span>
+	                    <span className="mono">amount (TAO)</span>
                   </div>
                   <UsdtAtomicField decimals={9} atomic={solSendLamports} onAtomic={(a) => setSolSendLamports(a)} placeholder="0.01" />
                 </div>
@@ -8154,7 +8043,7 @@ function App() {
                       const to = solSendTo.trim();
                       const lamports = String(solSendLamports || '').trim();
                       if (toolRequiresApproval('intercomswap_sol_transfer_sol') && !autoApprove) {
-                        const ok = window.confirm(`Send SOL now?\n\nto: ${to}\nlamports: ${lamports}`);
+	                        const ok = window.confirm(`Send TAO now?\n\nto: ${to}\namount: ${lamports}`);
                         if (!ok) return;
 	                      }
 	                      try {
@@ -8169,23 +8058,23 @@ function App() {
 	                          { auto_approve: true }
 	                        );
 	                        const sig = String(out?.tx_sig || out?.sig || '').trim();
-	                        pushToast('success', `SOL sent${sig ? ` (${sig.slice(0, 10)}…)` : ''}`);
+		                        pushToast('success', `TAO sent${sig ? ` (${sig.slice(0, 10)}…)` : ''}`);
 	                        void refreshPreflight();
 	                      } catch (e: any) {
                         pushToast('error', e?.message || String(e));
                       }
                     }}
                   >
-                    Send SOL
+	                    Send TAO
                   </button>
                 </div>
               </div>
 
               <div className="field">
                 <div className="field-hd">
-                  <span className="mono">Send USDT (SPL)</span>
+	                  <span className="mono">Send TAO</span>
                 </div>
-                <div className="muted small">Uses the mint above. Amount is entered in USDT (decimals=6).</div>
+	                <div className="muted small">Uses the asset id above. Amount is entered in TAO (decimals=18).</div>
                 <div className="row">
                   <input
                     className="input mono"
@@ -8196,9 +8085,9 @@ function App() {
                 </div>
                 <div className="field" style={{ marginTop: 8 }}>
                   <div className="field-hd">
-                    <span className="mono">amount (USDT)</span>
+	                    <span className="mono">amount (TAO)</span>
                   </div>
-                  <UsdtAtomicField decimals={6} atomic={usdtSendAtomic} onAtomic={(a) => setUsdtSendAtomic(a)} placeholder="10" />
+	                  <UsdtAtomicField decimals={TAO_DECIMALS} atomic={usdtSendAtomic} onAtomic={(a) => setUsdtSendAtomic(a)} placeholder="10" />
                 </div>
                 <div className="row">
                   <button
@@ -8209,7 +8098,7 @@ function App() {
                       const to_owner = usdtSendToOwner.trim();
                       const amount = String(usdtSendAtomic || '').trim();
                       if (toolRequiresApproval('intercomswap_sol_token_transfer') && !autoApprove) {
-                        const ok = window.confirm(`Send USDT now?\n\nmint: ${mint}\nto_owner: ${to_owner}\namount: ${amount}`);
+	                        const ok = window.confirm(`Send TAO now?\n\nasset: ${mint}\nto_owner: ${to_owner}\namount: ${amount}`);
                         if (!ok) return;
 	                      }
 	                      try {
@@ -8226,14 +8115,14 @@ function App() {
 	                          { auto_approve: true }
 	                        );
 	                        const sig = String(out?.tx_sig || out?.sig || '').trim();
-	                        pushToast('success', `USDT sent${sig ? ` (${sig.slice(0, 10)}…)` : ''}`);
+		                        pushToast('success', `TAO sent${sig ? ` (${sig.slice(0, 10)}…)` : ''}`);
                         void refreshPreflight();
                       } catch (e: any) {
                         pushToast('error', e?.message || String(e));
                       }
                     }}
                   >
-                    Send USDT
+	                    Send TAO
                   </button>
                 </div>
               </div>
@@ -8287,11 +8176,11 @@ function App() {
 	              </div>
 	              <div className="muted small">
 	                LN: <span className="mono">{String(envInfo?.ln?.impl || '—')}</span> /{' '}
-	                <span className="mono">{String(envInfo?.ln?.network || '—')}</span> · Solana:{' '}
+	                <span className="mono">{String(envInfo?.ln?.network || '—')}</span> · TAO (EVM):{' '}
 	                <span className="mono">{String(envInfo?.solana?.classify?.kind || '—')}</span>
 	              </div>
 	              <div className="muted small">
-	                Solana RPC:{' '}
+	                TAO RPC:{' '}
 	                <span className="mono">{String(Array.isArray(envInfo?.solana?.rpc_urls) ? envInfo.solana.rpc_urls[0] : '—')}</span>
 	              </div>
 	              <div className="muted small">
@@ -8583,6 +8472,7 @@ const READONLY_TOOLS = new Set<string>([
 	  'intercomswap_ln_docker_ps',
 	  'intercomswap_ln_info',
 	  'intercomswap_ln_listfunds',
+    'intercomswap_tao_wallet_info',
 
 	  // Solana reads
 	  'intercomswap_sol_local_status',
@@ -8623,7 +8513,7 @@ function toolGroup(name: string) {
   if (n.startsWith('intercomswap_rfq_') || n.startsWith('intercomswap_quote_') || n.startsWith('intercomswap_terms_')) return 'RFQ Protocol';
   if (n.startsWith('intercomswap_swap_')) return 'Swap Helpers';
   if (n.startsWith('intercomswap_ln_')) return 'Lightning';
-  if (n.startsWith('intercomswap_sol_')) return 'Solana';
+  if (n.startsWith('intercomswap_sol_')) return 'TAO (EVM)';
   if (n.startsWith('intercomswap_receipts_') || n.startsWith('intercomswap_swaprecover_')) return 'Receipts/Recovery';
   return 'Other';
 }
@@ -8710,6 +8600,31 @@ function atomicToNumber(atomic: string, decimals: number): number | null {
   } catch (_e) {
     return null;
   }
+}
+
+function getDisplayTaoAtomic(source: any): string {
+  const tao = typeof source?.tao_amount_atomic === 'string' ? source.tao_amount_atomic : '';
+  if (tao && /^[0-9]+$/.test(tao.trim())) return tao.trim();
+  const legacy = typeof source?.usdt_amount === 'string' ? source.usdt_amount : '';
+  if (legacy && /^[0-9]+$/.test(legacy.trim())) return legacy.trim();
+  return '';
+}
+
+function shortHash(value: any, left = 10, right = 6) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  if (s.length <= left + right + 1) return s;
+  return `${s.slice(0, left)}…${s.slice(-right)}`;
+}
+
+function sanitizeTradeForDisplay(trade: any) {
+  const omit = new Set(['sol_escrow_pda', 'sol_mint', 'sol_program', 'solana_program']);
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(trade || {})) {
+    if (omit.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 function parseAtomicBigInt(raw: any): bigint | null {
@@ -8925,7 +8840,7 @@ function ToolForm({
         const isChannel = typeof sch.type === 'string' && sch.type === 'string' && (k === 'channel' || k.endsWith('_channel') || k.includes('channel'));
         const isBtcSats = k === 'btc_sats' || k === 'amount_sats';
         const isMsat = k === 'amount_msat';
-        const isUsdt = k === 'usdt_amount';
+        const isUsdt = k === 'usdt_amount' || k === 'tao_amount_atomic';
         const isBps = sch?.type === 'integer' && (k.endsWith('_bps') || k.includes('bps'));
         const isSec = sch?.type === 'integer' && (k.endsWith('_sec') || k.includes('_sec'));
         const isAtomicDigits = sch?.type === 'string' && typeof sch?.pattern === 'string' && sch.pattern === '^[0-9]+$';
@@ -8944,8 +8859,8 @@ function ToolForm({
               <AtomicDisplayField
                 name={`amt-${tool.name}-${k}`}
                 atomic={typeof v === 'string' ? v : ''}
-                decimals={6}
-                symbol="USDT"
+                decimals={TAO_DECIMALS}
+                symbol="TAO"
                 onAtomic={(next) => (next === null ? del(k) : update(k, next))}
               />
             ) : isBtcSats ? (
@@ -8976,8 +8891,8 @@ function ToolForm({
               <AtomicDisplayField
                 name={`amt-${tool.name}-${k}`}
                 atomic={typeof v === 'string' ? v : ''}
-                decimals={k === 'lamports' ? 9 : 6}
-                symbol={k === 'lamports' ? 'SOL' : 'token'}
+                decimals={k === 'lamports' ? 9 : TAO_DECIMALS}
+                symbol={k === 'lamports' ? 'TAO' : 'token'}
                 onAtomic={(next) => (next === null ? del(k) : update(k, next))}
               />
             ) : enumVals && (sch?.type === 'string' || sch?.type === 'integer') ? (
@@ -9657,7 +9572,7 @@ function QuoteRow({
 }) {
   const body = evt?.message?.body;
   const btcSats = typeof body?.btc_sats === 'number' ? body.btc_sats : null;
-  const usdtAtomic = typeof body?.usdt_amount === 'string' ? body.usdt_amount : '';
+  const usdtAtomic = getDisplayTaoAtomic(body);
   const totalFee = (() => {
     const p = body?.platform_fee_bps;
     const t = body?.trade_fee_bps;
@@ -9669,14 +9584,14 @@ function QuoteRow({
   const expired = typeof validUntil === 'number' ? validUntil <= Math.floor(Date.now() / 1000) : false;
   const oracleBtcUsd = oracle && typeof oracle.btc_usd === 'number' ? oracle.btc_usd : null;
   const btcUsd = btcSats !== null && oracleBtcUsd ? (btcSats / 1e8) * oracleBtcUsd : null;
-  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, 6) : null;
+  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, TAO_DECIMALS) : null;
   const btcBtc = btcSats !== null ? btcSats / 1e8 : null;
   const btcDisplay = btcBtc !== null ? formatHumanNumber(btcBtc, { maxFractionDigits: 8 }) : '?';
   const usdtDisplay =
     usdtNum !== null
       ? formatHumanNumber(usdtNum, { maxFractionDigits: 6 })
       : usdtAtomic
-        ? atomicToDecimal(usdtAtomic, 6)
+        ? atomicToDecimal(usdtAtomic, TAO_DECIMALS)
         : '?';
   const pricePerBtc = btcBtc !== null && btcBtc > 0 && usdtNum !== null ? usdtNum / btcBtc : null;
   const priceDisplay = pricePerBtc !== null ? formatHumanNumber(pricePerBtc, { maxFractionDigits: 2 }) : '?';
@@ -9685,11 +9600,11 @@ function QuoteRow({
       <div className="rowitem-top">
         {expired ? <span className="mono chip warn">expired</span> : null}
         <span className="trade-activity-headline">
-          Sell <span className="mono">{btcDisplay}</span> BTC → <span className="mono">{usdtDisplay}</span> USDT
+          Sell <span className="mono">{btcDisplay}</span> BTC → <span className="mono">{usdtDisplay}</span> TAO
         </span>
       </div>
       <div className="rowitem-mid">
-        <span className="muted"><span className="mono">{priceDisplay}</span> USDT/BTC</span>
+        <span className="muted"><span className="mono">{priceDisplay}</span> TAO/BTC</span>
         {btcUsd !== null ? <span className="muted">≈ {fmtUsd(btcUsd)}</span> : null}
         {typeof totalFee === 'number' ? <span className="muted">fees {bpsToPctDisplay(totalFee)}%</span> : null}
         {typeof solWindow === 'number' ? <span className="muted">win {secToHuman(solWindow)}</span> : null}
@@ -9731,7 +9646,7 @@ function RfqRow({
 }) {
   const body = evt?.message?.body;
   const btcSats = typeof body?.btc_sats === 'number' ? body.btc_sats : null;
-  const usdtAtomic = typeof body?.usdt_amount === 'string' ? body.usdt_amount : '';
+  const usdtAtomic = getDisplayTaoAtomic(body);
   const maxTotal = body?.max_total_fee_bps;
   const minWin = body?.min_sol_refund_window_sec;
   const maxWin = body?.max_sol_refund_window_sec;
@@ -9740,14 +9655,14 @@ function RfqRow({
   const expired = typeof validUntil === 'number' ? validUntil <= Math.floor(Date.now() / 1000) : false;
   const oracleBtcUsd = oracle && typeof oracle.btc_usd === 'number' ? oracle.btc_usd : null;
   const btcUsd = btcSats !== null && oracleBtcUsd ? (btcSats / 1e8) * oracleBtcUsd : null;
-  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, 6) : null;
+  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, TAO_DECIMALS) : null;
   const btcBtc = btcSats !== null ? btcSats / 1e8 : null;
   const btcDisplay = btcBtc !== null ? formatHumanNumber(btcBtc, { maxFractionDigits: 8 }) : '?';
   const usdtDisplay =
     usdtNum !== null
       ? formatHumanNumber(usdtNum, { maxFractionDigits: 6 })
       : usdtAtomic
-        ? atomicToDecimal(usdtAtomic, 6)
+        ? atomicToDecimal(usdtAtomic, TAO_DECIMALS)
         : '?';
   const pricePerBtc = btcBtc !== null && btcBtc > 0 && usdtNum !== null ? usdtNum / btcBtc : null;
   const priceDisplay = pricePerBtc !== null ? formatHumanNumber(pricePerBtc, { maxFractionDigits: 2 }) : '?';
@@ -9758,11 +9673,11 @@ function RfqRow({
       <div className="rowitem-top">
         {expired ? <span className="mono chip warn">expired</span> : null}
         <span className="trade-activity-headline">
-          Sell <span className="mono">{btcDisplay}</span> BTC → <span className="mono">{usdtDisplay}</span> USDT
+          Sell <span className="mono">{btcDisplay}</span> BTC → <span className="mono">{usdtDisplay}</span> TAO
         </span>
       </div>
       <div className="rowitem-mid">
-        <span className="muted"><span className="mono">{priceDisplay}</span> USDT/BTC</span>
+        <span className="muted"><span className="mono">{priceDisplay}</span> TAO/BTC</span>
         {btcUsd !== null ? <span className="muted">≈ {fmtUsd(btcUsd)}</span> : null}
         <span className="muted">fees {typeof maxTotal === 'number' ? `${bpsToPctDisplay(maxTotal)}%` : '?'}</span>
         <span className="muted">win {typeof minWin === 'number' ? secToHuman(minWin) : '?'}–{typeof maxWin === 'number' ? secToHuman(maxWin) : '?'}</span>
@@ -9820,7 +9735,7 @@ function OfferRow({
   const o = offers[0] && typeof offers[0] === 'object' ? offers[0] : {};
 
   const btcSats = typeof o?.btc_sats === 'number' ? o.btc_sats : null;
-  const usdtAtomic = typeof o?.usdt_amount === 'string' ? o.usdt_amount : '';
+  const usdtAtomic = getDisplayTaoAtomic(o);
   const maxTotal = o?.max_total_fee_bps;
   const minWin = o?.min_sol_refund_window_sec;
   const maxWin = o?.max_sol_refund_window_sec;
@@ -9829,14 +9744,14 @@ function OfferRow({
   const expired = typeof validUntil === 'number' ? validUntil <= Math.floor(Date.now() / 1000) : false;
   const oracleBtcUsd = oracle && typeof oracle.btc_usd === 'number' ? oracle.btc_usd : null;
   const btcUsd = btcSats !== null && oracleBtcUsd ? (btcSats / 1e8) * oracleBtcUsd : null;
-  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, 6) : null;
+  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, TAO_DECIMALS) : null;
   const btcBtc = btcSats !== null ? btcSats / 1e8 : null;
   const btcDisplay = btcBtc !== null ? formatHumanNumber(btcBtc, { maxFractionDigits: 8 }) : '?';
   const usdtDisplay =
     usdtNum !== null
       ? formatHumanNumber(usdtNum, { maxFractionDigits: 6 })
       : usdtAtomic
-        ? atomicToDecimal(usdtAtomic, 6)
+        ? atomicToDecimal(usdtAtomic, TAO_DECIMALS)
         : '?';
   const pricePerBtc = btcBtc !== null && btcBtc > 0 && usdtNum !== null ? usdtNum / btcBtc : null;
   const priceDisplay = pricePerBtc !== null ? formatHumanNumber(pricePerBtc, { maxFractionDigits: 2 }) : '?';
@@ -9849,11 +9764,11 @@ function OfferRow({
         {expired ? <span className="mono chip warn">expired</span> : null}
         {offers.length > 1 ? <span className="mono chip">{offers.length} lines</span> : null}
         <span className="trade-activity-headline">
-          Sell <span className="mono">{usdtDisplay}</span> USDT → <span className="mono">{btcDisplay}</span> BTC
+          Sell <span className="mono">{usdtDisplay}</span> TAO → <span className="mono">{btcDisplay}</span> BTC
         </span>
       </div>
       <div className="rowitem-mid">
-        <span className="muted"><span className="mono">{priceDisplay}</span> USDT/BTC</span>
+        <span className="muted"><span className="mono">{priceDisplay}</span> TAO/BTC</span>
         {btcUsd !== null ? <span className="muted">≈ {fmtUsd(btcUsd)}</span> : null}
         <span className="muted">fees {typeof maxTotal === 'number' ? `${bpsToPctDisplay(maxTotal)}%` : '?'}</span>
         <span className="muted">win {typeof minWin === 'number' ? secToHuman(minWin) : '?'}–{typeof maxWin === 'number' ? secToHuman(maxWin) : '?'}</span>
@@ -10046,15 +9961,15 @@ function TradeRow({
   const stateLower = state.toLowerCase();
   const role = String(trade?.role || '').trim();
   const sats = typeof trade?.btc_sats === 'number' ? trade.btc_sats : null;
-  const usdtAtomic = typeof trade?.usdt_amount === 'string' ? trade.usdt_amount : '';
+  const usdtAtomic = getDisplayTaoAtomic(trade);
   const oracleBtcUsd = oracle && typeof oracle.btc_usd === 'number' ? oracle.btc_usd : null;
   const btcUsd = sats !== null && oracleBtcUsd ? (sats / 1e8) * oracleBtcUsd : null;
-  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, 6) : null;
+  const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, TAO_DECIMALS) : null;
   const btcBtc = sats !== null ? sats / 1e8 : null;
   const btcDisplay = btcBtc !== null ? formatHumanNumber(btcBtc, { maxFractionDigits: 8 }) : '?';
   const usdtDisplay = usdtNum !== null
     ? formatHumanNumber(usdtNum, { maxFractionDigits: 6 })
-    : usdtAtomic ? atomicToDecimal(usdtAtomic, 6) : '?';
+    : usdtAtomic ? atomicToDecimal(usdtAtomic, TAO_DECIMALS) : '?';
   const pricePerBtc = btcBtc !== null && btcBtc > 0 && usdtNum !== null ? usdtNum / btcBtc : null;
   const priceDisplay = pricePerBtc !== null ? formatHumanNumber(pricePerBtc, { maxFractionDigits: 2 }) : null;
   const terminalByState =
@@ -10067,7 +9982,7 @@ function TradeRow({
   const terminal = terminalByState || Boolean(tradeId && terminalTradeIdsSet?.has(tradeId));
   const expired = terminal;
 
-  const refundAfterRaw = trade?.sol_refund_after_unix;
+  const refundAfterRaw = trade?.tao_refund_after_unix ?? trade?.sol_refund_after_unix;
   const refundAfterUnix =
     typeof refundAfterRaw === 'number'
       ? refundAfterRaw
@@ -10090,6 +10005,8 @@ function TradeRow({
       ? `Refund available after ${unixSecToUtcIso(refundAfterUnix)}`
       : 'Not refundable yet';
 
+  const taoLockTxId = String(trade?.tao_lock_tx_id || '').trim();
+  const taoSettlementId = String(trade?.tao_settlement_id || '').trim();
   return (
     <div className={`rowitem ${selected ? 'selected' : ''} ${expired ? 'expired' : ''}`} role="button" onClick={onSelect}>
       <div className="rowitem-top">
@@ -10097,12 +10014,14 @@ function TradeRow({
         <span className="mono chip hi">{state || '?'}</span>
         {expired ? <span className="mono chip warn">ended</span> : null}
         <span className="trade-activity-headline">
-          <span className="mono">{btcDisplay}</span> BTC → <span className="mono">{usdtDisplay}</span> USDT
+          <span className="mono">{btcDisplay}</span> BTC → <span className="mono">{usdtDisplay}</span> TAO
         </span>
       </div>
       <div className="rowitem-mid">
-        {priceDisplay ? <span className="muted"><span className="mono">{priceDisplay}</span> USDT/BTC</span> : null}
+        {priceDisplay ? <span className="muted"><span className="mono">{priceDisplay}</span> TAO/BTC</span> : null}
         {btcUsd !== null ? <span className="muted">≈ {fmtUsd(btcUsd)}</span> : null}
+        {taoSettlementId ? <span className="muted">settlement {shortHash(taoSettlementId)}</span> : null}
+        {taoLockTxId ? <span className="muted">lock {shortHash(taoLockTxId)}</span> : null}
       </div>
       <div className="rowitem-bot">
         <div className="row">
