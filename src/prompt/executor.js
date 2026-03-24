@@ -43,6 +43,7 @@ import {
   isTaoPair,
   normalizePair,
 } from '../swap/pairs.js';
+import { normalizeSettlement } from '../swap/normalizeSettlement.js';
 import { AutopostManager } from './autopost.js';
 import { TradeAutoManager } from './tradeAuto.js';
 import { lnPeerProbe } from './lnPeerGuard.js';
@@ -208,6 +209,27 @@ function normalizeAtomicAmount(s, label = 'amount') {
   const v = String(s || '').trim();
   if (!/^[0-9]+$/.test(v)) throw new Error(`${label} must be a decimal string integer`);
   return v;
+}
+
+function normalizeOptionalSettlementAddressValue(value, label = 'settlement address') {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  return normalizeSettlementAddress(s, label);
+}
+
+function normalizeRequiredSettlementAddressValue(value, label = 'settlement address') {
+  const out = normalizeOptionalSettlementAddressValue(value, label);
+  if (!out) throw new Error(`${label} is required`);
+  return out;
+}
+
+function normalizeRequiredUnixSecondsValue(value, label = 'refund_after_unix') {
+  const n = Number.parseInt(String(value ?? '').trim(), 10);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) {
+    throw new Error(`${label} must be an integer >= 1`);
+  }
+  return n;
 }
 
 function parseLocalRpcPortFromUrls(urls, fallback = 8899) {
@@ -3702,13 +3724,13 @@ export class ToolExecutor {
       if (!isTaoPair(pair) && ('tao_amount_atomic' in args || 'settlement_refund_after_sec' in args)) {
         throw new Error(`${toolName}: tao_amount_atomic/settlement_refund_after_sec not allowed for ${pair}`);
       }
+      const normalizedSettlement = normalizeSettlement(pair, args);
+      const settlementKind = normalizedSettlement.settlement_kind;
+      const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
       const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
       const amountField = getAmountFieldForPair(pair);
-      const amountAtomic = normalizeAtomicAmount(expectString(args, toolName, amountField, { max: 64 }), amountField);
-      const solRecipient =
-        'sol_recipient' in args
-          ? normalizeSettlementAddress(expectString(args, toolName, 'sol_recipient', { min: 2, max: 66 }), 'sol_recipient')
-          : null;
+      const amountAtomic = normalizeAtomicAmount(normalizedSettlement.amount, amountField);
+      const solRecipient = normalizeOptionalSettlementAddressValue(normalizedSettlement.recipient, 'sol_recipient');
       const {
         settlementLegMaxPlatformFeeBps: maxPlatformFeeBps,
         settlementLegMaxTradeFeeBps: maxTradeFeeBps,
@@ -3772,7 +3794,7 @@ export class ToolExecutor {
           app_hash: appHash,
           btc_sats: btcSats,
           [amountField]: amountAtomic,
-          settlement_kind: getPairSettlementKind(pair),
+          settlement_kind: settlementKind,
           ...(solRecipient ? { sol_recipient: solRecipient } : {}),
           max_platform_fee_bps: maxPlatformFeeBps,
           max_trade_fee_bps: maxTradeFeeBps,
@@ -3804,9 +3826,9 @@ export class ToolExecutor {
 	                role: 'taker',
 	                rfq_channel: channel,
 	                btc_sats: btcSats,
-	                usdt_amount: isTaoPair(pair) ? null : amountAtomic,
-                  settlement_kind: getPairSettlementKind(pair),
-                  ...(isTaoPair(pair) ? { tao_amount_atomic: amountAtomic } : {}),
+	                usdt_amount: isTaoSettlement ? null : amountAtomic,
+                  settlement_kind: settlementKind,
+                  ...(isTaoSettlement ? { tao_amount_atomic: amountAtomic } : {}),
 	                state: 'rfq',
 	                last_error: null,
 	              });
@@ -3851,9 +3873,11 @@ export class ToolExecutor {
       if (!isTaoPair(pair) && ('tao_amount_atomic' in args || 'settlement_refund_after_sec' in args)) {
         throw new Error(`${toolName}: tao_amount_atomic/settlement_refund_after_sec not allowed for ${pair}`);
       }
+      const normalizedSettlement = normalizeSettlement(pair, args);
+      const settlementKind = normalizedSettlement.settlement_kind;
       const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
       const amountField = getAmountFieldForPair(pair);
-      const amountAtomic = normalizeAtomicAmount(expectString(args, toolName, amountField, { max: 64 }), amountField);
+      const amountAtomic = normalizeAtomicAmount(normalizedSettlement.amount, amountField);
       const tradeFeeCollector = normalizeSettlementAddress(
         expectString(args, toolName, 'trade_fee_collector', { min: 2, max: 66 }),
         'trade_fee_collector'
@@ -3957,7 +3981,7 @@ export class ToolExecutor {
           app_hash: appHash,
           btc_sats: btcSats,
           [amountField]: amountAtomic,
-          settlement_kind: getPairSettlementKind(pair),
+          settlement_kind: settlementKind,
           platform_fee_bps: platformFeeBps,
           trade_fee_bps: tradeFeeBps,
           trade_fee_collector: tradeFeeCollector,
@@ -5229,13 +5253,16 @@ export class ToolExecutor {
       if (!isTaoPair(pair) && ('tao_amount_atomic' in args)) {
         throw new Error(`${toolName}: tao_amount_atomic not allowed for ${pair}`);
       }
+      const normalizedSettlement = normalizeSettlement(pair, args);
+      const settlementKind = normalizedSettlement.settlement_kind;
+      const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
       const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
       const amountField = getAmountFieldForPair(pair);
-      const amountAtomic = normalizeAtomicAmount(expectString(args, toolName, amountField, { max: 64 }), amountField);
-      const solMint = normalizeSettlementAddress(expectString(args, toolName, 'sol_mint', { min: 2, max: 66 }), 'sol_mint');
-      const solRecipient = normalizeSettlementAddress(expectString(args, toolName, 'sol_recipient', { min: 2, max: 66 }), 'sol_recipient');
-      const solRefund = normalizeSettlementAddress(expectString(args, toolName, 'sol_refund', { min: 2, max: 66 }), 'sol_refund');
-      const solRefundAfter = expectInt(args, toolName, 'sol_refund_after_unix', { min: 1 });
+      const amountAtomic = normalizeAtomicAmount(normalizedSettlement.amount, amountField);
+      const solMint = normalizeRequiredSettlementAddressValue(normalizedSettlement.settlement_asset_id, 'sol_mint');
+      const solRecipient = normalizeRequiredSettlementAddressValue(normalizedSettlement.recipient, 'sol_recipient');
+      const solRefund = normalizeRequiredSettlementAddressValue(normalizedSettlement.refund, 'sol_refund');
+      const solRefundAfter = normalizeRequiredUnixSecondsValue(normalizedSettlement.refund_after_unix, 'sol_refund_after_unix');
       assertRefundAfterUnixWindow(solRefundAfter, toolName);
       const lnReceiverPeer = normalizeHex32(expectString(args, toolName, 'ln_receiver_peer', { min: 64, max: 64 }), 'ln_receiver_peer');
       const lnPayerPeer = normalizeHex32(expectString(args, toolName, 'ln_payer_peer', { min: 64, max: 64 }), 'ln_payer_peer');
@@ -5264,8 +5291,8 @@ export class ToolExecutor {
           app_hash: appHash,
           btc_sats: btcSats,
           [amountField]: amountAtomic,
-          ...(isTaoPair(pair) ? {} : { usdt_decimals: 6 }),
-          settlement_kind: getPairSettlementKind(pair),
+          ...(isTaoSettlement ? {} : { usdt_decimals: 6 }),
+          settlement_kind: settlementKind,
           sol_mint: solMint,
           sol_recipient: solRecipient,
           sol_refund: solRefund,
@@ -5295,9 +5322,9 @@ export class ToolExecutor {
           maker_peer: String(signed.signer || '').trim().toLowerCase() || lnReceiverPeer,
           taker_peer: lnPayerPeer,
           btc_sats: btcSats,
-          usdt_amount: isTaoPair(pair) ? null : amountAtomic,
-          settlement_kind: getPairSettlementKind(pair),
-          ...(isTaoPair(pair) ? { tao_amount_atomic: amountAtomic } : {}),
+          usdt_amount: isTaoSettlement ? null : amountAtomic,
+          settlement_kind: settlementKind,
+          ...(isTaoSettlement ? { tao_amount_atomic: amountAtomic } : {}),
           sol_mint: solMint,
           sol_program_id: settlementBinding,
           sol_recipient: solRecipient,
@@ -5484,7 +5511,19 @@ export class ToolExecutor {
         const body = isObject(terms.body) ? terms.body : {};
         const pair = normalizePair(body.pair || PAIR.BTC_LN__USDT_SOL);
         const btcSats = Number.isFinite(Number(body.btc_sats)) ? Math.trunc(Number(body.btc_sats)) : null;
-        const amountAtomic = getAmountForPair(body, pair, { allowLegacyTaoFallback: true }) || null;
+        const normalizedSettlement = normalizeSettlement(pair, body);
+        const settlementKind = normalizedSettlement.settlement_kind;
+        const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
+        const amountAtomic = normalizedSettlement.amount ? String(normalizedSettlement.amount).trim() : null;
+        const solMint = normalizeOptionalSettlementAddressValue(normalizedSettlement.settlement_asset_id, 'sol_mint');
+        const solRecipient = normalizeOptionalSettlementAddressValue(normalizedSettlement.recipient, 'sol_recipient');
+        const solRefund = normalizeOptionalSettlementAddressValue(normalizedSettlement.refund, 'sol_refund');
+        const solRefundAfter =
+          normalizedSettlement.refund_after_unix !== undefined &&
+          normalizedSettlement.refund_after_unix !== null &&
+          Number.isFinite(Number(normalizedSettlement.refund_after_unix))
+            ? Math.trunc(Number(normalizedSettlement.refund_after_unix))
+            : undefined;
         const programId = this._settlementAppBinding();
         store.upsertTrade(tradeId, {
           role: 'taker',
@@ -5492,16 +5531,14 @@ export class ToolExecutor {
           maker_peer: String(terms.signer || '').trim().toLowerCase() || null,
           taker_peer: String(signed.signer || '').trim().toLowerCase() || null,
           btc_sats: btcSats ?? undefined,
-          usdt_amount: isTaoPair(pair) ? undefined : amountAtomic ?? undefined,
-          settlement_kind: getPairSettlementKind(pair),
-          ...(isTaoPair(pair) && amountAtomic ? { tao_amount_atomic: amountAtomic } : {}),
-          sol_mint: typeof body.sol_mint === 'string' ? body.sol_mint : undefined,
+          usdt_amount: isTaoSettlement ? undefined : amountAtomic ?? undefined,
+          settlement_kind: settlementKind,
+          ...(isTaoSettlement && amountAtomic ? { tao_amount_atomic: amountAtomic } : {}),
+          sol_mint: solMint ?? undefined,
           sol_program_id: programId,
-          sol_recipient: typeof body.sol_recipient === 'string' ? body.sol_recipient : undefined,
-          sol_refund: typeof body.sol_refund === 'string' ? body.sol_refund : undefined,
-          sol_refund_after_unix: Number.isFinite(Number(body.sol_refund_after_unix))
-            ? Math.trunc(Number(body.sol_refund_after_unix))
-            : undefined,
+          sol_recipient: solRecipient ?? undefined,
+          sol_refund: solRefund ?? undefined,
+          sol_refund_after_unix: solRefundAfter,
           state: 'accepted',
           last_error: null,
         });
@@ -6422,12 +6459,16 @@ export class ToolExecutor {
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const settlementPair = this._isTaoSettlement() ? PAIR.BTC_LN__TAO_EVM : PAIR.BTC_LN__USDT_SOL;
+      const normalizedSettlement = normalizeSettlement(settlementPair, args);
+      const settlementKind = normalizedSettlement.settlement_kind;
+      const isTao = settlementKind === SETTLEMENT_KIND.TAO_EVM;
       const paymentHashHex = normalizeHex32(expectString(args, toolName, 'payment_hash_hex', { min: 64, max: 64 }), 'payment_hash_hex');
-      const mint = normalizeSettlementAddress(expectString(args, toolName, 'mint', { min: 2, max: 66 }), 'mint');
-      const amountStr = normalizeAtomicAmount(expectString(args, toolName, 'amount', { max: 64 }), 'amount');
-      const recipient = normalizeSettlementAddress(expectString(args, toolName, 'recipient', { min: 2, max: 66 }), 'recipient');
-      const refund = normalizeSettlementAddress(expectString(args, toolName, 'refund', { min: 2, max: 66 }), 'refund');
-      const refundAfterUnix = expectInt(args, toolName, 'refund_after_unix', { min: 1 });
+      const mint = normalizeRequiredSettlementAddressValue(normalizedSettlement.settlement_asset_id, 'mint');
+      const amountStr = normalizeAtomicAmount(normalizedSettlement.amount, 'amount');
+      const recipient = normalizeRequiredSettlementAddressValue(normalizedSettlement.recipient, 'recipient');
+      const refund = normalizeRequiredSettlementAddressValue(normalizedSettlement.refund, 'refund');
+      const refundAfterUnix = normalizeRequiredUnixSecondsValue(normalizedSettlement.refund_after_unix, 'refund_after_unix');
       assertRefundAfterUnixWindow(refundAfterUnix, toolName);
       const tradeFeeCollector = normalizeSettlementAddress(
         expectString(args, toolName, 'trade_fee_collector', { min: 2, max: 66 }),
@@ -6527,7 +6568,6 @@ export class ToolExecutor {
           computeUnitLimit,
           computeUnitPriceMicroLamports,
         });
-        const isTao = this._isTaoSettlement();
 
         const lock = await settlement.lock({
           paymentHashHex,
