@@ -1315,6 +1315,7 @@ export const INTERCOMSWAP_TOOLS = [
     },
     required: [],
   }),
+  tool('intercomswap_tao_wallet_info', 'Get the configured TAO EVM wallet address and RPC info for this promptd instance.', emptyParams),
   tool('intercomswap_sol_signer_pubkey', 'Get the configured Solana signer pubkey for this promptd instance.', emptyParams),
   tool('intercomswap_settlement_signer_address', 'Get the configured settlement signer address for the active settlement backend.', emptyParams),
   tool('intercomswap_sol_keygen', 'Generate a new Solana keypair JSON file under onchain/ (gitignored).', {

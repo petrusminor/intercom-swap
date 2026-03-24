@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
 
+import { Wallet } from 'ethers';
 import { Keypair, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -7464,6 +7465,31 @@ export class ToolExecutor {
       assertAllowedKeys(args, toolName, []);
       const signer = this._requireSolanaSigner();
       return { type: 'sol_signer', pubkey: signer.publicKey.toBase58() };
+    }
+
+    if (toolName === 'intercomswap_tao_wallet_info') {
+      assertAllowedKeys(args, toolName, []);
+      const privateKey = String(process.env.TAO_EVM_PRIVATE_KEY || '').trim();
+      const chainIdRaw = String(process.env.TAO_EVM_CHAIN_ID || '').trim();
+      const rpcUrl = String(process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai').trim();
+      const chainId = /^[0-9]+$/.test(chainIdRaw) ? Number.parseInt(chainIdRaw, 10) : 964;
+      if (!privateKey) {
+        return {
+          type: 'tao_wallet',
+          configured: false,
+          address: '',
+          chainId,
+          rpcUrl,
+        };
+      }
+      const wallet = new Wallet(privateKey);
+      return {
+        type: 'tao_wallet',
+        configured: true,
+        address: String(wallet.address || '').trim(),
+        chainId,
+        rpcUrl,
+      };
     }
 
     if (toolName === 'intercomswap_settlement_signer_address') {
