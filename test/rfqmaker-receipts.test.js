@@ -193,6 +193,158 @@ test('rfq-maker timeout cleanup does not regress locking state back to invoice b
   assert.equal(patch.last_error, 'swap timeout (swap-timeout-sec=5)');
 });
 
+test('rfq-maker cleanup preserves terminal claimed state for tao trades with lock tx', () => {
+  const patch = resolveMakerCleanupPersistence(
+    {
+      pair: 'BTC_LN/TAO_EVM',
+      trade: { state: 'claimed' },
+      taoLockPhase: 'escrow',
+      taoLockTxId: `0x${'a'.repeat(64)}`,
+      lastLockError: '',
+    },
+    { reason: 'swap_done' }
+  );
+  assert.equal(patch.state, 'claimed');
+});
+
+test('rfq-maker receipts stay claimed after cleanup and preserve tao_claim_tx_id', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-rfqmaker-claimed-cleanup-'));
+  const peerKeypairPath = path.join(root, 'db', 'keypair.json');
+  fs.mkdirSync(path.dirname(peerKeypairPath), { recursive: true });
+  fs.writeFileSync(peerKeypairPath, '[]');
+  const dbPath = resolveReceiptsDbPath({ receiptsDbPathRaw: '', peerKeypairPath });
+  const receipts = openTradeReceiptsStore({ dbPath });
+  try {
+    const tradeId = 'swap_claim_cleanup_1';
+    const settlementId = `0x${'1'.repeat(64)}`;
+    const lockTxId = `0x${'2'.repeat(64)}`;
+    const claimTxId = `0x${'3'.repeat(64)}`;
+
+    persistTradeReceipt({
+      receipts,
+      tradeId,
+      settlementKind: 'tao-evm',
+      patch: {
+        role: 'maker',
+        state: 'escrow',
+        tao_settlement_id: settlementId,
+        tao_lock_tx_id: lockTxId,
+      },
+      eventKind: 'tao_htlc_locked_sent',
+      eventPayload: { trade_id: tradeId, settlement_id: settlementId, tx_id: lockTxId },
+    });
+
+    persistTradeReceipt({
+      receipts,
+      tradeId,
+      settlementKind: 'tao-evm',
+      patch: {
+        state: 'claimed',
+        tao_settlement_id: settlementId,
+        tao_claim_tx_id: claimTxId,
+      },
+      eventKind: 'swap_done',
+      eventPayload: { trade_id: tradeId, state: 'claimed' },
+    });
+
+    const cleanupPatch = resolveMakerCleanupPersistence(
+      {
+        pair: 'BTC_LN/TAO_EVM',
+        trade: { state: 'claimed' },
+        taoLockPhase: 'escrow',
+        taoLockTxId: lockTxId,
+        lastLockError: '',
+      },
+      { reason: 'swap_done' }
+    );
+
+    persistTradeReceipt({
+      receipts,
+      tradeId,
+      settlementKind: 'tao-evm',
+      patch: cleanupPatch,
+      eventKind: 'swap_cleanup',
+      eventPayload: { trade_id: tradeId, reason: 'swap_done' },
+    });
+
+    const row = receipts.getTrade(tradeId);
+    assert.equal(row.state, 'claimed');
+    assert.equal(row.tao_claim_tx_id, claimTxId);
+    assert.equal(row.tao_lock_tx_id, lockTxId);
+  } finally {
+    receipts.close();
+  }
+});
+
+test('rfq-maker receipts stay refunded after cleanup and preserve tao_refund_tx_id', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-rfqmaker-refunded-cleanup-'));
+  const peerKeypairPath = path.join(root, 'db', 'keypair.json');
+  fs.mkdirSync(path.dirname(peerKeypairPath), { recursive: true });
+  fs.writeFileSync(peerKeypairPath, '[]');
+  const dbPath = resolveReceiptsDbPath({ receiptsDbPathRaw: '', peerKeypairPath });
+  const receipts = openTradeReceiptsStore({ dbPath });
+  try {
+    const tradeId = 'swap_refund_cleanup_1';
+    const settlementId = `0x${'4'.repeat(64)}`;
+    const lockTxId = `0x${'5'.repeat(64)}`;
+    const refundTxId = `0x${'6'.repeat(64)}`;
+
+    persistTradeReceipt({
+      receipts,
+      tradeId,
+      settlementKind: 'tao-evm',
+      patch: {
+        role: 'maker',
+        state: 'escrow',
+        tao_settlement_id: settlementId,
+        tao_lock_tx_id: lockTxId,
+      },
+      eventKind: 'tao_htlc_locked_sent',
+      eventPayload: { trade_id: tradeId, settlement_id: settlementId, tx_id: lockTxId },
+    });
+
+    persistTradeReceipt({
+      receipts,
+      tradeId,
+      settlementKind: 'tao-evm',
+      patch: {
+        state: 'refunded',
+        tao_settlement_id: settlementId,
+        tao_refund_tx_id: refundTxId,
+      },
+      eventKind: 'swap_refunded',
+      eventPayload: { trade_id: tradeId, state: 'refunded' },
+    });
+
+    const cleanupPatch = resolveMakerCleanupPersistence(
+      {
+        pair: 'BTC_LN/TAO_EVM',
+        trade: { state: 'refunded' },
+        taoLockPhase: 'escrow',
+        taoLockTxId: lockTxId,
+        lastLockError: '',
+      },
+      { reason: 'refunded' }
+    );
+
+    persistTradeReceipt({
+      receipts,
+      tradeId,
+      settlementKind: 'tao-evm',
+      patch: cleanupPatch,
+      eventKind: 'swap_cleanup',
+      eventPayload: { trade_id: tradeId, reason: 'refunded' },
+    });
+
+    const row = receipts.getTrade(tradeId);
+    assert.equal(row.state, 'refunded');
+    assert.equal(row.tao_refund_tx_id, refundTxId);
+    assert.equal(row.tao_lock_tx_id, lockTxId);
+  } finally {
+    receipts.close();
+  }
+});
+
 test('rfq-maker tao lock error stage persists last_error clearly', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-rfqmaker-taoerror-'));
   const peerKeypairPath = path.join(root, 'db', 'keypair.json');

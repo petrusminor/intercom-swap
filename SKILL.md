@@ -144,6 +144,13 @@ This repo also includes `scripts/swaprecover.mjs` (with wrappers `scripts/swapre
 - list/show local trade receipts from a local-only SQLite DB under `onchain/` (gitignored)
 - recover a stuck claim on Solana if the agent crashed after paying LN (requires `ln_preimage_hex` to be available in receipts)
 
+This repo also includes `scripts/swapreconcile.mjs` for manual local-only receipt reconciliation:
+- `node scripts/swapreconcile.mjs reconcile --receipts-db <path> (--trade-id <id> | --payment-hash <hex32>) --settlement tao-evm`
+- promotes ambiguous local TAO receipts (`escrow`, `ln_paid`, similar offline states) to `claimed` or `refunded` from on-chain evidence
+- records `reconciliation_source` and `reconciliation_ts`
+- preserves known `tao_lock_tx_id`, `tao_claim_tx_id`, and `tao_refund_tx_id`
+- use this when the chain is authoritative but local receipts are stale
+
 This repo also includes `scripts/escrowctl.mjs` (with wrappers `scripts/escrowctl.sh` and `scripts/escrowctl.ps1`) to deterministically:
 - inspect Solana escrow/config state (`config-get`, `escrow-get`)
 - manage program-wide fee config (`config-init`, `config-set`)
@@ -162,6 +169,15 @@ This repo also includes `scripts/lndctl.mjs` (with wrappers `scripts/lndctl.sh` 
 
 Optional secret helper scripts (store outputs under `onchain/`, never commit):
 - `scripts/lndpw.sh` / `scripts/lndpw.ps1`: write an LND auto-unlock password file (used by `wallet-unlock-password-file` in `lnd.conf`).
+
+### Lightning Initialization Capability
+Lightning may require initialization before swaps can be executed.
+
+If a Lightning node is not initialized, unlocked, or does not have active channels,
+the agent may use the LN bootstrap tool to initialize the node, obtain a funding address,
+and optionally establish a channel.
+
+This is an optional capability and should be used only when required.
 
 This repo also includes wallet/inventory operator tools (no custodial wallet APIs; keys stay local):
 - `scripts/lnctl.mjs` (with wrappers `scripts/lnctl.sh` and `scripts/lnctl.ps1`) for Lightning node ops (CLN or LND):
@@ -183,6 +199,55 @@ This repo also provides long-running RFQ “agent bots” that sit in an RFQ cha
   - With `--run-swap 1`, it also runs the **full swap state machine** inside the `swap:<id>` invite-only channel (terms -> invoice -> escrow).
 - `scripts/rfq-taker.mjs`: sends a `swap.rfq`, waits for a `swap.quote`, sends `swap.quote_accept`, waits for `swap.swap_invite`, then joins the `swap:<id>` channel.
   - With `--run-swap 1`, it also runs the **full swap state machine** (accept -> verify escrow on-chain -> pay LN -> claim Solana escrow).
+
+### Deterministic Test Flags (Regtest Only)
+- `--test-stop-before-ln-pay 1`
+- `--test-stop-after-ln-pay-before-claim 1`
+- Purpose: deterministic crash-boundary testing around the two critical taker windows:
+  - before LN payment
+  - after LN payment succeeds but before TAO claim executes
+- These flags are **regtest-only** and must never change protocol logic, wire messages, or settlement behavior.
+- When enabled, they must persist an explicit local stop reason in receipts (`test_stop_before_ln_pay` or `test_stop_after_ln_pay_before_claim`).
+- Treat them as real crash-window simulators: recovery must proceed from receipts, not from process memory.
+
+### Crash + Recovery Invariant
+- LN payment must be exactly-once.
+- TAO claim must be exactly-once.
+- Recovery must be idempotent from receipts.
+- Recovery correctness is validated by:
+  - no duplicate LN payments
+  - a single TAO claim tx
+  - final state `claimed` or a safe `refunded` resolution
+
+### Receipt Truth Model
+- On-chain state is authoritative.
+- Local receipts are eventually consistent.
+- Maker receipts can miss terminal transitions if the maker was offline when the later `swap.tao_claimed` / `swap.tao_refunded` message arrived.
+- In those cases, manual reconciliation is required; do not guess terminal state from logs alone.
+
+### Manual Reconciliation (`swapreconcile`)
+- Canonical usage:
+  - `node scripts/swapreconcile.mjs reconcile --receipts-db <path> --trade-id <id> --settlement tao-evm`
+- Behavior:
+  - inspects `tao_settlement_id`
+  - checks on-chain HTLC state and known tx evidence
+  - promotes stale local receipts from `escrow` / `ln_paid` to `claimed` or `refunded` when evidence is sufficient
+  - records `reconciliation_source=onchain` and `reconciliation_ts=<now_ms>`
+  - preserves lock/claim/refund tx ids already present
+
+### Operator Override (Claim/Refund Tx)
+- `--claim-tx-id <0x...>`
+- `--refund-tx-id <0x...>`
+- Use these only when public RPC evidence is incomplete (for example, sparse or missing historical logs) but the operator already knows the confirmed on-chain claim/refund tx.
+- This remains manual-only. It exists to reconcile receipts from known on-chain facts, not to infer missing outcomes automatically.
+- No automatic guessing is allowed: if evidence is insufficient and no override tx is provided, receipts must remain unchanged.
+
+### Safety Guarantees
+- No protocol changes.
+- No wire changes.
+- No settlement logic changes.
+- All deterministic crash-test flags and reconciliation overrides are local-only operator tooling.
+- Test-stop flags are gated to regtest.
 
 `--run-swap 1` requires:
 - LN backend configuration:
