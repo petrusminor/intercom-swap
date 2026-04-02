@@ -416,6 +416,47 @@ export const INTERCOMSWAP_TOOLS = [
     required: ['channel', 'trade_id', 'btc_sats'],
   }),
   tool(
+    'intercomswap_run_swap',
+    'Agent-facing helper: post an RFQ, wait for a matching quote, accept it, and optionally hand off the rest of the swap flow to the existing backend trade automation worker.',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        channel: channelParam,
+        pair: { type: 'string', enum: ['BTC_LN/USDT_SOL', 'BTC_LN/TAO_EVM'] },
+        btc_sats: {
+          anyOf: [
+            satsParam,
+            { type: 'string', minLength: 1, maxLength: 32, pattern: '^[0-9]+$' },
+          ],
+        },
+        usdt_amount: {
+          anyOf: [
+            atomicAmountParam,
+            { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+          ],
+        },
+        tao_amount_atomic: {
+          anyOf: [
+            atomicAmountParam,
+            { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+          ],
+        },
+        auto_execute: { type: 'boolean', description: 'If true (default), hand off post-accept swap progress to the existing backend trade automation worker.' },
+        timeout_sec: { type: 'integer', minimum: 5, maximum: 3600, description: 'How long to wait for a matching quote before failing.' },
+        trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+        rfq_mode: { type: 'string', minLength: 1, maxLength: 32, description: 'Reserved caller hint; accepted for compatibility but does not alter protocol behavior.' },
+        ln_liquidity_mode: {
+          type: 'string',
+          enum: ['single_channel', 'aggregate'],
+          description:
+            'Lightning outbound liquidity guardrail mode used when accepting the quote. single_channel requires one active channel to cover btc_sats; aggregate allows sum across active channels.',
+        },
+      },
+      required: ['channel', 'pair', 'btc_sats'],
+    }
+  ),
+  tool(
     'intercomswap_quote_post',
     'Post a signed QUOTE envelope into an RFQ channel (references an RFQ id). Fees are read from on-chain config/trade-config (not negotiated). Provide either valid_until_unix or valid_for_sec.',
     {
@@ -887,6 +928,39 @@ export const INTERCOMSWAP_TOOLS = [
         timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000, description: 'Optional timeout (default 30000).' },
       },
       required: [],
+    }
+  ),
+  tool(
+    'intercomswap_ln_bootstrap',
+    'LND-only infrastructure bootstrap for a local node: ensure config/start, create or unlock wallet, print node pubkey + funding address, and optionally open a channel to a peer.',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        node: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$' },
+        network: { type: 'string', minLength: 1, maxLength: 32 },
+        wallet_password_file: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 400,
+          pattern: '^[^\\s]+$',
+          description: 'Optional wallet password file under onchain/. Required if the wallet must be created or unlocked.',
+        },
+        peer_node: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$' },
+        wait_funding: { type: 'boolean' },
+        channel_amount_sats: { type: 'integer', minimum: 1_000, maximum: 10_000_000_000 },
+        lnd_dir: { type: 'string', minLength: 1, maxLength: 400, pattern: '^[^\\s]+$' },
+        ln_impl: { type: 'string', minLength: 1, maxLength: 16 },
+        ln_backend: { type: 'string', minLength: 1, maxLength: 16 },
+        ln_compose_file: { type: 'string', minLength: 1, maxLength: 400, pattern: '^[^\\s]+$' },
+        ln_service: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' },
+        ln_cli_bin: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[^\\s]+$' },
+        lnd_bin: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[^\\s]+$' },
+        lnd_rpcserver: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[^\\s]+$' },
+        lnd_tlscert: { type: 'string', minLength: 1, maxLength: 400, pattern: '^[^\\s]+$' },
+        lnd_macaroon: { type: 'string', minLength: 1, maxLength: 400, pattern: '^[^\\s]+$' },
+      },
+      required: ['node'],
     }
   ),
   tool('intercomswap_ln_info', 'Get Lightning node info (impl/backend configured locally).', emptyParams),
@@ -1564,6 +1638,40 @@ export const INTERCOMSWAP_TOOLS = [
         maxLength: 400,
         description: 'Optional receipts db override (must be under onchain/receipts and end with .sqlite).',
       },
+      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+    },
+    required: ['trade_id'],
+  }),
+  tool('intercomswap_get_trades', 'List recent local trades in a pair-neutral shape using the configured receipts DB.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      limit: { type: 'integer', minimum: 1, maximum: 1000 },
+      role: { type: 'string', enum: ['maker', 'taker'] },
+      status: { type: 'string', minLength: 1, maxLength: 32, description: 'Optional state filter or alias (for example: pending, completed, refunded).' },
+    },
+    required: [],
+  }),
+  tool('intercomswap_get_trade_status', 'Show a normalized trade status view from the configured receipts DB.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+    },
+    required: ['trade_id'],
+  }),
+  tool('intercomswap_claim', 'Claim a swap settlement using the existing executor claim path and configured receipts DB.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+    },
+    required: ['trade_id'],
+  }),
+  tool('intercomswap_refund', 'Refund a swap settlement using the existing executor refund path and configured receipts DB.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
       trade_id: { type: 'string', minLength: 1, maxLength: 128 },
     },
     required: ['trade_id'],

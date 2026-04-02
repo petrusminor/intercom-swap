@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { stableStringify } from '../util/stableStringify.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 const LEGACY_RFV_CHANNEL_COL = ['o', 't', 'c'].join('') + '_channel';
 const SETTLEMENT_KIND_SOLANA = 'solana';
@@ -117,6 +117,14 @@ function ensureTradeSettlementColumns(db) {
     db.exec('ALTER TABLE trades ADD COLUMN tao_refund_after_unix INTEGER;');
     cols.add('tao_refund_after_unix');
   }
+  if (!cols.has('reconciliation_source')) {
+    db.exec('ALTER TABLE trades ADD COLUMN reconciliation_source TEXT;');
+    cols.add('reconciliation_source');
+  }
+  if (!cols.has('reconciliation_ts')) {
+    db.exec('ALTER TABLE trades ADD COLUMN reconciliation_ts INTEGER;');
+    cols.add('reconciliation_ts');
+  }
 }
 
 function migrateSchema(db) {
@@ -147,6 +155,13 @@ function migrateSchema(db) {
     // v3 -> v4: settlement-aware receipt fields for TAO EVM parity.
     ensureTradeSettlementColumns(db);
     current = 4;
+    writeSchemaVersion(db, current);
+  }
+
+  if (current === 4) {
+    // v4 -> v5: local-only reconciliation metadata for manual on-chain state repair.
+    ensureTradeSettlementColumns(db);
+    current = 5;
     writeSchemaVersion(db, current);
   }
 
@@ -261,6 +276,8 @@ function mapRow(row) {
     tao_lock_tx_id: row.tao_lock_tx_id,
     tao_claim_tx_id: row.tao_claim_tx_id,
     tao_refund_tx_id: row.tao_refund_tx_id,
+    reconciliation_source: row.reconciliation_source,
+    reconciliation_ts: row.reconciliation_ts,
 
     ln_invoice_bolt11: row.ln_invoice_bolt11,
     ln_payment_hash_hex: row.ln_payment_hash_hex,
@@ -352,6 +369,7 @@ export class TradeReceiptsStore {
         btc_sats, usdt_amount,
         sol_mint, sol_program_id, sol_recipient, sol_refund, sol_escrow_pda, sol_vault_ata, sol_refund_after_unix,
         settlement_kind, tao_settlement_id, tao_htlc_address, tao_amount_atomic, tao_recipient, tao_refund, tao_refund_after_unix, tao_lock_tx_id, tao_claim_tx_id, tao_refund_tx_id,
+        reconciliation_source, reconciliation_ts,
         ln_invoice_bolt11, ln_payment_hash_hex, ln_preimage_hex,
         state, created_at, updated_at, last_error
       )
@@ -360,6 +378,7 @@ export class TradeReceiptsStore {
         ?, ?,
         ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?,
         ?, ?, ?,
         ?, ?, ?, ?
       )
@@ -388,6 +407,8 @@ export class TradeReceiptsStore {
         tao_lock_tx_id=excluded.tao_lock_tx_id,
         tao_claim_tx_id=excluded.tao_claim_tx_id,
         tao_refund_tx_id=excluded.tao_refund_tx_id,
+        reconciliation_source=excluded.reconciliation_source,
+        reconciliation_ts=excluded.reconciliation_ts,
         ln_invoice_bolt11=excluded.ln_invoice_bolt11,
         ln_payment_hash_hex=excluded.ln_payment_hash_hex,
         ln_preimage_hex=excluded.ln_preimage_hex,
@@ -440,6 +461,8 @@ export class TradeReceiptsStore {
         tao_lock_tx_id TEXT,
         tao_claim_tx_id TEXT,
         tao_refund_tx_id TEXT,
+        reconciliation_source TEXT,
+        reconciliation_ts INTEGER,
 
         ln_invoice_bolt11 TEXT,
         ln_payment_hash_hex TEXT,
@@ -586,6 +609,8 @@ export class TradeReceiptsStore {
       tao_lock_tx_id: coerceText(next.tao_lock_tx_id),
       tao_claim_tx_id: coerceText(next.tao_claim_tx_id),
       tao_refund_tx_id: coerceText(next.tao_refund_tx_id),
+      reconciliation_source: coerceText(next.reconciliation_source),
+      reconciliation_ts: next.reconciliation_ts === undefined ? undefined : coerceInt(next.reconciliation_ts),
       ln_invoice_bolt11: coerceText(next.ln_invoice_bolt11),
       ln_payment_hash_hex:
         next.ln_payment_hash_hex === undefined ? undefined : coerceHex32(next.ln_payment_hash_hex, 'ln_payment_hash_hex'),
@@ -628,6 +653,8 @@ export class TradeReceiptsStore {
       row.tao_lock_tx_id,
       row.tao_claim_tx_id,
       row.tao_refund_tx_id,
+      row.reconciliation_source,
+      row.reconciliation_ts,
       row.ln_invoice_bolt11,
       row.ln_payment_hash_hex,
       row.ln_preimage_hex,

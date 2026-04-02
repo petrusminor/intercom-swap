@@ -123,6 +123,25 @@ These choices should be surfaced as the initial configuration flow for the skill
   Instead, generate a **run script** for humans to start the peer and **track that script** for future changes.
  - **Security default:** use only SC‑Bridge **JSON** commands (`send/join/open/stats/info`). Keep `--sc-bridge-cli 1` **off** unless a human explicitly requests remote CLI control.
 
+### SC-Bridge Connectivity Diagnostics
+- Known failure mode: websocket `non-101` can actually be local socket denial, for example `connect EPERM 127.0.0.1:<port>`. Treat that as a local process/network permission issue, not automatically as a bad SC-Bridge URL.
+- Correct local baseline:
+  - maker: `ws://127.0.0.1:49222`
+  - taker: `ws://127.0.0.1:49223`
+  - do **not** use `wss://` for the local SC-Bridge
+  - direct websocket upgrade should succeed with `101`
+- Required checks:
+  - verify the websocket endpoint directly
+  - verify the SC-Bridge listener is running
+  - verify no TLS mismatch (`ws://` vs `wss://`)
+  - verify no stale env/config overrides for host/port/protocol
+- Critical insight: if a direct websocket test succeeds but `rfq-maker` / `rfq-taker` still fail, suspect the local execution environment first. `EPERM` means local socket access is blocked by the runtime/sandbox.
+- TAO passive mode note: `rfq-taker` still requires `TAO_EVM_HTLC_ADDRESS` even with `--run-swap 0` because it must build the settlement binding.
+- Validation standard:
+  - maker reaches `{"type":"ready"}`
+  - taker reaches `{"type":"waiting_offer"}`
+  - no websocket errors appear in startup logs
+
 ## Deterministic Scripts (Mandatory)
 To keep operation non-fuzzy and cross-platform, any agent guidance MUST be delivered as scripts:
 - macOS/Linux: `.sh`
@@ -199,6 +218,31 @@ This repo also provides long-running RFQ “agent bots” that sit in an RFQ cha
   - With `--run-swap 1`, it also runs the **full swap state machine** inside the `swap:<id>` invite-only channel (terms -> invoice -> escrow).
 - `scripts/rfq-taker.mjs`: sends a `swap.rfq`, waits for a `swap.quote`, sends `swap.quote_accept`, waits for `swap.swap_invite`, then joins the `swap:<id>` channel.
   - With `--run-swap 1`, it also runs the **full swap state machine** (accept -> verify escrow on-chain -> pay LN -> claim Solana escrow).
+
+### RFQ Selection Behavior (Current Limitation)
+- Current behavior:
+  - `rfq-taker` accepts the first valid offer/quote it receives.
+  - There is no aggregation or ranking across multiple offers.
+  - There is no best-price selection based on `tao_amount_atomic` or economic value.
+- Maker behavior:
+  - In the RFQ bot path, maker copies `tao_amount_atomic` from the RFQ into the quote.
+  - Makers do not independently price the trade in the RFQ bot path.
+  - Multiple makers responding to the same RFQ therefore produce identical quoted amounts.
+- Implication:
+  - Multi-offer environments do not result in price competition.
+  - Execution is order-dependent; first valid offer/quote wins.
+- Guardrails that still apply:
+  - fee caps (`platform`, `trade`, `total`)
+  - refund window compatibility
+  - `rfq_id` / `app_hash` / expiry validation
+  - exact `btc_sats` match
+  - `amount_below_rfq_min`
+- Not implemented:
+  - no slippage model
+  - no best-offer selection
+  - no multi-offer comparison window
+- Future direction:
+  - best-offer selection would require collecting multiple offers, ranking candidates, and applying a deterministic selection rule
 
 ### Deterministic Test Flags (Regtest Only)
 - `--test-stop-before-ln-pay 1`

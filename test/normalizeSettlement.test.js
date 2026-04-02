@@ -42,6 +42,25 @@ test('normalizeSettlement maps TAO_EVM legacy settlement fields', () => {
   });
 });
 
+test('normalizeSettlement maps persisted TAO receipt aliases', () => {
+  const out = normalizeSettlement(PAIR.BTC_LN__TAO_EVM, {
+    tao_amount_atomic: '500000000000000000',
+    tao_recipient: '0x1111111111111111111111111111111111111111',
+    tao_refund: '0x2222222222222222222222222222222222222222',
+    tao_refund_after_unix: 1770005678,
+    tao_htlc_address: '0x3333333333333333333333333333333333333333',
+  });
+
+  assert.deepEqual(out, {
+    recipient: '0x1111111111111111111111111111111111111111',
+    refund: '0x2222222222222222222222222222222222222222',
+    refund_after_unix: 1770005678,
+    amount: '500000000000000000',
+    settlement_kind: 'tao-evm',
+    settlement_asset_id: '0x3333333333333333333333333333333333333333',
+  });
+});
+
 test('normalizeSettlement prefers generic settlement tool fields when present', () => {
   const out = normalizeSettlement(PAIR.BTC_LN__TAO_EVM, {
     amount: '300',

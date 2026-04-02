@@ -274,6 +274,12 @@ export function resolveMakerCleanupPersistence(ctx, { reason = null } = {}) {
   const txId = String(ctx?.taoLockTxId || '').trim();
   const lockPhase = String(ctx?.taoLockPhase || '').trim().toLowerCase();
   let state = String(ctx?.trade?.state || '').trim() || null;
+  if ([STATE.CLAIMED, STATE.REFUNDED, STATE.CANCELED].includes(state)) {
+    return {
+      state,
+      last_error: String(ctx?.lastLockError || '').trim() || (reason ? String(reason) : null),
+    };
+  }
   if (isTaoPair(ctx?.pair)) {
     if (txId) state = STATE.ESCROW;
     else if (lockPhase === 'locking') state = 'locking';

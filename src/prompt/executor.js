@@ -32,6 +32,7 @@ import { buildSettlementContext } from '../swap/settlementContext.js';
 import { parseUnixSecondsOrNull } from '../swap/timelockPolicy.js';
 import { hashTermsEnvelope } from '../swap/terms.js';
 import {
+  getDefaultPairForSettlementKind,
   getAmountFieldForPair,
   getAmountForPair,
   getDirectionForPair,
@@ -211,6 +212,37 @@ function normalizeAtomicAmount(s, label = 'amount') {
   return v;
 }
 
+const MAX_BTC_SATS = 21_000_000 * 100_000_000;
+
+function normalizePositiveSatsValue(value, label = 'btc_sats') {
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_BTC_SATS) {
+      throw new Error(`${label} must be an integer between 1 and ${MAX_BTC_SATS}`);
+    }
+    return value;
+  }
+  const s = String(value ?? '').trim();
+  if (!/^[0-9]+$/.test(s)) throw new Error(`${label} must be a decimal integer`);
+  const n = Number(s);
+  if (!Number.isSafeInteger(n) || n < 1 || n > MAX_BTC_SATS) {
+    throw new Error(`${label} must be an integer between 1 and ${MAX_BTC_SATS}`);
+  }
+  return n;
+}
+
+function normalizeOptionalAtomicInput(value, label = 'amount') {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`${label} must be a non-negative integer`);
+    }
+    return String(value);
+  }
+  const s = String(value).trim();
+  if (!s) return null;
+  return normalizeAtomicAmount(s, label);
+}
+
 function normalizeOptionalSettlementAddressValue(value, label = 'settlement address') {
   if (value === undefined || value === null) return null;
   const s = String(value).trim();
@@ -230,6 +262,76 @@ function normalizeRequiredUnixSecondsValue(value, label = 'refund_after_unix') {
     throw new Error(`${label} must be an integer >= 1`);
   }
   return n;
+}
+
+function parseKeyValueLines(text) {
+  const out = {};
+  const lines = String(text || '').split(/\r?\n/);
+  for (const lineRaw of lines) {
+    const line = String(lineRaw || '').trim();
+    if (!line) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (!key) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function buildEffectiveLnConfig(currentLn = {}, overrides = {}) {
+  return {
+    ...currentLn,
+    impl: overrides.impl ?? currentLn.impl,
+    backend: overrides.backend ?? currentLn.backend,
+    composeFile: overrides.composeFile ?? currentLn.composeFile,
+    service: overrides.service ?? currentLn.service,
+    network: overrides.network ?? currentLn.network,
+    cliBin: overrides.cliBin ?? currentLn.cliBin,
+    cwd: overrides.cwd ?? currentLn.cwd ?? process.cwd(),
+    lnd: {
+      ...(currentLn?.lnd || {}),
+      ...(overrides.lnd || {}),
+    },
+  };
+}
+
+async function isLnReady(config) {
+  try {
+    const info = await lnGetInfo(config);
+    const funds = await lnListFunds(config);
+    const channels = Array.isArray(funds?.channels)
+      ? funds.channels
+      : Array.isArray(funds?.channels?.channels)
+        ? funds.channels.channels
+        : [];
+    const walletConfirmedSat = (() => {
+      try {
+        return BigInt(String(funds?.wallet?.confirmed_balance ?? 0));
+      } catch (_e) {
+        return 0n;
+      }
+    })();
+    return {
+      ok: true,
+      unlocked: true,
+      responsive: true,
+      hasChannel: Array.isArray(channels) && channels.length > 0,
+      canOpenChannel: walletConfirmedSat > 0n,
+      info,
+      funds,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      unlocked: false,
+      responsive: false,
+      hasChannel: false,
+      canOpenChannel: false,
+      error: err?.message ?? String(err),
+    };
+  }
 }
 
 function parseLocalRpcPortFromUrls(urls, fallback = 8899) {
@@ -509,6 +611,87 @@ function isTerminalTradeState(value) {
 function isActiveTradeState(value) {
   const st = normalizeTradeState(value);
   return st ? ACTIVE_TRADE_STATES.has(st) : false;
+}
+
+function inferTradeSettlementKind(trade) {
+  const explicit = normalizeSettlementKind(trade?.settlement_kind, { allowUndefined: true });
+  if (explicit) return explicit;
+  if (
+    isNonEmptyString(trade?.tao_settlement_id) ||
+    isNonEmptyString(trade?.tao_htlc_address) ||
+    isNonEmptyString(trade?.tao_amount_atomic) ||
+    isNonEmptyString(trade?.tao_lock_tx_id) ||
+    isNonEmptyString(trade?.tao_claim_tx_id) ||
+    isNonEmptyString(trade?.tao_refund_tx_id)
+  ) {
+    return SETTLEMENT_KIND.TAO_EVM;
+  }
+  return SETTLEMENT_KIND.SOLANA;
+}
+
+function assertNormalizedAmount(normalized) {
+  if (!normalized || normalized.amount === undefined || normalized.amount === null || String(normalized.amount).trim() === '') {
+    throw new Error('Normalized settlement amount missing');
+  }
+}
+
+function normalizeUnixSeconds(ts) {
+  if (ts === null || ts === undefined) return ts;
+  const n = typeof ts === 'number' ? ts : Number.parseInt(String(ts).trim(), 10);
+  if (!Number.isFinite(n)) return null;
+  if (n < 0) return null;
+  if (n > 1e12) {
+    const normalized = Math.floor(n / 1000);
+    if (normalized !== n) {
+      try {
+        process.stderr.write(
+          `[executor] WARN normalize_refund_after_unix original_ts=${Math.trunc(n)} normalized_ts=${normalized}\n`
+        );
+      } catch (_e) {}
+    }
+    return normalized;
+  }
+  return Math.trunc(n);
+}
+
+function normalizeTradeSettlementSnapshot(trade) {
+  if (!trade || typeof trade !== 'object') return null;
+  const settlementKind = inferTradeSettlementKind(trade);
+  const pair = normalizePair(trade?.pair || getDefaultPairForSettlementKind(settlementKind));
+  const normalized = normalizeSettlement(pair, trade);
+  assertNormalizedAmount(normalized);
+  const amountField = getAmountFieldForPair(pair);
+  const settlementAmount = normalizeAtomicAmount(normalized.amount, amountField);
+  const normalizedRefundAfterUnix = normalizeUnixSeconds(normalized.refund_after_unix);
+  return {
+    pair,
+    settlement_kind: settlementKind,
+    settlement_amount: settlementAmount,
+    settlement: {
+      ...normalized,
+      refund_after_unix: normalizedRefundAfterUnix,
+    },
+  };
+}
+
+function isActionable(state, timestamps, settlement, trade = {}, { nowUnix = Math.floor(Date.now() / 1000) } = {}) {
+  const st = normalizeTradeState(state);
+  const refundAfterUnix = toPositiveIntOrNull(normalizeUnixSeconds(settlement?.refund_after_unix));
+  const claimed = st === 'claimed';
+  const refunded = st === 'refunded';
+  const canClaim = st === 'ln_paid' && !claimed && !refunded && /^[0-9a-f]{64}$/i.test(String(trade?.ln_preimage_hex || '').trim());
+  const nowSec = normalizeUnixSeconds(nowUnix);
+  const canRefund = st === 'escrow' && !claimed && !refunded && refundAfterUnix !== null && nowSec !== null && nowSec > refundAfterUnix;
+  return { can_claim: canClaim, can_refund: canRefund };
+}
+
+function matchesTradeStatusFilter(trade, statusFilter) {
+  const want = normalizeTradeState(statusFilter);
+  if (!want) return true;
+  const state = normalizeTradeState(trade?.state);
+  if (want === 'completed') return isTerminalTradeState(state);
+  if (want === 'pending') return !isTerminalTradeState(state);
+  return state === want;
 }
 
 function toPositiveIntOrNull(value) {
@@ -3849,6 +4032,214 @@ export class ToolExecutor {
 	      }
 	    }
 
+    if (toolName === 'intercomswap_run_swap') {
+      assertAllowedKeys(args, toolName, [
+        'channel',
+        'pair',
+        'btc_sats',
+        'usdt_amount',
+        'tao_amount_atomic',
+        'auto_execute',
+        'timeout_sec',
+        'trade_id',
+        'rfq_mode',
+        'ln_liquidity_mode',
+      ]);
+      requireApproval(toolName, autoApprove);
+      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
+      const pair = normalizePair(expectString(args, toolName, 'pair', { min: 1, max: 64 }));
+      const btcSats = normalizePositiveSatsValue(args.btc_sats, 'btc_sats');
+      const autoExecute = 'auto_execute' in args ? expectBool(args, toolName, 'auto_execute') : true;
+      const timeoutSec = expectOptionalInt(args, toolName, 'timeout_sec', { min: 5, max: 3600 }) ?? 60;
+      const tradeId =
+        expectOptionalString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ }) ||
+        `swaprun_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const rfqMode = expectOptionalString(args, toolName, 'rfq_mode', { min: 1, max: 32, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const lnLiquidityMode =
+        expectOptionalString(args, toolName, 'ln_liquidity_mode', { min: 1, max: 32, pattern: /^(single_channel|aggregate)$/ }) ||
+        'single_channel';
+      const amountField = getAmountFieldForPair(pair);
+
+      const amountArgs = {
+        usdt_amount: normalizeOptionalAtomicInput(args.usdt_amount, 'usdt_amount'),
+        tao_amount_atomic: normalizeOptionalAtomicInput(args.tao_amount_atomic, 'tao_amount_atomic'),
+      };
+      if (isTaoPair(pair) && amountArgs.usdt_amount !== null) {
+        throw new Error(`${toolName}: usdt_amount not allowed for ${pair}`);
+      }
+      if (!isTaoPair(pair) && amountArgs.tao_amount_atomic !== null) {
+        throw new Error(`${toolName}: tao_amount_atomic not allowed for ${pair}`);
+      }
+
+      const normalizedSettlement = normalizeSettlement(pair, amountArgs);
+      if (!normalizedSettlement.amount) {
+        throw new Error(`${toolName}: ${amountField} is required for ${pair}`);
+      }
+      const settlementAmount = normalizeAtomicAmount(normalizedSettlement.amount, amountField);
+      const settlementKind = normalizedSettlement.settlement_kind;
+
+      const rfqArgs = {
+        channel,
+        trade_id: tradeId,
+        pair,
+        btc_sats: btcSats,
+        ...(pair === PAIR.BTC_LN__TAO_EVM
+          ? { tao_amount_atomic: settlementAmount }
+          : { usdt_amount: settlementAmount }),
+      };
+
+      if (dryRun) {
+        const rfqDryRun = await this.execute('intercomswap_rfq_post', rfqArgs, {
+          autoApprove: true,
+          dryRun: true,
+          secrets,
+        });
+        return {
+          type: 'dry_run',
+          tool: toolName,
+          trade_id: tradeId,
+          pair,
+          btc_sats: btcSats,
+          settlement_amount: settlementAmount,
+          settlement_kind: settlementKind,
+          channel,
+          auto_execute: autoExecute,
+          ...(rfqMode ? { rfq_mode: rfqMode } : {}),
+          rfq: rfqDryRun,
+        };
+      }
+
+      await this.execute('intercomswap_sc_subscribe', { channels: [channel] }, {
+        autoApprove: true,
+        dryRun: false,
+        secrets,
+      });
+
+      const rfqOut = await this.execute('intercomswap_rfq_post', rfqArgs, {
+        autoApprove: true,
+        dryRun: false,
+        secrets,
+      });
+      const rfqId = String(rfqOut?.rfq_id || '').trim().toLowerCase();
+      if (!rfqId) throw new Error(`${toolName}: rfq_post returned empty rfq_id`);
+
+      const findMatchingQuote = () => {
+        for (let i = this._scLog.length - 1; i >= 0; i -= 1) {
+          const evt = this._scLog[i];
+          if (!evt || typeof evt !== 'object') continue;
+          if (String(evt.channel || '').trim() !== channel) continue;
+          const msg = evt.message;
+          if (!isObject(msg)) continue;
+          if (String(msg.kind || '').trim() !== KIND.QUOTE) continue;
+          if (String(msg.trade_id || '').trim() !== tradeId) continue;
+          const body = isObject(msg.body) ? msg.body : {};
+          const bodyRfqId = String(body.rfq_id || '').trim().toLowerCase();
+          if (bodyRfqId !== rfqId) continue;
+          return msg;
+        }
+        return null;
+      };
+
+      let quoteEnvelope = findMatchingQuote();
+      if (!quoteEnvelope) {
+        const evt = await this._scWaitFor(
+          (e) => {
+            if (!e || typeof e !== 'object') return false;
+            if (String(e.channel || '').trim() !== channel) return false;
+            const msg = e.message;
+            if (!isObject(msg)) return false;
+            if (String(msg.kind || '').trim() !== KIND.QUOTE) return false;
+            if (String(msg.trade_id || '').trim() !== tradeId) return false;
+            const body = isObject(msg.body) ? msg.body : {};
+            return String(body.rfq_id || '').trim().toLowerCase() === rfqId;
+          },
+          { timeoutMs: timeoutSec * 1000 }
+        );
+        if (!evt || !isObject(evt.message)) {
+          throw new Error(`${toolName}: timed out waiting for quote (trade_id=${tradeId}, rfq_id=${rfqId}, timeout_sec=${timeoutSec})`);
+        }
+        quoteEnvelope = evt.message;
+      }
+
+      const quoteAcceptOut = await this.execute(
+        'intercomswap_quote_accept',
+        {
+          channel,
+          quote_envelope: quoteEnvelope,
+          ln_liquidity_mode: lnLiquidityMode,
+        },
+        {
+          autoApprove: true,
+          dryRun: false,
+          secrets,
+        }
+      );
+      const quoteId = String(quoteAcceptOut?.quote_id || '').trim().toLowerCase();
+
+      let status = 'quote_accepted';
+      let tradeAutoOut = null;
+      if (autoExecute) {
+        const tradeAutoStatus = await this.execute('intercomswap_tradeauto_status', {}, {
+          autoApprove: true,
+          dryRun: false,
+          secrets,
+        });
+        const watchedChannels = Array.isArray(tradeAutoStatus?.options?.channels)
+          ? tradeAutoStatus.options.channels.map((c) => String(c || '').trim())
+          : [];
+        if (!tradeAutoStatus?.running) {
+          tradeAutoOut = await this.execute(
+            'intercomswap_tradeauto_start',
+            {
+              channels: [channel],
+              settlement: settlementKind,
+              ln_liquidity_mode: lnLiquidityMode,
+              enable_quote_from_offers: false,
+              enable_quote_from_rfqs: false,
+              enable_accept_quotes: false,
+              enable_invite_from_accepts: false,
+              enable_join_invites: true,
+              enable_settlement: true,
+            },
+            {
+              autoApprove: true,
+              dryRun: false,
+              secrets,
+            }
+          );
+          status = 'quote_accepted_tradeauto_started';
+        } else if (watchedChannels.includes(channel)) {
+          tradeAutoOut = tradeAutoStatus;
+          status = 'quote_accepted_tradeauto_active';
+        } else {
+          tradeAutoOut = tradeAutoStatus;
+          status = 'quote_accepted_tradeauto_channel_missing';
+        }
+      }
+
+      const listingState = await this._inspectListingState({ tradeId, rfqId, quoteId });
+
+      return {
+        type: 'swap_run_started',
+        trade_id: tradeId,
+        rfq_id: rfqId,
+        quote_id: quoteId || null,
+        pair,
+        btc_sats: btcSats,
+        settlement_amount: settlementAmount,
+        settlement_kind: settlementKind,
+        channel,
+        status,
+        swap_channel: listingState?.swap_channel || null,
+        details: {
+          rfq_post: rfqOut,
+          quote_accept: quoteAcceptOut,
+          ...(tradeAutoOut ? { trade_auto: tradeAutoOut } : {}),
+          ...(rfqMode ? { rfq_mode: rfqMode } : {}),
+        },
+      };
+    }
+
     if (toolName === 'intercomswap_quote_post') {
       assertAllowedKeys(args, toolName, [
         'channel',
@@ -5925,6 +6316,138 @@ export class ToolExecutor {
     }
 
     // Lightning tools
+    if (toolName === 'intercomswap_ln_bootstrap') {
+      assertAllowedKeys(args, toolName, [
+        'node',
+        'network',
+        'wallet_password_file',
+        'peer_node',
+        'wait_funding',
+        'channel_amount_sats',
+        'lnd_dir',
+        'ln_impl',
+        'ln_backend',
+        'ln_compose_file',
+        'ln_service',
+        'ln_cli_bin',
+        'lnd_bin',
+        'lnd_rpcserver',
+        'lnd_tlscert',
+        'lnd_macaroon',
+      ]);
+      requireApproval(toolName, autoApprove);
+
+      const node = expectString(args, toolName, 'node', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      const network = expectOptionalString(args, toolName, 'network', { min: 1, max: 32 }) || String(this.ln?.network || '').trim() || 'regtest';
+      const lnImpl = (expectOptionalString(args, toolName, 'ln_impl', { min: 1, max: 16 }) || String(this.ln?.impl || '').trim() || 'lnd').toLowerCase();
+      const lnBackend = (expectOptionalString(args, toolName, 'ln_backend', { min: 1, max: 16 }) || String(this.ln?.backend || '').trim() || 'cli').toLowerCase();
+      if (lnImpl !== 'lnd') throw new Error(`${toolName}: ln_impl must be "lnd"`);
+      if (lnBackend !== 'cli') throw new Error(`${toolName}: ln_backend must be "cli"`);
+
+      const walletPasswordFileArg = expectOptionalString(args, toolName, 'wallet_password_file', { min: 1, max: 400, pattern: /^[^\s]+$/ });
+      const peerNode = expectOptionalString(args, toolName, 'peer_node', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      const waitFunding = 'wait_funding' in args ? expectBool(args, toolName, 'wait_funding') : false;
+      const channelAmountSats = expectOptionalInt(args, toolName, 'channel_amount_sats', { min: 1_000, max: 10_000_000_000 });
+      const lndDirArg = expectOptionalString(args, toolName, 'lnd_dir', { min: 1, max: 400, pattern: /^[^\s]+$/ });
+      const lnComposeFileArg = expectOptionalString(args, toolName, 'ln_compose_file', { min: 1, max: 400, pattern: /^[^\s]+$/ });
+      const lnServiceArg = expectOptionalString(args, toolName, 'ln_service', { min: 1, max: 64, pattern: /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/ });
+      const lnCliBin = expectOptionalString(args, toolName, 'ln_cli_bin', { min: 1, max: 256, pattern: /^[^\s]+$/ }) || String(this.ln?.cliBin || '').trim();
+      const lndBin = expectOptionalString(args, toolName, 'lnd_bin', { min: 1, max: 256, pattern: /^[^\s]+$/ });
+      const lndRpcserver = expectOptionalString(args, toolName, 'lnd_rpcserver', { min: 1, max: 128, pattern: /^[^\s]+$/ }) || String(this.ln?.lnd?.rpcserver || '').trim();
+      const lndTlsCertArg = expectOptionalString(args, toolName, 'lnd_tlscert', { min: 1, max: 400, pattern: /^[^\s]+$/ });
+      const lndMacaroonArg = expectOptionalString(args, toolName, 'lnd_macaroon', { min: 1, max: 400, pattern: /^[^\s]+$/ });
+
+      const scriptPath = resolveWithinRepoRoot('scripts/ln-bootstrap.sh', { label: 'ln-bootstrap.sh', mustExist: true });
+      const lndDir = lndDirArg
+        ? resolveWithinRepoRoot(lndDirArg, { label: 'lnd_dir', allowDir: true })
+        : String(this.ln?.lnd?.lnddir || '').trim()
+          ? resolveWithinRepoRoot(String(this.ln?.lnd?.lnddir || '').trim(), { label: 'lnd_dir', allowDir: true })
+          : '';
+      const walletPasswordFile = walletPasswordFileArg
+        ? resolveOnchainPath(walletPasswordFileArg, { label: 'wallet_password_file' })
+        : String(this.ln?.walletPasswordFile || '').trim()
+          ? resolveOnchainPath(String(this.ln?.walletPasswordFile || '').trim(), { label: 'wallet_password_file' })
+          : '';
+      const lnComposeFile = lnComposeFileArg || '';
+      const lnService = lnServiceArg || '';
+      const lndTlsCert = lndTlsCertArg
+        ? resolveWithinRepoRoot(lndTlsCertArg, { label: 'lnd_tlscert' })
+        : String(this.ln?.lnd?.tlscertpath || '').trim()
+          ? resolveWithinRepoRoot(String(this.ln?.lnd?.tlscertpath || '').trim(), { label: 'lnd_tlscert' })
+          : '';
+      const lndMacaroon = lndMacaroonArg
+        ? resolveWithinRepoRoot(lndMacaroonArg, { label: 'lnd_macaroon' })
+        : String(this.ln?.lnd?.macaroonpath || '').trim()
+          ? resolveWithinRepoRoot(String(this.ln?.lnd?.macaroonpath || '').trim(), { label: 'lnd_macaroon' })
+          : '';
+
+      const effectiveLn = buildEffectiveLnConfig(this.ln, {
+        impl: lnImpl,
+        backend: lnBackend,
+        network,
+        composeFile: lnComposeFile || String(this.ln?.composeFile || '').trim(),
+        service: lnService || String(this.ln?.service || '').trim(),
+        cliBin: lnCliBin || String(this.ln?.cliBin || '').trim(),
+        lnd: {
+          rpcserver: lndRpcserver,
+          tlscertpath: lndTlsCert,
+          macaroonpath: lndMacaroon,
+          lnddir: lndDir || String(this.ln?.lnd?.lnddir || '').trim(),
+        },
+      });
+
+      const preReady = await isLnReady(effectiveLn);
+
+      const cmdArgs = [scriptPath, '--node', node, '--network', network, '--ln-impl', lnImpl, '--ln-backend', lnBackend];
+      if (walletPasswordFile) cmdArgs.push('--wallet-password-file', walletPasswordFile);
+      if (peerNode) cmdArgs.push('--peer-node', peerNode);
+      cmdArgs.push('--wait-funding', waitFunding ? '1' : '0');
+      if (channelAmountSats !== null) cmdArgs.push('--channel-amount-sats', String(channelAmountSats));
+      if (lndDir) cmdArgs.push('--lnd-dir', lndDir);
+      if (lnComposeFile) cmdArgs.push('--ln-compose-file', lnComposeFile);
+      if (lnService) cmdArgs.push('--ln-service', lnService);
+      if (lnCliBin) cmdArgs.push('--lncli-bin', lnCliBin);
+      if (lndBin) cmdArgs.push('--lnd-bin', lndBin);
+      if (lndRpcserver) cmdArgs.push('--lnd-rpcserver', lndRpcserver);
+      if (lndTlsCert) cmdArgs.push('--lnd-tlscert', lndTlsCert);
+      if (lndMacaroon) cmdArgs.push('--lnd-macaroon', lndMacaroon);
+
+      if (dryRun) {
+        return {
+          type: 'dry_run',
+          tool: toolName,
+          node,
+          network,
+          peer_node: peerNode,
+          wait_funding: waitFunding,
+          channel_amount_sats: channelAmountSats,
+          lnd_dir: lndDir || null,
+          ln_ready: preReady.ok,
+        };
+      }
+
+      const out = await execFileP('bash', cmdArgs, { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 10 });
+      const parsed = parseKeyValueLines(out.stdout);
+      const postReady = await isLnReady(effectiveLn);
+      const channelStatus = String(parsed.channel_status || '').trim().toLowerCase();
+
+      return {
+        type: 'ln_bootstrap',
+        node,
+        network,
+        node_pubkey: parsed.node_pubkey || null,
+        funding_address: parsed.funding_address || null,
+        channel_opened: channelStatus === 'active' && !preReady.hasChannel,
+        channel_active: channelStatus === 'active' || channelStatus === 'already_active' || postReady.hasChannel,
+        details: {
+          peer_uri: parsed.peer_uri || null,
+          confirmed_balance_sats: parsed.confirmed_balance_sats ? Number.parseInt(String(parsed.confirmed_balance_sats), 10) : null,
+          ln_ready_before: preReady.ok,
+          ln_ready_after: postReady.ok,
+        },
+      };
+    }
+
     if (toolName === 'intercomswap_ln_unlock') {
       assertAllowedKeys(args, toolName, ['password_file', 'timeout_ms']);
       requireApproval(toolName, autoApprove);
@@ -8182,6 +8705,10 @@ export class ToolExecutor {
 
     // Receipts + recovery (local-only)
     if (
+      toolName === 'intercomswap_get_trades' ||
+      toolName === 'intercomswap_get_trade_status' ||
+      toolName === 'intercomswap_claim' ||
+      toolName === 'intercomswap_refund' ||
       toolName === 'intercomswap_receipts_list' ||
       toolName === 'intercomswap_receipts_show' ||
       toolName === 'intercomswap_receipts_list_open_claims' ||
@@ -8212,6 +8739,26 @@ export class ToolExecutor {
       if (!dbPath) throw new Error('receipts db not configured (set receipts.db in prompt setup JSON)');
       const store = TradeReceiptsStore.open({ dbPath });
       try {
+      const listTradeEvents = (tradeId, { limit = 200 } = {}) => {
+        const n = Number.isFinite(limit) ? Math.max(1, Math.min(1000, Math.trunc(limit))) : 200;
+        return store.db
+          .prepare('SELECT ts, kind, payload_json FROM events WHERE trade_id = ? ORDER BY ts ASC LIMIT ?')
+          .all(tradeId, n)
+          .map((row) => {
+            let payload = null;
+            try {
+              const raw = String(row?.payload_json || '').trim();
+              payload = raw ? JSON.parse(raw) : null;
+            } catch (_e) {
+              payload = null;
+            }
+            return {
+              ts: Number(row?.ts || 0) || 0,
+              kind: String(row?.kind || '').trim(),
+              payload,
+            };
+          });
+      };
 
       const pickTrade = ({ tradeId, paymentHashHex }) => {
         if (tradeId) {
@@ -8226,6 +8773,150 @@ export class ToolExecutor {
         }
         throw new Error('Missing trade_id or payment_hash_hex');
       };
+
+      const getTradeSnapshot = (trade) => {
+        const snapshot = normalizeTradeSettlementSnapshot(trade);
+        if (!snapshot) throw new Error('trade snapshot unavailable');
+        const actions = isActionable(trade?.state, { created_at: trade?.created_at, updated_at: trade?.updated_at }, snapshot.settlement, trade);
+        return { snapshot, actions };
+      };
+
+      if (toolName === 'intercomswap_get_trades') {
+        assertAllowedKeys(args, toolName, ['limit', 'role', 'status']);
+        const limit = expectOptionalInt(args, toolName, 'limit', { min: 1, max: 1000 }) ?? 10;
+        const role = expectOptionalString(args, toolName, 'role', { min: 1, max: 16, pattern: /^(maker|taker)$/ });
+        const status = expectOptionalString(args, toolName, 'status', { min: 1, max: 32, pattern: /^[A-Za-z_]+$/ });
+        const trades = store
+          .listTradesPaged({ limit: 1000, offset: 0 })
+          .filter((trade) => !role || String(trade?.role || '').trim().toLowerCase() === role)
+          .filter((trade) => matchesTradeStatusFilter(trade, status))
+          .slice(0, limit)
+          .map((trade) => {
+            const { snapshot, actions } = getTradeSnapshot(trade);
+            return {
+              trade_id: trade.trade_id,
+              pair: snapshot.pair,
+              settlement_kind: snapshot.settlement_kind,
+              state: trade.state,
+              btc_sats: trade.btc_sats,
+              settlement_amount: snapshot.settlement_amount,
+              updated_at: trade.updated_at,
+              actionable: Boolean(actions.can_claim || actions.can_refund),
+            };
+          });
+        return { type: 'trades', trades };
+      }
+
+      if (toolName === 'intercomswap_get_trade_status') {
+        assertAllowedKeys(args, toolName, ['trade_id']);
+        const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128 });
+        const trade = pickTrade({ tradeId, paymentHashHex: null });
+        const { snapshot, actions } = getTradeSnapshot(trade);
+        return {
+          type: 'trade_status',
+          trade_id: trade.trade_id,
+          pair: snapshot.pair,
+          settlement_kind: snapshot.settlement_kind,
+          state: trade.state,
+          btc_sats: trade.btc_sats,
+          settlement_amount: snapshot.settlement_amount,
+          timestamps: {
+            created_at: trade.created_at,
+            updated_at: trade.updated_at,
+          },
+          settlement: {
+            recipient: snapshot.settlement.recipient,
+            refund: snapshot.settlement.refund,
+            refund_after_unix: snapshot.settlement.refund_after_unix,
+          },
+          onchain: {
+            lock_tx_id: trade.tao_lock_tx_id || trade.sol_escrow_pda || null,
+            claim_tx_id: trade.tao_claim_tx_id || null,
+            refund_tx_id: trade.tao_refund_tx_id || null,
+          },
+          actions_available: {
+            can_claim: actions.can_claim,
+            can_refund: actions.can_refund,
+          },
+        };
+      }
+
+      if (toolName === 'intercomswap_claim' || toolName === 'intercomswap_refund') {
+        assertAllowedKeys(args, toolName, ['trade_id']);
+        requireApproval(toolName, autoApprove);
+        const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128 });
+        const trade = pickTrade({ tradeId, paymentHashHex: null });
+        const { snapshot, actions } = getTradeSnapshot(trade);
+        const expectedSettlementKind = snapshot.settlement_kind;
+        if (expectedSettlementKind !== this._settlementKind()) {
+          throw new Error(
+            `${toolName}: trade settlement_kind=${expectedSettlementKind} does not match executor settlement_kind=${this._settlementKind()}`
+          );
+        }
+
+        const events = listTradeEvents(tradeId);
+        const swapChannel =
+          String(trade?.swap_channel || '').trim() ||
+          (() => {
+            for (let i = events.length - 1; i >= 0; i -= 1) {
+              const candidate = String(events[i]?.payload?.channel || '').trim();
+              if (candidate) return candidate;
+            }
+            return '';
+          })();
+        if (!swapChannel) throw new Error(`${toolName}: trade missing swap_channel`);
+
+        const mint = String(snapshot.settlement.settlement_asset_id || this._settlementAppBinding()).trim();
+        if (!mint) throw new Error(`${toolName}: trade missing settlement asset/binding`);
+
+        if (toolName === 'intercomswap_claim') {
+          if (!actions.can_claim) {
+            throw new Error(`${toolName}: claim not allowed in state=${normalizeTradeState(trade.state) || 'unknown'}`);
+          }
+          const preimageHex = normalizeHex32(String(trade?.ln_preimage_hex || '').trim(), 'ln_preimage_hex');
+          if (dryRun) return { type: 'dry_run', tool: toolName, trade_id: tradeId };
+          const out = await this.execute(
+            'intercomswap_swap_sol_claim_and_post',
+            {
+              channel: swapChannel,
+              trade_id: tradeId,
+              preimage_hex: preimageHex,
+              mint,
+            },
+            { autoApprove: true, dryRun: false, secrets }
+          );
+          return {
+            type: 'claim_result',
+            trade_id: tradeId,
+            status: 'claimed',
+            tx_id: String(out?.tx_id || out?.tx_sig || '').trim() || null,
+            settlement_kind: expectedSettlementKind,
+          };
+        }
+
+        if (!actions.can_refund) {
+          throw new Error(`${toolName}: refund not allowed in state=${normalizeTradeState(trade.state) || 'unknown'}`);
+        }
+        const paymentHashHex = normalizeHex32(String(trade?.ln_payment_hash_hex || '').trim(), 'ln_payment_hash_hex');
+        if (dryRun) return { type: 'dry_run', tool: toolName, trade_id: tradeId };
+        const out = await this.execute(
+          'intercomswap_swap_sol_refund_and_post',
+          {
+            channel: swapChannel,
+            trade_id: tradeId,
+            payment_hash_hex: paymentHashHex,
+            mint,
+          },
+          { autoApprove: true, dryRun: false, secrets }
+        );
+        return {
+          type: 'refund_result',
+          trade_id: tradeId,
+          status: 'refunded',
+          tx_id: String(out?.tx_id || out?.tx_sig || '').trim() || null,
+          settlement_kind: expectedSettlementKind,
+        };
+      }
 
       if (toolName === 'intercomswap_receipts_list') {
         assertAllowedKeys(args, toolName, ['db', 'limit', 'offset']);

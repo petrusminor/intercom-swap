@@ -274,6 +274,145 @@ export function resolveTakerRefundAfterMarginConfig({
   };
 }
 
+export function resolveTestStopBeforeLnPayConfig({ enabledRaw, lnNetwork } = {}) {
+  const enabled = parseBool(enabledRaw, false);
+  if (!enabled) {
+    return {
+      enabled: false,
+      warnings: [],
+    };
+  }
+  const normalizedNetwork = String(lnNetwork || '').trim().toLowerCase();
+  if (normalizedNetwork !== 'regtest') {
+    throw new Error('Invalid --test-stop-before-ln-pay (only supported when --ln-network regtest)');
+  }
+  return {
+    enabled: true,
+    warnings: [
+      'TEST MODE: stopping taker immediately before lnPay() for deterministic refund-path testing',
+    ],
+  };
+}
+
+export function resolveTestStopAfterLnPayBeforeClaimConfig({ enabledRaw, lnNetwork } = {}) {
+  const enabled = parseBool(enabledRaw, false);
+  if (!enabled) {
+    return {
+      enabled: false,
+      warnings: [],
+    };
+  }
+  const normalizedNetwork = String(lnNetwork || '').trim().toLowerCase();
+  if (normalizedNetwork !== 'regtest') {
+    throw new Error('Invalid --test-stop-after-ln-pay-before-claim (only supported when --ln-network regtest)');
+  }
+  return {
+    enabled: true,
+    warnings: [
+      'TEST MODE: stopping taker immediately after successful lnPay() and before settlement claim for deterministic crash-recovery testing',
+    ],
+  };
+}
+
+export function buildTestStopBeforeLnPayPayload({ tradeId, swapChannel, invoice, escrow } = {}) {
+  return {
+    stop_reason: 'test_stop_before_ln_pay',
+    trade_id: String(tradeId || '').trim() || null,
+    swap_channel: String(swapChannel || '').trim() || null,
+    ln_invoice_bolt11: String(invoice?.bolt11 || '').trim() || null,
+    ln_payment_hash_hex: String(invoice?.payment_hash_hex || '').trim().toLowerCase() || null,
+    settlement_id: String(escrow?.settlement_id || escrow?.escrow_pda || '').trim() || null,
+    refund_after_unix: escrow?.refund_after_unix ?? null,
+  };
+}
+
+export function buildTestStopAfterLnPayBeforeClaimPayload({
+  tradeId,
+  swapChannel,
+  paymentHashHex,
+  preimageHex,
+  escrow,
+} = {}) {
+  return {
+    stop_reason: 'test_stop_after_ln_pay_before_claim',
+    trade_id: String(tradeId || '').trim() || null,
+    swap_channel: String(swapChannel || '').trim() || null,
+    ln_payment_hash_hex: String(paymentHashHex || '').trim().toLowerCase() || null,
+    ln_preimage_hex: String(preimageHex || '').trim().toLowerCase() || null,
+    settlement_id: String(escrow?.settlement_id || escrow?.escrow_pda || '').trim() || null,
+    refund_after_unix: escrow?.refund_after_unix ?? null,
+  };
+}
+
+export function buildTestStopAfterLnPayBeforeClaimPatch({
+  settlementKind,
+  tradeState,
+  stopPayload,
+} = {}) {
+  const patch = {
+    ln_payment_hash_hex: stopPayload?.ln_payment_hash_hex || null,
+    ln_preimage_hex: stopPayload?.ln_preimage_hex || null,
+    state: String(tradeState || '').trim() || null,
+    last_error: stopPayload?.stop_reason || 'test_stop_after_ln_pay_before_claim',
+  };
+  if (settlementKind === SETTLEMENT_KIND.TAO_EVM) {
+    patch.tao_settlement_id = stopPayload?.settlement_id || null;
+    patch.tao_refund_after_unix = stopPayload?.refund_after_unix ?? null;
+  } else {
+    patch.sol_escrow_pda = stopPayload?.settlement_id || null;
+    patch.sol_refund_after_unix = stopPayload?.refund_after_unix ?? null;
+  }
+  return patch;
+}
+
+export async function maybeHandleTestStopAfterLnPayBeforeClaim({
+  enabled = false,
+  tradeId,
+  swapChannel,
+  settlementKind,
+  tradeState,
+  paymentHashHex,
+  preimageHex,
+  escrow,
+  persistTrade = null,
+  writeWarning = null,
+  writeEvent = null,
+  cleanupAndExit = null,
+} = {}) {
+  if (!enabled) return false;
+  const stopPayload = buildTestStopAfterLnPayBeforeClaimPayload({
+    tradeId,
+    swapChannel,
+    paymentHashHex,
+    preimageHex,
+    escrow,
+  });
+  if (typeof writeWarning === 'function') {
+    writeWarning(
+      `[taker] TEST MODE: stopping immediately after successful lnPay() and before settlement claim; no claim will be attempted\n`
+    );
+    writeWarning(`[taker] TEST MODE: stop_reason=${stopPayload.stop_reason} trade_id=${stopPayload.trade_id || 'n/a'}\n`);
+  }
+  if (typeof writeEvent === 'function') {
+    writeEvent({ type: 'test_stop_after_ln_pay_before_claim', ...stopPayload });
+  }
+  if (typeof persistTrade === 'function') {
+    persistTrade(
+      buildTestStopAfterLnPayBeforeClaimPatch({
+        settlementKind,
+        tradeState,
+        stopPayload,
+      }),
+      'test_stop_after_ln_pay_before_claim',
+      stopPayload
+    );
+  }
+  if (typeof cleanupAndExit === 'function') {
+    await cleanupAndExit({ stopPayload });
+  }
+  return true;
+}
+
 export function resolveTakerMinTimelockConfig({
   env = process.env,
   fallbackSec = 3600,
@@ -380,6 +519,8 @@ async function main() {
   });
   const persistPreimage = parseBool(flags.get('persist-preimage'), true);
   const stopAfterLnPay = parseBool(flags.get('stop-after-ln-pay'), false);
+  const testStopBeforeLnPayRaw = flags.get('test-stop-before-ln-pay');
+  const testStopAfterLnPayBeforeClaimRaw = flags.get('test-stop-after-ln-pay-before-claim');
 
   const tradeId = (flags.get('trade-id') && String(flags.get('trade-id')).trim()) || `swap_${crypto.randomUUID()}`;
   let settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
@@ -512,6 +653,28 @@ async function main() {
   const lndTlsCert = flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '';
   const lndMacaroon = flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '';
   const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
+  let testStopBeforeLnPay = false;
+  let testStopAfterLnPayBeforeClaim = false;
+  try {
+    const testStopConfig = resolveTestStopBeforeLnPayConfig({
+      enabledRaw: testStopBeforeLnPayRaw,
+      lnNetwork,
+    });
+    testStopBeforeLnPay = testStopConfig.enabled;
+    for (const warning of testStopConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
+  } catch (err) {
+    die(err?.message || String(err));
+  }
+  try {
+    const testStopAfterLnPayConfig = resolveTestStopAfterLnPayBeforeClaimConfig({
+      enabledRaw: testStopAfterLnPayBeforeClaimRaw,
+      lnNetwork,
+    });
+    testStopAfterLnPayBeforeClaim = testStopAfterLnPayConfig.enabled;
+    for (const warning of testStopAfterLnPayConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
+  } catch (err) {
+    die(err?.message || String(err));
+  }
 
   const ln = {
     impl: lnImpl,
@@ -1344,6 +1507,38 @@ async function main() {
       }
     }
 
+    if (testStopBeforeLnPay) {
+      const stopPayload = buildTestStopBeforeLnPayPayload({
+        tradeId,
+        swapChannel,
+        invoice: swapCtx.trade.invoice,
+        escrow: swapCtx.trade.escrow,
+      });
+      process.stderr.write('[taker] TEST MODE: stopping immediately before lnPay(); invoice will not be paid\n');
+      process.stdout.write(`${JSON.stringify({ type: 'test_stop_before_ln_pay', ...stopPayload })}\n`);
+      persistTrade(
+        {
+          ln_invoice_bolt11: stopPayload.ln_invoice_bolt11,
+          ln_payment_hash_hex: stopPayload.ln_payment_hash_hex,
+          state: swapCtx.trade.state,
+          last_error: stopPayload.stop_reason,
+        },
+        'test_stop_before_ln_pay',
+        stopPayload
+      );
+      swapCtx.done = true;
+      done = true;
+      clearTimers();
+      await leaveSidechannel(swapChannel);
+      try {
+        receipts?.close();
+      } catch (_e) {
+        process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+      }
+      sc.close();
+      process.exit(0);
+    }
+
     // Pay LN invoice and obtain preimage.
     const payRes = await lnPay(ln, { bolt11: swapCtx.trade.invoice.bolt11 });
     const preimageHex = String(payRes?.payment_preimage || '').trim().toLowerCase();
@@ -1376,6 +1571,34 @@ async function main() {
       'ln_paid',
       { payment_hash_hex: paymentHashHex }
     );
+
+    const stoppedAfterLnPayBeforeClaim = await maybeHandleTestStopAfterLnPayBeforeClaim({
+      enabled: testStopAfterLnPayBeforeClaim,
+      tradeId,
+      swapChannel,
+      settlementKind,
+      tradeState: swapCtx.trade.state,
+      paymentHashHex,
+      preimageHex: persistPreimage ? preimageHex : null,
+      escrow: swapCtx.trade.escrow,
+      persistTrade,
+      writeWarning: (line) => process.stderr.write(line),
+      writeEvent: (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`),
+      cleanupAndExit: async () => {
+        swapCtx.done = true;
+        done = true;
+        clearTimers();
+        await leaveSidechannel(swapChannel);
+        try {
+          receipts?.close();
+        } catch (_e) {
+          process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+        }
+        sc.close();
+        process.exit(0);
+      },
+    });
+    if (stoppedAfterLnPayBeforeClaim) return;
 
     if (stopAfterLnPay) {
       // Recovery path: operator can claim via `scripts/swaprecover.mjs claim ...`.
