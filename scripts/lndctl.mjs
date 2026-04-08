@@ -157,10 +157,52 @@ function warn(msg) {
   process.stderr.write(`Warning: ${msg}\n`);
 }
 
-function debugLncliCall({ rpcserver, lnddir, tlscertpath, command }) {
-  process.stderr.write(
-    `[lncli] command=${command} rpcserver=${rpcserver || ''} lnddir=${lnddir || ''} tlscertpath=${tlscertpath || ''}\n`
-  );
+function shellQuote(arg) {
+  const s = String(arg ?? '');
+  if (/^[A-Za-z0-9_./:=+,-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+function logExecCommand(cmd, args) {
+  process.stderr.write(`[exec] ${[cmd, ...args].map(shellQuote).join(' ')}\n`);
+}
+
+function buildLncliEnv() {
+  const env = { ...process.env, COPYFILE_DISABLE: '1' };
+  for (const key of [
+    'RPCSERVER',
+    'LNDDIR',
+    'TLSCERTPATH',
+    'MACAROONPATH',
+    'LNCLI_RPCSERVER',
+    'LNCLI_LNDDIR',
+    'LNCLI_TLSCERTPATH',
+    'LNCLI_MACAROONPATH',
+  ]) {
+    delete env[key];
+  }
+  return env;
+}
+
+function resolveRequiredLncliRpcserver({ lndDir }) {
+  const rpcserver = resolveLncliRpcserver({ lndDir });
+  if (!rpcserver) throw new Error(`Missing rpclisten in ${configPathFor({ lndDir })}`);
+  return rpcserver;
+}
+
+function buildLncliArgs({ network, lndDir, includeMacaroon }) {
+  const rpcserver = resolveRequiredLncliRpcserver({ lndDir });
+  const tlscertpath = tlsCertPathFor({ lndDir });
+  const args = [
+    `--network=${network}`,
+    `--rpcserver=${rpcserver}`,
+    `--lnddir=${lndDir}`,
+    `--tlscertpath=${tlscertpath}`,
+  ];
+  if (includeMacaroon) {
+    args.push(`--macaroonpath=${macaroonPathFor({ lndDir, network })}`);
+  }
+  return args;
 }
 
 function isIpv4Host(value) {
@@ -255,18 +297,9 @@ function printMainnetNeutrinoWarnings(confPath) {
 }
 
 async function getLndInfo({ lncliBin, network, lndDir, cwd }) {
-  const tlscertpath = tlsCertPathFor({ lndDir });
-  debugLncliCall({
-    command: 'getinfo',
-    rpcserver: resolveLncliRpcserver({ lndDir }),
-    lnddir: lndDir,
-    tlscertpath,
-  });
-  const { stdout } = await execFileP(
-    lncliBin,
-    [`--network=${network}`, `--lnddir=${lndDir}`, `--tlscertpath=${tlscertpath}`, 'getinfo'],
-    { cwd, maxBuffer: 1024 * 1024 * 4 }
-  );
+  const args = [...buildLncliArgs({ network, lndDir, includeMacaroon: true }), 'getinfo'];
+  logExecCommand(lncliBin, args);
+  const { stdout } = await execFileP(lncliBin, args, { cwd, maxBuffer: 1024 * 1024 * 4, env: buildLncliEnv() });
   return JSON.parse(String(stdout || '').trim() || '{}');
 }
 
@@ -348,12 +381,12 @@ function buildLndConf({
   return `${lines.join('\n')}\n`;
 }
 
-function run(cmd, args, { cwd, inheritStdio = true } = {}) {
+function run(cmd, args, { cwd, inheritStdio = true, env = null } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, {
       cwd,
       stdio: inheritStdio ? 'inherit' : 'pipe',
-      env: { ...process.env, COPYFILE_DISABLE: '1' },
+      env: env || { ...process.env, COPYFILE_DISABLE: '1' },
     });
     proc.on('error', reject);
     proc.on('exit', (code) => {
@@ -364,15 +397,12 @@ function run(cmd, args, { cwd, inheritStdio = true } = {}) {
 }
 
 async function runLncli({ lncliBin, network, lndDir, command, extraArgs = [], cwd, inheritStdio = true }) {
-  const tlscertpath = tlsCertPathFor({ lndDir });
-  debugLncliCall({
-    command,
-    rpcserver: resolveLncliRpcserver({ lndDir }),
-    lnddir: lndDir,
-    tlscertpath,
-  });
-  const args = [`--network=${network}`, `--lnddir=${lndDir}`, `--tlscertpath=${tlscertpath}`, ...extraArgs];
-  await run(lncliBin, args, { cwd, inheritStdio });
+  const args = [
+    ...buildLncliArgs({ network, lndDir, includeMacaroon: command !== 'create' }),
+    ...extraArgs,
+  ];
+  logExecCommand(lncliBin, args);
+  await run(lncliBin, args, { cwd, inheritStdio, env: buildLncliEnv() });
 }
 
 async function main() {
