@@ -308,7 +308,9 @@ ensure_wallet_ready() {
     fi
   else
     local lncli_bin="${LNCLI_BIN:-lncli}"
-    printf '%s\n%s\nn\n\n' "$pw" "$pw" | "$lncli_bin" --network="$NETWORK" --lnddir="$LND_DIR" create >/dev/null
+    local tls_cert_path="$LND_DIR/tls.cert"
+    printf '[lncli] command=create rpcserver=%s lnddir=%s tlscertpath=%s\n' "${LND_RPCSERVER:-}" "$LND_DIR" "$tls_cert_path" >&2
+    printf '%s\n%s\nn\n\n' "$pw" "$pw" | "$lncli_bin" --network="$NETWORK" --lnddir="$LND_DIR" --tlscertpath="$tls_cert_path" create >/dev/null
   fi
 
   wait_for_info 60 1 || die "LND did not become ready after wallet create/unlock"

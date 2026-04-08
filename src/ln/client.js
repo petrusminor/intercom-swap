@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
@@ -165,10 +166,17 @@ async function lnLndCli({
   const baseArgs = [`--network=${network}`];
   // For CLI backend, lnd connection details should be explicit.
   if (!useDocker) {
-    if (lnd?.rpcserver) baseArgs.push(`--rpcserver=${String(lnd.rpcserver)}`);
-    if (lnd?.tlscertpath) baseArgs.push(`--tlscertpath=${String(lnd.tlscertpath)}`);
-    if (lnd?.macaroonpath) baseArgs.push(`--macaroonpath=${String(lnd.macaroonpath)}`);
-    if (lnd?.lnddir) baseArgs.push(`--lnddir=${String(lnd.lnddir)}`);
+    const rpcserver = lnd?.rpcserver ? String(lnd.rpcserver) : '';
+    const lnddir = lnd?.lnddir ? String(lnd.lnddir) : '';
+    const tlscertpath = lnd?.tlscertpath
+      ? String(lnd.tlscertpath)
+      : (lnddir ? path.join(lnddir, 'tls.cert') : '');
+    const macaroonpath = lnd?.macaroonpath ? String(lnd.macaroonpath) : '';
+    process.stderr.write(`[lncli] rpcserver=${rpcserver} lnddir=${lnddir} tlscertpath=${tlscertpath}\n`);
+    if (rpcserver) baseArgs.push(`--rpcserver=${rpcserver}`);
+    if (tlscertpath) baseArgs.push(`--tlscertpath=${tlscertpath}`);
+    if (macaroonpath) baseArgs.push(`--macaroonpath=${macaroonpath}`);
+    if (lnddir) baseArgs.push(`--lnddir=${lnddir}`);
   }
 
   const cmd = useDocker ? 'docker' : lncliBin;

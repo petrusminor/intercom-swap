@@ -2,12 +2,31 @@
 import process from 'node:process';
 import path from 'node:path';
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..');
+const MAINNET_NEUTRINO_FEE_URL = 'https://nodes.lightning.computer/fees/v1/btc-fee-estimates.json';
+const MAINNET_NEUTRINO_DEFAULT_PEERS = [
+  '165.227.7.29:8333',
+  '45.79.195.29:8333',
+  '154.53.63.218:8333',
+  '91.134.145.202:8333',
+  '65.109.145.24:8333',
+];
+const MAINNET_NEUTRINO_PEER_IP_MAP = new Map([
+  ['btcd-mainnet.lightning.computer', '165.227.7.29'],
+  ['btcd1.lnolymp.us', '45.79.195.29'],
+  ['btcd2.lnolymp.us', '154.53.63.218'],
+  ['bb1.breez.technology', '91.134.145.202'],
+  ['bb2.breez.technology', '65.109.145.24'],
+  ['neutrino.shock.network', '167.88.11.203'],
+  ['uswest.blixtwallet.com', '45.137.194.104'],
+]);
+const execFileP = promisify(execFile);
 
 function die(msg) {
   process.stderr.write(`${msg}\n`);
@@ -111,6 +130,16 @@ function configPathFor({ lndDir }) {
   return path.join(lndDir, 'lnd.conf');
 }
 
+function resolveLncliRpcserver({ lndDir }) {
+  const confPath = configPathFor({ lndDir });
+  if (!fs.existsSync(confPath)) return '';
+  try {
+    return extractLndConfValue(fs.readFileSync(confPath, 'utf8'), 'rpclisten');
+  } catch (_err) {
+    return '';
+  }
+}
+
 function writeFileAtomic(filePath, text, mode = null) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
@@ -122,6 +151,146 @@ function splitCsv(value) {
   const s = String(value || '').trim();
   if (!s) return [];
   return s.split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+function warn(msg) {
+  process.stderr.write(`Warning: ${msg}\n`);
+}
+
+function debugLncliCall({ rpcserver, lnddir, tlscertpath, command }) {
+  process.stderr.write(
+    `[lncli] command=${command} rpcserver=${rpcserver || ''} lnddir=${lnddir || ''} tlscertpath=${tlscertpath || ''}\n`
+  );
+}
+
+function isIpv4Host(value) {
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(String(value || '').trim());
+}
+
+function normalizeNeutrinoPeers({ network, bitcoinNode, peers }) {
+  if (network !== 'mainnet' || bitcoinNode !== 'neutrino') return peers;
+  const source = Array.isArray(peers) && peers.length > 0 ? peers : MAINNET_NEUTRINO_DEFAULT_PEERS;
+  const normalized = [];
+  const seen = new Set();
+  for (const rawPeer of source) {
+    const peer = String(rawPeer || '').trim();
+    if (!peer) continue;
+    const m = peer.match(/^(.*):([0-9]+)$/);
+    if (!m) {
+      if (!seen.has(peer)) {
+        seen.add(peer);
+        normalized.push(peer);
+      }
+      continue;
+    }
+    const host = String(m[1] || '').trim();
+    const port = String(m[2] || '').trim();
+    const hostLower = host.toLowerCase();
+    const outHost = isIpv4Host(hostLower) ? hostLower : (MAINNET_NEUTRINO_PEER_IP_MAP.get(hostLower) || host);
+    const outPeer = `${outHost}:${port}`;
+    if (!seen.has(outPeer)) {
+      seen.add(outPeer);
+      normalized.push(outPeer);
+    }
+  }
+  return normalized;
+}
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractLndConfValue(confText, key) {
+  const rx = new RegExp(`^\\s*${escapeRegex(key)}\\s*=\\s*(.*?)\\s*$`, 'm');
+  const match = String(confText || '').match(rx);
+  return match ? String(match[1] || '').trim() : '';
+}
+
+function extractAllLndConfValues(confText, key) {
+  const rx = new RegExp(`^\\s*${escapeRegex(key)}\\s*=\\s*(.*?)\\s*$`, 'gm');
+  const matches = [];
+  for (const match of String(confText || '').matchAll(rx)) {
+    matches.push(String(match[1] || '').trim());
+  }
+  return matches;
+}
+
+function collectMainnetNeutrinoWarnings(confPath) {
+  let confText = '';
+  try {
+    confText = fs.readFileSync(confPath, 'utf8');
+  } catch (err) {
+    return [`Failed to read config: ${confPath} (${err?.message || String(err)})`];
+  }
+  const isMainnet = extractLndConfValue(confText, 'bitcoin.mainnet') === '1';
+  const bitcoinNode = extractLndConfValue(confText, 'bitcoin.node');
+  if (!isMainnet || bitcoinNode !== 'neutrino') return [];
+
+  const warnings = [];
+  const feeUrls = extractAllLndConfValues(confText, 'fee.url');
+  if (feeUrls.length === 0) {
+    warnings.push(`mainnet neutrino config missing fee.url=${MAINNET_NEUTRINO_FEE_URL}`);
+  } else if (feeUrls.length > 1) {
+    warnings.push(`mainnet neutrino config has duplicate fee.url entries in ${confPath}`);
+  } else if (feeUrls[0] !== MAINNET_NEUTRINO_FEE_URL) {
+    warnings.push(`mainnet neutrino config fee.url should be ${MAINNET_NEUTRINO_FEE_URL}`);
+  }
+
+  const peers = extractAllLndConfValues(confText, 'neutrino.addpeer');
+  if (peers.length === 0) {
+    warnings.push('mainnet neutrino config has no neutrino.addpeer entries');
+  }
+  for (const peer of peers) {
+    const m = String(peer || '').trim().match(/^(.*):([0-9]+)$/);
+    const host = m ? String(m[1] || '').trim() : '';
+    if (host && !isIpv4Host(host)) {
+      warnings.push(`neutrino peer ${peer} uses a hostname. Likely DNS issue (WSL). See SKILL.md LND section.`);
+    }
+  }
+  return warnings;
+}
+
+function printMainnetNeutrinoWarnings(confPath) {
+  for (const msg of collectMainnetNeutrinoWarnings(confPath)) warn(msg);
+}
+
+async function getLndInfo({ lncliBin, network, lndDir, cwd }) {
+  const tlscertpath = tlsCertPathFor({ lndDir });
+  debugLncliCall({
+    command: 'getinfo',
+    rpcserver: resolveLncliRpcserver({ lndDir }),
+    lnddir: lndDir,
+    tlscertpath,
+  });
+  const { stdout } = await execFileP(
+    lncliBin,
+    [`--network=${network}`, `--lnddir=${lndDir}`, `--tlscertpath=${tlscertpath}`, 'getinfo'],
+    { cwd, maxBuffer: 1024 * 1024 * 4 }
+  );
+  return JSON.parse(String(stdout || '').trim() || '{}');
+}
+
+function scheduleLndHealthHints({ lncliBin, network, lndDir, cwd }) {
+  if (network !== 'mainnet') return;
+  const timer = setTimeout(async () => {
+    try {
+      const info = await getLndInfo({ lncliBin, network, lndDir, cwd });
+      const syncedToChain = info?.synced_to_chain === true;
+      const syncedToGraph = info?.synced_to_graph === true;
+      const numPeers = Number(info?.num_peers || 0);
+      if (numPeers === 0) {
+        warn('LND is running with num_peers=0. Likely DNS issue (WSL). See SKILL.md LND section.');
+      }
+      if (!syncedToChain || !syncedToGraph || numPeers <= 0) {
+        warn(
+          `LND health check: synced_to_chain=${syncedToChain} synced_to_graph=${syncedToGraph} num_peers=${numPeers}. DO NOT RUN SWAPS UNTIL THESE ARE TRUE.`
+        );
+      }
+    } catch (_err) {
+      warn('LND health check unavailable after startup (node may still be locked). Run scripts/lnd-health.sh after unlock.');
+    }
+  }, 8000);
+  if (typeof timer.unref === 'function') timer.unref();
 }
 
 function buildLndConf({
@@ -159,6 +328,11 @@ function buildLndConf({
   lines.push(`bitcoin.node=${bitcoinNode}`);
 
   if (bitcoinNode === 'neutrino') {
+    if (network === 'mainnet') {
+      lines.push('');
+      lines.push('[fee]');
+      lines.push(`fee.url=${MAINNET_NEUTRINO_FEE_URL}`);
+    }
     lines.push('');
     lines.push('[neutrino]');
     if (neutrinoPeers.length === 0) {
@@ -187,6 +361,18 @@ function run(cmd, args, { cwd, inheritStdio = true } = {}) {
       else reject(new Error(`${cmd} exited with code ${code}`));
     });
   });
+}
+
+async function runLncli({ lncliBin, network, lndDir, command, extraArgs = [], cwd, inheritStdio = true }) {
+  const tlscertpath = tlsCertPathFor({ lndDir });
+  debugLncliCall({
+    command,
+    rpcserver: resolveLncliRpcserver({ lndDir }),
+    lnddir: lndDir,
+    tlscertpath,
+  });
+  const args = [`--network=${network}`, `--lnddir=${lndDir}`, `--tlscertpath=${tlscertpath}`, ...extraArgs];
+  await run(lncliBin, args, { cwd, inheritStdio });
 }
 
 async function main() {
@@ -226,7 +412,20 @@ async function main() {
     const rpcPort = parseIntFlag(flags, 'rpc-port', 10009);
     const restPort = parseIntFlag(flags, 'rest-port', 8080);
     const bitcoinNode = normalizeBitcoinNode(flags.get('bitcoin-node') || 'neutrino');
-    const neutrinoPeers = splitCsv(flags.get('neutrino-peers'));
+    const neutrinoPeers = normalizeNeutrinoPeers({
+      network,
+      bitcoinNode,
+      peers: splitCsv(flags.get('neutrino-peers')),
+    });
+    if (network === 'mainnet' && bitcoinNode === 'neutrino') {
+      for (const peer of neutrinoPeers) {
+        const m = String(peer || '').trim().match(/^(.*):([0-9]+)$/);
+        const host = m ? String(m[1] || '').trim() : '';
+        if (host && !isIpv4Host(host)) {
+          warn(`mainnet neutrino peer ${peer} uses a hostname. Likely DNS issue (WSL). See SKILL.md LND section.`);
+        }
+      }
+    }
     const walletPasswordFile = flags.get('wallet-password-file')
       ? path.resolve(String(flags.get('wallet-password-file')))
       : '';
@@ -262,27 +461,30 @@ async function main() {
 
   if (cmd === 'start') {
     const lndBin = flags.get('lnd-bin') ? String(flags.get('lnd-bin')).trim() : 'lnd';
+    const lncliBin = flags.get('lncli-bin') ? String(flags.get('lncli-bin')).trim() : 'lncli';
     const confPath = configPathFor({ lndDir });
     if (!fs.existsSync(confPath)) die(`Missing config: ${confPath}. Run: lndctl init ...`);
+    printMainnetNeutrinoWarnings(confPath);
+    scheduleLndHealthHints({ lncliBin, network, lndDir, cwd: repoRoot });
     await run(lndBin, [`--lnddir=${lndDir}`, `--configfile=${confPath}`], { cwd: repoRoot, inheritStdio: true });
     return;
   }
 
   if (cmd === 'stop') {
     const lncliBin = flags.get('lncli-bin') ? String(flags.get('lncli-bin')).trim() : 'lncli';
-    await run(lncliBin, [`--network=${network}`, `--lnddir=${lndDir}`, 'stop'], { cwd: repoRoot, inheritStdio: true });
+    await runLncli({ lncliBin, network, lndDir, command: 'stop', extraArgs: ['stop'], cwd: repoRoot, inheritStdio: true });
     return;
   }
 
   if (cmd === 'create-wallet') {
     const lncliBin = flags.get('lncli-bin') ? String(flags.get('lncli-bin')).trim() : 'lncli';
-    await run(lncliBin, [`--network=${network}`, `--lnddir=${lndDir}`, 'create'], { cwd: repoRoot, inheritStdio: true });
+    await runLncli({ lncliBin, network, lndDir, command: 'create', extraArgs: ['create'], cwd: repoRoot, inheritStdio: true });
     return;
   }
 
   if (cmd === 'unlock') {
     const lncliBin = flags.get('lncli-bin') ? String(flags.get('lncli-bin')).trim() : 'lncli';
-    await run(lncliBin, [`--network=${network}`, `--lnddir=${lndDir}`, 'unlock'], { cwd: repoRoot, inheritStdio: true });
+    await runLncli({ lncliBin, network, lndDir, command: 'unlock', extraArgs: ['unlock'], cwd: repoRoot, inheritStdio: true });
     return;
   }
 

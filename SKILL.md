@@ -1659,6 +1659,112 @@ LND Neutrino (no `bitcoind`) runtime notes (mainnet/testnet/signet):
 - Store all LND runtime data, tls certs, and macaroons under `onchain/lnd/<network>/<nodeName>/` (gitignored).
 - Do **not** use `--noseedbackup` on mainnet (only used in regtest e2e).
 
+## LND (Neutrino) Canonical Setup - WSL
+
+### DNS REQUIREMENT (CRITICAL)
+- WSL Ubuntu often autogenerates `/etc/resolv.conf` with a transient resolver like `10.255.255.254`.
+- In live operations this caused `lookup mainnet1-btcd.zaphq.io: no such host`, which blocks Neutrino peer discovery and leaves the node running without useful peers.
+- If this is not done, Neutrino WILL fail silently.
+
+```bash
+sudo tee /etc/wsl.conf <<EOF
+[network]
+generateResolvConf = false
+EOF
+
+sudo rm -f /etc/resolv.conf
+
+sudo tee /etc/resolv.conf <<EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+
+sudo chmod 644 /etc/resolv.conf
+
+wsl.exe --shutdown
+```
+
+### NEUTRINO PEERS (NO DNS)
+- Do NOT rely on hostname peers on WSL.
+- Always use IPv4 peers.
+- Canonical fallback peer set:
+
+```text
+165.227.7.29:8333
+45.79.195.29:8333
+154.53.63.218:8333
+91.134.145.202:8333
+65.109.145.24:8333
+```
+
+### fee.url (MANDATORY)
+- Required for mainnet + neutrino.
+- Must exist in config under `[fee]`.
+
+```ini
+[fee]
+fee.url=https://nodes.lightning.computer/fees/v1/btc-fee-estimates.json
+```
+
+### REQUIRED HEALTH CHECKS
+- Run:
+
+```bash
+lncli getinfo
+```
+
+- Required conditions:
+  - `synced_to_chain = true`
+  - `synced_to_graph = true`
+  - `num_peers > 0`
+- DO NOT RUN SWAPS UNTIL THESE ARE TRUE
+
+### COMMON FAILURE MODES
+- DNS not overridden -> no peers
+- missing `fee.url` -> startup / fee issues
+- hostname peers -> intermittent failure
+- WSL restart not performed -> config ignored
+
+### ALIGNMENT NOTE
+This setup mirrors the canonical BTC(LN)/USDT(SOL) workflow,
+but replaces DNS-dependent behavior with deterministic peers
+to ensure production reliability.
+
+## LND Multi-Node TLS Determinism (CRITICAL)
+- In multi-node environments (for example `maker` and `taker`), `lncli` MUST NOT rely on default TLS resolution.
+- Each LND instance generates its own self-signed `tls.cert`.
+- `lncli` will fail with x509 errors if it connects using the wrong certificate.
+- This failure is non-obvious and can appear during wallet creation, unlock, or any RPC call.
+
+- Invariant: all `lncli` calls MUST include:
+  - `--lnddir`
+  - `--rpcserver`
+  - `--tlscertpath`
+
+- Canonical mapping:
+  - `maker`
+    - `lnddir = onchain/lnd/mainnet/maker`
+    - `tlscertpath = onchain/lnd/mainnet/maker/tls.cert`
+  - `taker`
+    - `lnddir = onchain/lnd/mainnet/taker`
+    - `tlscertpath = onchain/lnd/mainnet/taker/tls.cert`
+
+- Enforcement:
+  - `scripts/lndctl.mjs` enforces this automatically for local wallet lifecycle commands.
+  - `src/ln/client.js` derives `tlscertpath` from `lnddir` when not explicitly provided.
+  - No `lncli` call in the local runtime should omit `tlscertpath`.
+
+- Failure to follow this invariant will cause:
+  - TLS handshake failures
+  - cross-node certificate mismatch
+  - non-deterministic behavior across settlement types
+
+- This invariant applies to all LN-based settlement types:
+  - BTC(LN) ↔ TAO(EVM)
+  - BTC(LN) ↔ USDT(SOL)
+  - any future LN-based settlement
+- LND behavior must remain identical regardless of settlement layer.
+
 ### Live Ops Checklist (Devnet/Testnet -> Mainnet)
 Goal: a fully scripted path so the only manual input is "fund these addresses" (SOL + USDT + LN liquidity).
 
