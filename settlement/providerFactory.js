@@ -64,6 +64,7 @@ export function getSettlementProvider(kind, opts = {}) {
     rpcUrl: tao.rpcUrl,
     chainId: tao.chainId,
     privateKey: tao.privateKey,
+    keyfilePath: tao.keyfilePath,
     confirmations: tao.confirmations,
     htlcAddress: tao.htlcAddress,
   });

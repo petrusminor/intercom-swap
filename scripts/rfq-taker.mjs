@@ -631,6 +631,7 @@ async function main() {
 
   const solRpcUrl = (flags.get('solana-rpc-url') && String(flags.get('solana-rpc-url')).trim()) || 'http://127.0.0.1:8899';
   const solKeypairPath = flags.get('solana-keypair') ? String(flags.get('solana-keypair')).trim() : '';
+  const taoKeyfilePath = flags.get('tao-keyfile') ? String(flags.get('tao-keyfile')).trim() : '';
   const solMintStr = flags.get('solana-mint') ? String(flags.get('solana-mint')).trim() : '';
   const solProgramIdStr = flags.get('solana-program-id') ? String(flags.get('solana-program-id')).trim() : '';
   const solComputeUnitLimit = parseIntFlag(flags.get('solana-cu-limit'), 'solana-cu-limit', null);
@@ -756,7 +757,9 @@ async function main() {
         if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1 and --settlement solana)');
       }
       if (isTaoSettlement) {
-        if (!process.env.TAO_EVM_PRIVATE_KEY) die('Missing TAO_EVM_PRIVATE_KEY (required when --settlement tao-evm)');
+        if (!taoKeyfilePath && !process.env.TAO_EVM_PRIVATE_KEY) {
+          die('Missing TAO signer: provide --tao-keyfile or TAO_EVM_PRIVATE_KEY');
+        }
         if (!process.env.TAO_EVM_HTLC_ADDRESS) die('Missing TAO_EVM_HTLC_ADDRESS (required when --settlement tao-evm)');
       }
       if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
@@ -779,6 +782,7 @@ async function main() {
               rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
               chainId: 964,
               privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
+              keyfilePath: taoKeyfilePath,
               confirmations: 1,
               htlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
             },

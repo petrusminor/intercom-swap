@@ -11,6 +11,7 @@ import {
   randomBytes,
 } from 'ethers';
 import { getAmountForPair, normalizePair } from '../../src/swap/pairs.js';
+import { readTaoPrivateKeyFromFile } from '../../src/tao/keyfile.js';
 import {
   getTermsSettlementRecipient,
   getTermsSettlementRefundAddress,
@@ -186,6 +187,7 @@ export class TaoEvmSettlementProvider {
     rpcUrl = process.env.TAO_EVM_RPC_URL || DEFAULT_RPC_URL,
     chainId = DEFAULT_CHAIN_ID,
     privateKey = process.env.TAO_EVM_PRIVATE_KEY || '',
+    keyfilePath = '',
     confirmations = process.env.TAO_EVM_CONFIRMATIONS || DEFAULT_CONFIRMATIONS,
     htlcAddress = process.env.TAO_EVM_HTLC_ADDRESS || '',
   } = {}) {
@@ -196,8 +198,20 @@ export class TaoEvmSettlementProvider {
     }
     this.confirmations = parsePositiveInt(confirmations, DEFAULT_CONFIRMATIONS);
 
-    const pk = normalizePrivateKey(privateKey);
-    if (!pk) throw new Error('Missing TAO_EVM_PRIVATE_KEY');
+    const taoKeyfilePath = String(keyfilePath || '').trim();
+    let pk = '';
+    if (taoKeyfilePath) {
+      pk = readTaoPrivateKeyFromFile(taoKeyfilePath);
+      if (process.env.DEBUG) {
+        process.stderr.write('Loaded TAO signer from file\n');
+      }
+    } else {
+      pk = normalizePrivateKey(privateKey);
+      if (!pk) throw new Error('Missing TAO signer: provide --tao-keyfile or TAO_EVM_PRIVATE_KEY');
+      if (process.env.DEBUG) {
+        process.stderr.write('Loaded TAO signer from environment\n');
+      }
+    }
 
     this.provider = new JsonRpcProvider(this.rpcUrl);
     this.wallet = new Wallet(pk, this.provider);
