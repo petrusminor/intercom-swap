@@ -690,6 +690,20 @@ export class TaoEvmSettlementProvider {
     };
   }
 
+  async waitForPrepayOnchain(input = {}) {
+    const deadlineMs = Date.now() + 20_000;
+    const pollMs = 1_000;
+    let last = null;
+    for (;;) {
+      last = await this.verifySwapPrePayOnchain(input);
+      if (last?.ok) return last;
+      if (String(last?.error || '') !== 'swap not found on chain') return last;
+      if (Date.now() >= deadlineMs) return last;
+      process.stderr.write('[taker] waiting for TAO HTLC on-chain...\n');
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+  }
+
   async claim(input) {
     await this._ensureReady();
     const htlc = this._requireHtlc();

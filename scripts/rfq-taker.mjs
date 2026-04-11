@@ -1448,20 +1448,12 @@ async function main() {
     // Hard rule: verify settlement lock on-chain before paying.
     let prepay;
     if (isTaoSettlement) {
-      const verifyPrepayDeadlineMs = Date.now() + 20_000;
-      const verifyPrepayPollMs = 1_000;
-      for (;;) {
-        prepay = await sol.settlement.verifySwapPrePayOnchain({
-          terms: swapCtx.trade.terms,
-          invoiceBody: swapCtx.trade.invoice,
-          escrowBody: swapCtx.trade.escrow,
-          nowUnix: Math.floor(Date.now() / 1000),
-        });
-        if (prepay?.ok) break;
-        if (String(prepay?.error || '') !== 'swap not found on chain' || Date.now() >= verifyPrepayDeadlineMs) break;
-        process.stderr.write('[taker] waiting for TAO HTLC on-chain...\n');
-        await new Promise((resolve) => setTimeout(resolve, verifyPrepayPollMs));
-      }
+      prepay = await sol.settlement.waitForPrepayOnchain({
+        terms: swapCtx.trade.terms,
+        invoiceBody: swapCtx.trade.invoice,
+        escrowBody: swapCtx.trade.escrow,
+        nowUnix: Math.floor(Date.now() / 1000),
+      });
     } else {
       prepay = await sol.settlement.verifySwapPrePayOnchain({
         terms: swapCtx.trade.terms,
