@@ -1458,10 +1458,22 @@ async function main() {
           );
         }
 
-        // Taker can join and send STATUS before it has seen TERMS due delivery races.
-        // On STATUS, force a TERMS re-send so both peers converge deterministically.
+        const statusNote = String(msg.body?.note || '').trim().toLowerCase();
+        if (msg.kind === KIND.STATUS && statusNote === 'ready' && ctx.awaitingTakerReady && !ctx.sendingTerms) {
+          ctx.sendingTerms = true;
+          try {
+            process.stderr.write('[maker] taker ready received, sending TERMS\n');
+            await createAndSendTerms(ctx);
+            ctx.awaitingTakerReady = false;
+          } finally {
+            ctx.sendingTerms = false;
+          }
+        }
+
+        // Taker can re-send STATUS after join; once TERMS exists, force a TERMS re-send so both peers converge deterministically.
         if (msg.kind === KIND.STATUS && ctx.trade.state === STATE.TERMS && ctx.sent.terms) {
           await sc.send(ctx.swapChannel, ctx.sent.terms, { invite: ctx.invite || null });
+          ctx.lastTermsSendAtMs = Date.now();
         }
 
         process.stderr.write(
@@ -2000,6 +2012,8 @@ async function main() {
             lastTermsSendAtMs: 0,
             lastInvoiceSendAtMs: 0,
             lastEscrowSendAtMs: 0,
+            awaitingTakerReady: true,
+            sendingTerms: false,
           };
           ctx.sent.swap_invite = swapInviteSigned;
           ctx.lastInviteSendAtMs = Date.now();
@@ -2013,8 +2027,8 @@ async function main() {
             swapChannelToLockKey.set(swapChannel, lockKey);
           }
 
-          // Begin swap: send terms and start the resend loop.
-          await createAndSendTerms(ctx);
+          // Begin swap: wait for taker readiness on swap:* before sending TERMS.
+          process.stderr.write('[maker] waiting for taker ready before sending TERMS\n');
           startSwapResender(ctx);
 
           persistTrade(

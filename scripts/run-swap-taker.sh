@@ -8,7 +8,7 @@ cd "$ROOT"
 
 # Dev-oriented swap taker/client peer.
 # - joins the public RFQ channel (to see RFQs/quotes)
-# - requires invites for swap:* channels, and must trust the maker's inviter pubkey(s)
+# - requires invites for swap:* channels
 #
 # Notes:
 # - Welcome enforcement is disabled here to keep RFQ join friction low. For stricter authenticity,
@@ -26,10 +26,10 @@ SIDECHANNEL_POW="${SIDECHANNEL_POW:-1}"
 SIDECHANNEL_POW_DIFFICULTY="${SIDECHANNEL_POW_DIFFICULTY:-12}"
 
 INVITER_KEYS="${SWAP_INVITER_KEYS:-}"
-if [[ -z "$INVITER_KEYS" ]]; then
-  echo "ERROR: SWAP_INVITER_KEYS is required (comma-separated inviter peer pubkeys, hex)." >&2
-  echo "Hint: start maker first, then read its pubkey from the startup banner or via swapctl info." >&2
-  exit 1
+if [[ -n "$INVITER_KEYS" ]]; then
+  echo "[taker] using explicit inviter keys" >&2
+else
+  echo "[taker] running in dynamic invite mode (no preconfigured inviter keys)" >&2
 fi
 
 TOKEN_DIR="onchain/sc-bridge"
@@ -45,18 +45,23 @@ if [[ ! -f "$TOKEN_FILE" ]]; then
 fi
 SC_TOKEN="$(tr -d '\r\n' <"$TOKEN_FILE")"
 
-exec pear run . \
-  --peer-store-name "$STORE_NAME" \
-  --msb 0 \
-  --price-oracle 1 \
-  --sc-bridge 1 \
-  --sc-bridge-token "$SC_TOKEN" \
-  --sc-bridge-port "$SC_PORT" \
-  --sidechannels "$RFQ_CHANNEL" \
-  --sidechannel-pow "$SIDECHANNEL_POW" \
-  --sidechannel-pow-difficulty "$SIDECHANNEL_POW_DIFFICULTY" \
-  --sidechannel-welcome-required 0 \
-  --sidechannel-invite-required 1 \
-  --sidechannel-invite-prefixes "swap:" \
-  --sidechannel-inviter-keys "$INVITER_KEYS" \
-  "$@"
+ARGS=(
+  --peer-store-name "$STORE_NAME"
+  --msb 0
+  --price-oracle 1
+  --sc-bridge 1
+  --sc-bridge-token "$SC_TOKEN"
+  --sc-bridge-port "$SC_PORT"
+  --sidechannels "$RFQ_CHANNEL"
+  --sidechannel-pow "$SIDECHANNEL_POW"
+  --sidechannel-pow-difficulty "$SIDECHANNEL_POW_DIFFICULTY"
+  --sidechannel-welcome-required 0
+  --sidechannel-invite-required 1
+  --sidechannel-invite-prefixes "swap:"
+)
+
+if [[ -n "$INVITER_KEYS" ]]; then
+  ARGS+=(--sidechannel-inviter-keys "$INVITER_KEYS")
+fi
+
+exec pear run . "${ARGS[@]}" "$@"

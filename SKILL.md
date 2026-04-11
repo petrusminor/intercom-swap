@@ -1761,9 +1761,44 @@ to ensure production reliability.
 
 - This invariant applies to all LN-based settlement types:
   - BTC(LN) ↔ TAO(EVM)
-  - BTC(LN) ↔ USDT(SOL)
-  - any future LN-based settlement
+- BTC(LN) ↔ USDT(SOL)
+- any future LN-based settlement
 - LND behavior must remain identical regardless of settlement layer.
+
+## LND CLI Determinism (CRITICAL)
+- In multi-node environments (`maker` and `taker`), `lncli` MUST be invoked deterministically.
+- Default `lncli` behavior silently falls back to `~/.lnd` and port `10009` if flags are malformed or ignored.
+
+- Enforced invariants:
+  - All `lncli` flags MUST use `--flag=value` format:
+    - `--rpcserver=127.0.0.1:PORT`
+    - `--lnddir=/absolute/path`
+    - `--tlscertpath=/absolute/path`
+    - `--macaroonpath=/absolute/path`
+  - NEVER pass flags as split args:
+    - `["--rpcserver", "127.0.0.1:10010"]` ❌
+  - All commands MUST include:
+    - `--rpcserver`
+    - `--lnddir`
+    - `--tlscertpath`
+  - All commands EXCEPT wallet creation MUST include:
+    - `--macaroonpath`
+  - `create-wallet` MUST NOT include `--macaroonpath`
+  - `lncli` execution environment MUST be sanitized. Remove:
+    - `RPCSERVER`
+    - `LNDDIR`
+    - `TLSCERTPATH`
+    - `MACAROONPATH`
+    - `LNCLI_*`
+  - All `lncli` executions MUST log the exact command string before execution.
+
+- Failure modes if violated:
+  - silent fallback to `127.0.0.1:10009`
+  - cross-node contamination (`maker` ↔ `taker`)
+  - TLS mismatch errors
+  - missing macaroon errors
+
+- This is a hard requirement for deterministic multi-node operation.
 
 ### Live Ops Checklist (Devnet/Testnet -> Mainnet)
 Goal: a fully scripted path so the only manual input is "fund these addresses" (SOL + USDT + LN liquidity).

@@ -406,7 +406,7 @@ class Sidechannel extends Feature {
     };
   }
 
-  _verifyInviteForKey(invite, channel, inviteeKey) {
+  _verifyInviteForKey(invite, channel, inviteeKey, { requireTrustedInviter = true } = {}) {
     if (!invite || typeof invite !== 'object') return false;
     const payload = invite.payload && typeof invite.payload === 'object' ? invite.payload : invite;
     const sigHex = invite.sig || invite.signature;
@@ -415,7 +415,7 @@ class Sidechannel extends Feature {
     if (normalized.channel !== String(channel)) return false;
     if (normalized.inviteePubKey !== inviteeKey) return false;
     if (!normalized.inviterPubKey || normalized.inviterPubKey.length === 0) return false;
-    if (this.inviterKeys && !this.inviterKeys.has(normalized.inviterPubKey)) return false;
+    if (requireTrustedInviter && this.inviterKeys && !this.inviterKeys.has(normalized.inviterPubKey)) return false;
     if (!Number.isFinite(normalized.issuedAt) || !Number.isFinite(normalized.expiresAt)) return false;
     if (normalized.expiresAt <= this._now()) return false;
     const message = stableStringify(normalized);
@@ -442,9 +442,10 @@ class Sidechannel extends Feature {
   _acceptLocalInvite(invite, channel) {
     const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
     if (!selfKey) return false;
-    const normalized = this._verifyInviteForKey(invite, channel, selfKey);
+    const normalized = this._verifyInviteForKey(invite, channel, selfKey, { requireTrustedInviter: false });
     if (!normalized) return false;
     this._rememberLocalInvite(channel, normalized.expiresAt);
+    this._rememberInvite(channel, normalized.inviterPubKey, normalized.expiresAt);
     this.localInviteObjects.set(normalizeChannel(channel), invite);
     const embeddedWelcome = invite?.welcome;
     if (embeddedWelcome) {
