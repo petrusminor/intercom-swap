@@ -553,10 +553,17 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 200);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
-  const maxTrades = flags.get('max-trades') !== undefined
+  const parsedMaxTrades = flags.get('max-trades') !== undefined
     ? Number.parseInt(String(flags.get('max-trades')), 10)
     : 1;
-  if (!Number.isInteger(maxTrades) || maxTrades < 0) die('Invalid --max-trades (expected integer >= 0)');
+  if (!Number.isInteger(parsedMaxTrades) || parsedMaxTrades < 0) die('Invalid --max-trades (expected integer >= 0)');
+  let maxTrades = parsedMaxTrades;
+  if (once) {
+    if (flags.get('max-trades') !== undefined && parsedMaxTrades > 1) {
+      process.stderr.write('[taker] WARNING: --once overrides --max-trades (forcing single trade)\n');
+    }
+    maxTrades = 1;
+  }
 
   const runSwap = parseBool(flags.get('run-swap'), false);
   const allowNoReceipts = parseBool(flags.get('allow-no-receipts'), false);
@@ -2050,7 +2057,17 @@ async function main() {
     process.stderr.write(`[taker] starting trade cycle ${tradeCount + 1}\n`);
     await runSingleTradeCycle();
     tradeCount += 1;
-    if (once) return;
+  }
+
+  if (maxTrades !== 0) {
+    process.stderr.write(`[taker] completed ${tradeCount} trade cycle(s), exiting\n`);
+    try {
+      receipts?.close();
+    } catch (_e) {
+      process.stderr.write(`[taker] ERROR: ${_e?.message || String(_e)}\n`);
+    }
+    sc.close();
+    process.exit(0);
   }
 
   await new Promise(() => {});
