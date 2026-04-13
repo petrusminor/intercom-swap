@@ -522,7 +522,8 @@ async function main() {
   const testStopBeforeLnPayRaw = flags.get('test-stop-before-ln-pay');
   const testStopAfterLnPayBeforeClaimRaw = flags.get('test-stop-after-ln-pay-before-claim');
 
-  const tradeId = (flags.get('trade-id') && String(flags.get('trade-id')).trim()) || `swap_${crypto.randomUUID()}`;
+  const configuredTradeId = (flags.get('trade-id') && String(flags.get('trade-id')).trim()) || '';
+  let tradeId = configuredTradeId || `swap_${crypto.randomUUID()}`;
   let settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
   const initialSettlementKind = settlementKind;
   let isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
@@ -552,6 +553,10 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 200);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
+  const maxTrades = flags.get('max-trades') !== undefined
+    ? Number.parseInt(String(flags.get('max-trades')), 10)
+    : 1;
+  if (!Number.isInteger(maxTrades) || maxTrades < 0) die('Invalid --max-trades (expected integer >= 0)');
 
   const runSwap = parseBool(flags.get('run-swap'), false);
   const allowNoReceipts = parseBool(flags.get('allow-no-receipts'), false);
@@ -628,6 +633,13 @@ async function main() {
   });
   const invoiceExpirySafetyMarginSec = invoiceExpiryMarginConfig.invoiceExpirySafetyMarginSec;
   for (const warning of invoiceExpiryMarginConfig.warnings) process.stderr.write(`Warning: ${warning}\n`);
+
+  const configuredSettlementKind = settlementKind;
+  const configuredBtcSats = btcSats;
+  const configuredUsdtAmount = usdtAmount;
+  const configuredSettlementRefundAfterSec = settlementRefundAfterSec;
+  const configuredEffectiveMinSettlementRefundAfterSec = effectiveMinSettlementRefundAfterSec;
+  const configuredUnsafeMinSettlementRefundAfterSecProvided = unsafeMinSettlementRefundAfterSecProvided;
 
   const solRpcUrl = (flags.get('solana-rpc-url') && String(flags.get('solana-rpc-url')).trim()) || 'http://127.0.0.1:8899';
   const solKeypairPath = flags.get('solana-keypair') ? String(flags.get('solana-keypair')).trim() : '';
@@ -802,7 +814,7 @@ async function main() {
   }
   ensureOk(await sc.subscribe(joinedChannels), `subscribe ${joinedChannels.join(',')}`);
   process.stderr.write(
-    `[taker] subscribed rfq_channel=${rfqChannel} joined_channels=${joinedChannels.join(',')} trade_id=${tradeId} rfq_id=pending\n`
+    `[taker] subscribed rfq_channel=${rfqChannel} joined_channels=${joinedChannels.join(',')} trade_id=${configuredTradeId || 'pending'} rfq_id=pending\n`
   );
 
   const takerPubkey = String(sc.hello?.peer || '').trim().toLowerCase();
@@ -813,6 +825,26 @@ async function main() {
   }
 
   const runSingleTradeCycle = async () => {
+    tradeId = configuredTradeId && maxTrades === 1 ? configuredTradeId : `swap_${crypto.randomUUID()}`;
+    settlementKind = configuredSettlementKind;
+    isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
+    isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
+    rfqPair = buildSettlementContext({ settlementKind }).pair;
+    btcSats = configuredBtcSats;
+    usdtAmount = configuredUsdtAmount;
+    settlementRefundAfterSec = configuredSettlementRefundAfterSec;
+    effectiveMinSettlementRefundAfterSec = configuredEffectiveMinSettlementRefundAfterSec;
+    unsafeMinSettlementRefundAfterSecProvided = configuredUnsafeMinSettlementRefundAfterSecProvided;
+    minSolRefundWindowSec = minSolRefundWindowSecCfg;
+    maxSolRefundWindowSec = maxSolRefundWindowSecCfg;
+    maxPlatformFeeBps = maxPlatformFeeBpsCfg;
+    maxTradeFeeBps = maxTradeFeeBpsCfg;
+    maxTotalFeeBps = maxTotalFeeBpsCfg;
+    settlementProgramId = null;
+    settlementBinding = null;
+    expectedAppHash = null;
+    sol = null;
+
     let offerMeta = null;
     if (listenOffers) {
       const offerWaitMs = Math.max(5_000, Math.trunc(Number(timeoutSec || 30) * 1000));
@@ -990,6 +1022,16 @@ async function main() {
     let joinSwapInFlight = false;
     let done = false;
     let swapCtx = null; // { swapChannel, invite, trade, waiters, sent }
+    let resolveCycleDone = null;
+    const cycleDone = new Promise((resolve) => {
+      resolveCycleDone = resolve;
+    });
+    const finishCycle = () => {
+      if (!resolveCycleDone) return;
+      const resolve = resolveCycleDone;
+      resolveCycleDone = null;
+      resolve();
+    };
 
     const deadlineMs = Date.now() + timeoutSec * 1000;
 
@@ -1044,6 +1086,7 @@ async function main() {
     const stopTimers = () => {
       clearInterval(resendRfqTimer);
       clearInterval(resendAcceptTimer);
+      clearInterval(enforceTimeout);
     };
 
     const enforceTimeout = setInterval(() => {
@@ -1707,14 +1750,16 @@ async function main() {
 
     swapCtx.done = true;
     done = true;
+    stopTimers();
     clearTimers();
     process.stdout.write(`${JSON.stringify({ type: 'swap_done', trade_id: tradeId, swap_channel: swapChannel })}\n`);
     persistTrade({ state: STATE.CLAIMED }, 'swap_done', { trade_id: tradeId, swap_channel: swapChannel });
     await leaveSidechannel(swapChannel);
+    finishCycle();
     maybeExit();
     };
 
-    sc.on('sidechannel_message', async (evt) => {
+    const onSidechannelMessage = async (evt) => {
       try {
         if (swapCtx && evt?.channel === swapCtx.swapChannel) {
           const msg = evt?.message;
@@ -1971,6 +2016,7 @@ async function main() {
           if (!runSwap) {
             if (once) await leaveSidechannel(swapChannel);
             done = true;
+            finishCycle();
             maybeExit();
             return;
           }
@@ -1984,13 +2030,30 @@ async function main() {
       } catch (err) {
         process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
       }
-    });
+    };
 
-    // Keep process alive.
-    await new Promise(() => {});
+    sc.on('sidechannel_message', onSidechannelMessage);
+    try {
+      await cycleDone;
+    } finally {
+      sc.off('sidechannel_message', onSidechannelMessage);
+      stopTimers();
+    }
   };
 
-  await runSingleTradeCycle();
+  if (maxTrades === 0) {
+    process.stderr.write('[taker] WARNING: running in infinite multi-trade mode (may fully convert balances)\n');
+  }
+
+  let tradeCount = 0;
+  while (maxTrades === 0 || tradeCount < maxTrades) {
+    process.stderr.write(`[taker] starting trade cycle ${tradeCount + 1}\n`);
+    await runSingleTradeCycle();
+    tradeCount += 1;
+    if (once) return;
+  }
+
+  await new Promise(() => {});
 }
 
 const isDirectRun = (() => {
