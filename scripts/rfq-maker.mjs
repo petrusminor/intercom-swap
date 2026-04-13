@@ -489,6 +489,12 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 750);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
+  const maxTrades = flags.get('max-trades') !== undefined
+    ? Number(flags.get('max-trades'))
+    : null;
+  if (maxTrades !== null) {
+    if (!Number.isInteger(maxTrades) || maxTrades < 1) die('Invalid --max-trades (expected integer >= 1)');
+  }
   const settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
   const isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
   const isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
@@ -564,7 +570,6 @@ async function main() {
   const settlementCtx = buildSettlementContext({
     settlementKind,
     solanaProgramId: expectedProgramId,
-    taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
   });
   const settlementBinding = settlementCtx.settlementBinding;
   const settlementProgramId = settlementBinding.binding_id;
@@ -583,6 +588,12 @@ async function main() {
   }
   const receipts = receiptsRuntime.receipts;
   process.stderr.write(`[receipts] enabled=${receiptsRuntime.enabled} db_path=${receiptsRuntime.dbPath}\n`);
+  if (maxTrades !== null) {
+    process.stderr.write(`[maker] max trades set to ${maxTrades}\n`);
+  } else {
+    process.stderr.write('[maker] max trades: unlimited\n');
+    process.stderr.write('[maker] WARNING: unlimited mode enabled — may consume all available liquidity\n');
+  }
 
   if (runSwap) {
     if (isSolanaSettlement) {
@@ -593,7 +604,6 @@ async function main() {
       if (!taoKeyfilePath && !process.env.TAO_EVM_PRIVATE_KEY) {
         die('Missing TAO signer: provide --tao-keyfile or TAO_EVM_PRIVATE_KEY');
       }
-      if (!process.env.TAO_EVM_HTLC_ADDRESS) die('Missing TAO_EVM_HTLC_ADDRESS (required when --settlement tao-evm)');
     }
     if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
   }
@@ -633,6 +643,8 @@ async function main() {
   const quoteIdToLockKey = new Map(); // quote_id -> lockKey
   const tradeIdToLockKey = new Map(); // trade_id -> lockKey
   const swapChannelToLockKey = new Map(); // swap_channel -> lockKey
+  let completedTrades = 0;
+  let shouldStop = false;
 
   const clearRfqLock = (lockKey, reason = 'unknown') => {
     if (!lockKey) return;
@@ -698,12 +710,10 @@ async function main() {
             computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
           },
           taoEvm: {
-            rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
             chainId: 964,
             privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
             keyfilePath: taoKeyfilePath,
             confirmations: 1,
-            htlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
           },
         });
         return {
@@ -1488,6 +1498,14 @@ async function main() {
           done = true;
           const evtType =
             ctx.trade.state === STATE.CLAIMED ? 'swap_done' : (ctx.trade.state === STATE.REFUNDED ? 'swap_refunded' : 'swap_canceled');
+          if (ctx.trade.state === STATE.CLAIMED) {
+            completedTrades += 1;
+            process.stderr.write(`[maker] completed trades: ${completedTrades}\n`);
+            if (maxTrades && completedTrades >= maxTrades && !shouldStop) {
+              shouldStop = true;
+              process.stderr.write('[maker] reached max trades, stopping new trades\n');
+            }
+          }
           process.stdout.write(
             `${JSON.stringify({ type: evtType, trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, state: ctx.trade.state })}\n`
           );
@@ -1513,6 +1531,10 @@ async function main() {
       }
 
       if (msg.kind === KIND.RFQ) {
+        if (shouldStop) {
+          process.stderr.write('[maker] max trades reached — ignoring new RFQs\n');
+          return;
+        }
         const v = validateLocalMakerEnvelope(msg, { effectiveMinSettlementRefundAfterSec });
         const logRfqEarlyReturn = (reason, extra = {}) => {
           const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
@@ -1891,6 +1913,10 @@ async function main() {
         const existing = swaps.get(swapChannel);
         const pendingInvitee = pendingSwaps.get(swapChannel);
         const isRetry = Boolean(existing || pendingInvitee);
+        if (shouldStop && !isRetry) {
+          process.stderr.write('[maker] reached max trades, ignoring new quote accepts\n');
+          return;
+        }
         if (existing) {
           if (String(existing.inviteePubKey || '').trim().toLowerCase() !== inviteePubKey) return;
         }
