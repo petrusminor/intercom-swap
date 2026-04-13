@@ -746,7 +746,6 @@ async function main() {
     const settlementCtx = buildSettlementContext({
       settlementKind,
       solanaProgramId: expectedProgramId,
-      taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
     });
     settlementBinding = settlementCtx.settlementBinding;
     settlementProgramId = settlementBinding.binding_id;
@@ -760,7 +759,6 @@ async function main() {
         if (!taoKeyfilePath && !process.env.TAO_EVM_PRIVATE_KEY) {
           die('Missing TAO signer: provide --tao-keyfile or TAO_EVM_PRIVATE_KEY');
         }
-        if (!process.env.TAO_EVM_HTLC_ADDRESS) die('Missing TAO_EVM_HTLC_ADDRESS (required when --settlement tao-evm)');
       }
       if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
     }
@@ -779,12 +777,10 @@ async function main() {
               computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
             },
             taoEvm: {
-              rpcUrl: process.env.TAO_EVM_RPC_URL || 'https://lite.chain.opentensor.ai',
               chainId: 964,
               privateKey: process.env.TAO_EVM_PRIVATE_KEY || '',
               keyfilePath: taoKeyfilePath,
               confirmations: 1,
-              htlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
             },
           });
           return {
@@ -816,255 +812,278 @@ async function main() {
     die(`peer keypair pubkey mismatch: sc_bridge=${takerPubkey} keypair=${signing.pubHex}`);
   }
 
-  let offerMeta = null;
-  if (listenOffers) {
-    const offerWaitMs = Math.max(5_000, Math.trunc(Number(timeoutSec || 30) * 1000));
-    process.stdout.write(
-      `${JSON.stringify({ type: 'waiting_offer', offer_channels: offerChannels, rfq_channel: rfqChannel, trade_id: tradeId, pubkey: takerPubkey })}\n`
-    );
-
-    offerMeta = await new Promise((resolve, reject) => {
-      const deadline = setTimeout(() => {
-        cleanup();
-        reject(new Error(`offer wait timeout after ${offerWaitMs}ms`));
-      }, offerWaitMs);
-
-      const cleanup = () => {
-        clearTimeout(deadline);
-        sc.off('sidechannel_message', onMsg);
-      };
-
-      const onMsg = (evt) => {
-        try {
-          const matchedOffer = matchOfferAnnouncementEvent(evt, {
-            offerChannels,
-            rfqChannel,
-            fallbackPair: rfqPair,
-            expectedProgramId,
-            taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS || '',
-            maxPlatformFeeBps: maxPlatformFeeBpsCfg,
-            maxTradeFeeBps: maxTradeFeeBpsCfg,
-            maxTotalFeeBps: maxTotalFeeBpsCfg,
-            minRefundSec: minSolRefundWindowSecCfg,
-            minSettlementRefundSec: effectiveMinSettlementRefundAfterSec,
-            maxRefundSec: maxSolRefundWindowSecCfg,
-          });
-          if (!matchedOffer) return;
-          cleanup();
-          resolve(matchedOffer);
-          return;
-        } catch (err) {
-          cleanup();
-          reject(err);
-        }
-      };
-
-      sc.on('sidechannel_message', onMsg);
-    });
-
-    rfqPair = offerMeta.pair;
-    if (offerMeta.settlement_kind !== settlementKind) {
-      process.stderr.write(
-        `Warning: matched ${rfqPair} offer overrides taker settlement from ${initialSettlementKind} to ${offerMeta.settlement_kind}\n`
+  const runSingleTradeCycle = async () => {
+    let offerMeta = null;
+    if (listenOffers) {
+      const offerWaitMs = Math.max(5_000, Math.trunc(Number(timeoutSec || 30) * 1000));
+      const offerWaitLogIntervalMs = 10 * 60 * 1000;
+      let firstOfferTimeout = true;
+      let lastOfferWaitLogAtMs = 0;
+      process.stdout.write(
+        `${JSON.stringify({ type: 'waiting_offer', offer_channels: offerChannels, rfq_channel: rfqChannel, trade_id: tradeId, pubkey: takerPubkey })}\n`
       );
-      settlementKind = offerMeta.settlement_kind;
-      isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
-      isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
-    }
-    btcSats = offerMeta.btc_sats;
-    usdtAmount = String(getAmountForPair(offerMeta, rfqPair) || '').trim();
-    maxPlatformFeeBps = offerMeta.max_platform_fee_bps;
-    maxTradeFeeBps = offerMeta.max_trade_fee_bps;
-    maxTotalFeeBps = offerMeta.max_total_fee_bps;
-    const offerRefundPolicy = buildSettlementContext({
-      pair: rfqPair,
-      refundRaw: offerMeta,
-      refundDefaults: {
-        minSec: SETTLEMENT_REFUND_MIN_SEC,
-        maxSec: SETTLEMENT_REFUND_MAX_SEC,
-        defaultQuoteRefundSec: settlementRefundAfterSec,
-        defaultMinRefundSec: minSolRefundWindowSec,
-        defaultMaxRefundSec: maxSolRefundWindowSec,
-      },
-    }).refundPolicy;
-    settlementRefundAfterSec = offerRefundPolicy.quoteRefundSec;
-    minSolRefundWindowSec = offerRefundPolicy.minRefundSec;
-    maxSolRefundWindowSec = offerRefundPolicy.maxRefundSec;
 
-    process.stdout.write(
-      `${JSON.stringify({
-        type: 'offer_matched',
-        trade_id: tradeId,
-        offer_channel: offerMeta.offer_channel,
-        offer_name: offerMeta.offer_name,
-        pair: rfqPair,
-        btc_sats: btcSats,
-        [getAmountFieldForPair(rfqPair)]: usdtAmount,
-      })}\n`
-    );
-  }
+      for (;;) {
+        try {
+          offerMeta = await new Promise((resolve, reject) => {
+            const deadline = setTimeout(() => {
+              cleanup();
+              const err = new Error(`offer wait timeout after ${offerWaitMs}ms`);
+              err.code = 'OFFER_TIMEOUT';
+              reject(err);
+            }, offerWaitMs);
 
-  await initSettlementRuntime();
+            const cleanup = () => {
+              clearTimeout(deadline);
+              sc.off('sidechannel_message', onMsg);
+            };
 
-  const nowSec = Math.floor(Date.now() / 1000);
-  let rfqValidUntil = nowSec + rfqValidSec;
-  if (offerMeta && Number.isFinite(offerMeta.offer_valid_until_unix) && offerMeta.offer_valid_until_unix > 0) {
-    rfqValidUntil = Math.min(rfqValidUntil, Math.trunc(offerMeta.offer_valid_until_unix));
-  }
-  if (!Number.isInteger(Number(btcSats)) || Number(btcSats) < 1) {
-    die('Invalid --btc-sats (must be >= 1)');
-  }
-  if (!/^[0-9]+$/.test(String(usdtAmount || '').trim()) || BigInt(String(usdtAmount || '0')) <= 0n) {
-    const amountFlagLabel = isTaoSettlement ? '--tao-amount-atomic' : '--usdt-amount';
-    die(`Invalid ${amountFlagLabel} (must be a positive base-unit integer; open RFQ amount=0 is not supported)`);
-  }
-  const rfqUnsigned = buildRfqUnsignedEnvelope({
-    tradeId,
-    pair: rfqPair,
-    expectedAppHash,
-    btcSats,
-    amountAtomic: usdtAmount,
-    maxPlatformFeeBps,
-    maxTradeFeeBps,
-    maxTotalFeeBps,
-    settlementRefundAfterSec,
-    minSolRefundWindowSec,
-    maxSolRefundWindowSec,
-    solRecipient: runSwap ? sol.recipientAddress : null,
-    solMint: runSwap && solMintStr ? solMintStr : null,
-    validUntilUnix: rfqValidUntil,
-  });
-  process.stderr.write(
-    `[taker] rfq settlement_refund_after_sec=${rfqUnsigned?.body?.settlement_refund_after_sec} rfq_id=${rfqUnsigned?.body?.rfq_id ?? 'n/a'} trade_id=${rfqUnsigned?.tradeId ?? 'n/a'}\n`
-  );
-  const rfqId = hashUnsignedEnvelope(rfqUnsigned);
-  const rfqSigned = signSwapEnvelope(rfqUnsigned, signing, {
-    effectiveMinSettlementRefundAfterSec,
-  });
-  ensureOk(await sc.send(rfqChannel, rfqSigned), 'send rfq');
+            const onMsg = (evt) => {
+              try {
+                const matchedOffer = matchOfferAnnouncementEvent(evt, {
+                  offerChannels,
+                  rfqChannel,
+                  fallbackPair: rfqPair,
+                  expectedProgramId,
+                  maxPlatformFeeBps: maxPlatformFeeBpsCfg,
+                  maxTradeFeeBps: maxTradeFeeBpsCfg,
+                  maxTotalFeeBps: maxTotalFeeBpsCfg,
+                  minRefundSec: minSolRefundWindowSecCfg,
+                  minSettlementRefundSec: effectiveMinSettlementRefundAfterSec,
+                  maxRefundSec: maxSolRefundWindowSecCfg,
+                });
+                if (!matchedOffer) return;
+                cleanup();
+                resolve(matchedOffer);
+                return;
+              } catch (err) {
+                cleanup();
+                reject(err);
+              }
+            };
 
-  persistTrade(
-    {
-      role: 'taker',
-      rfq_channel: rfqChannel,
-      maker_peer: null,
-      taker_peer: takerPubkey,
-      btc_sats: btcSats,
-      usdt_amount: isTaoPair(rfqPair) ? null : usdtAmount,
-      ...(isTaoPair(rfqPair) ? { tao_amount_atomic: usdtAmount } : {}),
-      ...(isSolanaSettlement
-        ? {
-            sol_mint: runSwap && solMintStr ? solMintStr : null,
-            sol_recipient: runSwap ? sol.recipientAddress : null,
+            sc.on('sidechannel_message', onMsg);
+          });
+          break;
+        } catch (err) {
+          if (err?.code !== 'OFFER_TIMEOUT') {
+            throw err;
           }
-        : {}),
-      state: STATE.INIT,
-    },
-    'rfq_sent',
-    rfqSigned
-  );
+          const nowMs = Date.now();
+          if (firstOfferTimeout) {
+            process.stderr.write(`[taker] no offers received (${Math.trunc(offerWaitMs / 1000)}s), continuing to listen...\n`);
+            firstOfferTimeout = false;
+            lastOfferWaitLogAtMs = nowMs;
+          } else if (nowMs - lastOfferWaitLogAtMs > offerWaitLogIntervalMs) {
+            process.stderr.write('[taker] still listening for offers...\n');
+            lastOfferWaitLogAtMs = nowMs;
+          }
+        }
+      }
 
-  process.stdout.write(`${JSON.stringify({ type: 'ready', role: 'taker', rfq_channel: rfqChannel, trade_id: tradeId, rfq_id: rfqId, pubkey: takerPubkey })}\n`);
+      rfqPair = offerMeta.pair;
+      if (offerMeta.settlement_kind !== settlementKind) {
+        process.stderr.write(
+          `Warning: matched ${rfqPair} offer overrides taker settlement from ${initialSettlementKind} to ${offerMeta.settlement_kind}\n`
+        );
+        settlementKind = offerMeta.settlement_kind;
+        isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
+        isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
+      }
+      btcSats = offerMeta.btc_sats;
+      usdtAmount = String(getAmountForPair(offerMeta, rfqPair) || '').trim();
+      maxPlatformFeeBps = offerMeta.max_platform_fee_bps;
+      maxTradeFeeBps = offerMeta.max_trade_fee_bps;
+      maxTotalFeeBps = offerMeta.max_total_fee_bps;
+      const offerRefundPolicy = buildSettlementContext({
+        pair: rfqPair,
+        refundRaw: offerMeta,
+        refundDefaults: {
+          minSec: SETTLEMENT_REFUND_MIN_SEC,
+          maxSec: SETTLEMENT_REFUND_MAX_SEC,
+          defaultQuoteRefundSec: settlementRefundAfterSec,
+          defaultMinRefundSec: minSolRefundWindowSec,
+          defaultMaxRefundSec: maxSolRefundWindowSec,
+        },
+      }).refundPolicy;
+      settlementRefundAfterSec = offerRefundPolicy.quoteRefundSec;
+      minSolRefundWindowSec = offerRefundPolicy.minRefundSec;
+      maxSolRefundWindowSec = offerRefundPolicy.maxRefundSec;
 
-  let chosen = null; // { rfq_id, quote_id, quote }
-  let joined = false;
-  let joinSwapInFlight = false;
-  let done = false;
-  let swapCtx = null; // { swapChannel, invite, trade, waiters, sent }
+      process.stdout.write(
+        `${JSON.stringify({
+          type: 'offer_matched',
+          trade_id: tradeId,
+          offer_channel: offerMeta.offer_channel,
+          offer_name: offerMeta.offer_name,
+          pair: rfqPair,
+          btc_sats: btcSats,
+          [getAmountFieldForPair(rfqPair)]: usdtAmount,
+        })}\n`
+      );
+    }
 
-  const deadlineMs = Date.now() + timeoutSec * 1000;
+    await initSettlementRuntime();
 
-  const maybeExit = () => {
-    if (!once) return;
-    if (!done) return;
-    const delay = Number.isFinite(onceExitDelayMs) ? Math.max(onceExitDelayMs, 0) : 0;
-    setTimeout(() => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    let rfqValidUntil = nowSec + rfqValidSec;
+    if (offerMeta && Number.isFinite(offerMeta.offer_valid_until_unix) && offerMeta.offer_valid_until_unix > 0) {
+      rfqValidUntil = Math.min(rfqValidUntil, Math.trunc(offerMeta.offer_valid_until_unix));
+    }
+    if (!Number.isInteger(Number(btcSats)) || Number(btcSats) < 1) {
+      die('Invalid --btc-sats (must be >= 1)');
+    }
+    if (!/^[0-9]+$/.test(String(usdtAmount || '').trim()) || BigInt(String(usdtAmount || '0')) <= 0n) {
+      const amountFlagLabel = isTaoSettlement ? '--tao-amount-atomic' : '--usdt-amount';
+      die(`Invalid ${amountFlagLabel} (must be a positive base-unit integer; open RFQ amount=0 is not supported)`);
+    }
+    const rfqUnsigned = buildRfqUnsignedEnvelope({
+      tradeId,
+      pair: rfqPair,
+      expectedAppHash,
+      btcSats,
+      amountAtomic: usdtAmount,
+      maxPlatformFeeBps,
+      maxTradeFeeBps,
+      maxTotalFeeBps,
+      settlementRefundAfterSec,
+      minSolRefundWindowSec,
+      maxSolRefundWindowSec,
+      solRecipient: runSwap ? sol.recipientAddress : null,
+      solMint: runSwap && solMintStr ? solMintStr : null,
+      validUntilUnix: rfqValidUntil,
+    });
+    process.stderr.write(
+      `[taker] rfq settlement_refund_after_sec=${rfqUnsigned?.body?.settlement_refund_after_sec} rfq_id=${rfqUnsigned?.body?.rfq_id ?? 'n/a'} trade_id=${rfqUnsigned?.tradeId ?? 'n/a'}\n`
+    );
+    const rfqId = hashUnsignedEnvelope(rfqUnsigned);
+    const rfqSigned = signSwapEnvelope(rfqUnsigned, signing, {
+      effectiveMinSettlementRefundAfterSec,
+    });
+    ensureOk(await sc.send(rfqChannel, rfqSigned), 'send rfq');
+
+    persistTrade(
+      {
+        role: 'taker',
+        rfq_channel: rfqChannel,
+        maker_peer: null,
+        taker_peer: takerPubkey,
+        btc_sats: btcSats,
+        usdt_amount: isTaoPair(rfqPair) ? null : usdtAmount,
+        ...(isTaoPair(rfqPair) ? { tao_amount_atomic: usdtAmount } : {}),
+        ...(isSolanaSettlement
+          ? {
+              sol_mint: runSwap && solMintStr ? solMintStr : null,
+              sol_recipient: runSwap ? sol.recipientAddress : null,
+            }
+          : {}),
+        state: STATE.INIT,
+      },
+      'rfq_sent',
+      rfqSigned
+    );
+
+    process.stdout.write(`${JSON.stringify({ type: 'ready', role: 'taker', rfq_channel: rfqChannel, trade_id: tradeId, rfq_id: rfqId, pubkey: takerPubkey })}\n`);
+
+    let chosen = null; // { rfq_id, quote_id, quote }
+    let joined = false;
+    let joinSwapInFlight = false;
+    let done = false;
+    let swapCtx = null; // { swapChannel, invite, trade, waiters, sent }
+
+    const deadlineMs = Date.now() + timeoutSec * 1000;
+
+    const maybeExit = () => {
+      if (!once) return;
+      if (!done) return;
+      const delay = Number.isFinite(onceExitDelayMs) ? Math.max(onceExitDelayMs, 0) : 0;
+      setTimeout(() => {
+        try {
+          receipts?.close();
+        } catch (_e) {
+          process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+        }
+        sc.close();
+        process.exit(0);
+      }, delay);
+    };
+
+    const leaveSidechannel = async (channel) => {
       try {
-        receipts?.close();
+        await sc.leave(channel);
       } catch (_e) {
         process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
       }
-      sc.close();
-      process.exit(0);
-    }, delay);
-  };
+    };
 
-  const leaveSidechannel = async (channel) => {
-    try {
-      await sc.leave(channel);
-    } catch (_e) {
-      process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
-    }
-  };
+    const resendRfqTimer = setInterval(async () => {
+      try {
+        if (chosen) return;
+        if (Date.now() > deadlineMs) return;
+        ensureOk(await sc.send(rfqChannel, rfqSigned), 'resend rfq');
+        if (debug) process.stderr.write(`[taker] resend rfq trade_id=${tradeId}\n`);
+      } catch (err) {
+        process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
+      }
+    }, Math.max(rfqResendMs, 200));
 
-  const resendRfqTimer = setInterval(async () => {
-    try {
-      if (chosen) return;
-      if (Date.now() > deadlineMs) return;
-      ensureOk(await sc.send(rfqChannel, rfqSigned), 'resend rfq');
-      if (debug) process.stderr.write(`[taker] resend rfq trade_id=${tradeId}\n`);
-    } catch (err) {
-      process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
-    }
-  }, Math.max(rfqResendMs, 200));
+    let quoteAcceptSigned = null;
+    const resendAcceptTimer = setInterval(async () => {
+      try {
+        if (!chosen) return;
+        if (joined) return;
+        if (Date.now() > deadlineMs) return;
+        if (!quoteAcceptSigned) return;
+        ensureOk(await sc.send(rfqChannel, quoteAcceptSigned), 'resend quote_accept');
+        if (debug) process.stderr.write(`[taker] resend quote_accept trade_id=${tradeId} quote_id=${chosen.quote_id}\n`);
+      } catch (err) {
+        process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
+      }
+    }, Math.max(acceptResendMs, 200));
 
-  let quoteAcceptSigned = null;
-  const resendAcceptTimer = setInterval(async () => {
-    try {
-      if (!chosen) return;
-      if (joined) return;
-      if (Date.now() > deadlineMs) return;
-      if (!quoteAcceptSigned) return;
-      ensureOk(await sc.send(rfqChannel, quoteAcceptSigned), 'resend quote_accept');
-      if (debug) process.stderr.write(`[taker] resend quote_accept trade_id=${tradeId} quote_id=${chosen.quote_id}\n`);
-    } catch (err) {
-      process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
-    }
-  }, Math.max(acceptResendMs, 200));
+    const stopTimers = () => {
+      clearInterval(resendRfqTimer);
+      clearInterval(resendAcceptTimer);
+    };
 
-  const stopTimers = () => {
-    clearInterval(resendRfqTimer);
-    clearInterval(resendAcceptTimer);
-  };
+    const enforceTimeout = setInterval(() => {
+      if (Date.now() <= deadlineMs) return;
+      stopTimers();
+      process.stderr.write(
+        `[taker] still waiting for RFQ handshake expected_next=${chosen ? 'swap_invite' : 'quote'} ` +
+          `trade_id=${tradeId} rfq_id=${rfqId} rfq_channel=${rfqChannel}\n`
+      );
+      process.stderr.write(
+        '[taker] hint: common offer-listen skip causes: offer missing app_hash; offer app_hash mismatch vs settlement binding\n'
+      );
+      die(`Timeout waiting for RFQ handshake (timeout-sec=${timeoutSec})`);
+    }, 200);
 
-  const enforceTimeout = setInterval(() => {
-    if (Date.now() <= deadlineMs) return;
-    stopTimers();
-    process.stderr.write(
-      `[taker] still waiting for RFQ handshake expected_next=${chosen ? 'swap_invite' : 'quote'} ` +
-        `trade_id=${tradeId} rfq_id=${rfqId} rfq_channel=${rfqChannel}\n`
-    );
-    process.stderr.write(
-      '[taker] hint: common offer-listen skip causes: offer missing app_hash; offer app_hash mismatch vs settlement binding\n'
-    );
-    die(`Timeout waiting for RFQ handshake (timeout-sec=${timeoutSec})`);
-  }, 200);
-
-  const waitForSwapMessage = (match, { timeoutMs, label }) =>
-    new Promise((resolve, reject) => {
-      if (!swapCtx) return reject(new Error('swapCtx not initialized'));
-      const timer = setTimeout(() => {
-        swapCtx.waiters.delete(waiter);
-        reject(new Error(`Timeout waiting for ${label}`));
-      }, timeoutMs);
-      const waiter = (msg) => {
-        try {
-          if (!match(msg)) return;
-          clearTimeout(timer);
+    const waitForSwapMessage = (match, { timeoutMs, label }) =>
+      new Promise((resolve, reject) => {
+        if (!swapCtx) return reject(new Error('swapCtx not initialized'));
+        const timer = setTimeout(() => {
           swapCtx.waiters.delete(waiter);
-          resolve(msg);
-        } catch (err) {
-          clearTimeout(timer);
-          swapCtx.waiters.delete(waiter);
-          reject(err);
-        }
-      };
-      swapCtx.waiters.add(waiter);
-    });
+          reject(new Error(`Timeout waiting for ${label}`));
+        }, timeoutMs);
+        const waiter = (msg) => {
+          try {
+            if (!match(msg)) return;
+            clearTimeout(timer);
+            swapCtx.waiters.delete(waiter);
+            resolve(msg);
+          } catch (err) {
+            clearTimeout(timer);
+            swapCtx.waiters.delete(waiter);
+            reject(err);
+          }
+        };
+        swapCtx.waiters.add(waiter);
+      });
 
-  let persistSwapMessageCheckpoint = (_msg) => {};
+    let persistSwapMessageCheckpoint = (_msg) => {};
 
-  const startSwap = async ({ swapChannel, invite }) => {
+    const startSwap = async ({ swapChannel, invite }) => {
     ensureOk(await sc.subscribe([swapChannel]), `subscribe ${swapChannel}`);
 
     swapCtx = {
@@ -1446,22 +1465,12 @@ async function main() {
     }
 
     // Hard rule: verify settlement lock on-chain before paying.
-    let prepay;
-    if (isTaoSettlement) {
-      prepay = await sol.settlement.waitForPrepayOnchain({
-        terms: swapCtx.trade.terms,
-        invoiceBody: swapCtx.trade.invoice,
-        escrowBody: swapCtx.trade.escrow,
-        nowUnix: Math.floor(Date.now() / 1000),
-      });
-    } else {
-      prepay = await sol.settlement.verifySwapPrePayOnchain({
-        terms: swapCtx.trade.terms,
-        invoiceBody: swapCtx.trade.invoice,
-        escrowBody: swapCtx.trade.escrow,
-        nowUnix: Math.floor(Date.now() / 1000),
-      });
-    }
+    const prepay = await sol.settlement.waitForPrepayOnchain({
+      terms: swapCtx.trade.terms,
+      invoiceBody: swapCtx.trade.invoice,
+      escrowBody: swapCtx.trade.escrow,
+      nowUnix: Math.floor(Date.now() / 1000),
+    });
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
     if (isTaoSettlement && swapCtx.trade.escrow) {
       persistTrade({
@@ -1703,282 +1712,285 @@ async function main() {
     persistTrade({ state: STATE.CLAIMED }, 'swap_done', { trade_id: tradeId, swap_channel: swapChannel });
     await leaveSidechannel(swapChannel);
     maybeExit();
-  };
+    };
 
-  sc.on('sidechannel_message', async (evt) => {
-    try {
-      if (swapCtx && evt?.channel === swapCtx.swapChannel) {
+    sc.on('sidechannel_message', async (evt) => {
+      try {
+        if (swapCtx && evt?.channel === swapCtx.swapChannel) {
+          const msg = evt?.message;
+          if (!msg || typeof msg !== 'object') return;
+          const v = validateSwapEnvelope(msg);
+          if (!v.ok) return;
+          const r = applySwapEnvelope(swapCtx.trade, msg);
+          if (r.ok) {
+            swapCtx.trade = r.trade;
+            persistSwapMessageCheckpoint(msg);
+          }
+          for (const waiter of swapCtx.waiters) {
+            try {
+              waiter(msg);
+            } catch (_e) {
+              process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
+            }
+          }
+          return;
+        }
+
+        if (evt?.channel !== rfqChannel) return;
         const msg = evt?.message;
         if (!msg || typeof msg !== 'object') return;
-        const v = validateSwapEnvelope(msg);
-        if (!v.ok) return;
-        const r = applySwapEnvelope(swapCtx.trade, msg);
-        if (r.ok) {
-          swapCtx.trade = r.trade;
-          persistSwapMessageCheckpoint(msg);
-        }
-        for (const waiter of swapCtx.waiters) {
-          try {
-            waiter(msg);
-          } catch (_e) {
-            process.stderr.write(`[taker] ERROR: ${_e?.stack || _e?.message || String(_e)}\n`);
-          }
-        }
-        return;
-      }
+        process.stderr.write(
+          `[taker] rfq_inbound channel=${rfqChannel} msg_kind=${String(msg.kind || msg.type || 'unknown')} ` +
+            `looks_signed_quote=${msg.kind === KIND.QUOTE || (msg?.body?.quote_id && msg?.sig ? 'yes' : 'no')} ` +
+            `trade_id=${String(msg.trade_id || 'n/a')} rfq_id=${String(msg?.body?.rfq_id || 'n/a')}\n`
+        );
 
-      if (evt?.channel !== rfqChannel) return;
-      const msg = evt?.message;
-      if (!msg || typeof msg !== 'object') return;
-      process.stderr.write(
-        `[taker] rfq_inbound channel=${rfqChannel} msg_kind=${String(msg.kind || msg.type || 'unknown')} ` +
-          `looks_signed_quote=${msg.kind === KIND.QUOTE || (msg?.body?.quote_id && msg?.sig ? 'yes' : 'no')} ` +
-          `trade_id=${String(msg.trade_id || 'n/a')} rfq_id=${String(msg?.body?.rfq_id || 'n/a')}\n`
-      );
-
-      if (msg.kind === KIND.QUOTE) {
-        if (String(msg.trade_id) !== tradeId) {
-          process.stderr.write(
-            `[taker] quote_reject reason=trade_id_mismatch actual_trade_id=${String(msg.trade_id || '')} expected_trade_id=${tradeId}\n`
-          );
-          return;
-        }
-        const v = validateLocalTakerEnvelope(msg, { effectiveMinSettlementRefundAfterSec });
-        if (!v.ok) {
-          process.stderr.write(
-            `[taker] quote_reject reason=invalid_envelope trade_id=${tradeId} rfq_id=${String(msg?.body?.rfq_id || 'n/a')} error=${v.error || 'unknown'}\n`
-          );
-          return;
-        }
-        const quoteAppHash = String(msg?.body?.app_hash || '').trim().toLowerCase();
-        if (quoteAppHash !== expectedAppHash) {
-          process.stderr.write(
-            `[taker] quote_reject reason=app_hash_mismatch trade_id=${tradeId} rfq_id=${String(msg?.body?.rfq_id || 'n/a')} ` +
-              `actual_app_hash=${quoteAppHash || 'n/a'} expected_app_hash=${expectedAppHash || 'n/a'}\n`
-          );
-          return;
-        }
-        const quoteUnsigned = stripSignature(msg);
-        const quoteId = hashUnsignedEnvelope(quoteUnsigned);
-        const rfqIdGot = String(msg.body?.rfq_id || '').trim().toLowerCase();
-        if (rfqIdGot !== rfqId) {
-          process.stderr.write(
-            `[taker] quote_reject reason=rfq_id_mismatch trade_id=${tradeId} actual_rfq_id=${rfqIdGot || 'n/a'} expected_rfq_id=${rfqId}\n`
-          );
-          return;
-        }
-
-        const validUntil = Number(msg.body?.valid_until_unix);
-        const now = Math.floor(Date.now() / 1000);
-        if (Number.isFinite(validUntil) && validUntil <= now) {
-          process.stderr.write(
-            `[taker] quote_reject reason=expired quote_id=${quoteId} valid_until_unix=${validUntil} now_unix=${now}\n`
-          );
-          if (debug) process.stderr.write(`[taker] ignore expired quote quote_id=${quoteId}\n`);
-          return;
-        }
-
-        // Pre-filtering: require explicit fee preview in QUOTE so we can reject before joining swap:<id>.
-        const quotePlatformFeeBps = Number(msg.body?.platform_fee_bps);
-        const quoteTradeFeeBps = Number(msg.body?.trade_fee_bps);
-        if (!Number.isFinite(quotePlatformFeeBps) || quotePlatformFeeBps < 0) {
-          process.stderr.write(`[taker] quote_reject reason=invalid_platform_fee quote_id=${quoteId} value=${msg.body?.platform_fee_bps ?? 'n/a'}\n`);
-          return;
-        }
-        if (!Number.isFinite(quoteTradeFeeBps) || quoteTradeFeeBps < 0) {
-          process.stderr.write(`[taker] quote_reject reason=invalid_trade_fee quote_id=${quoteId} value=${msg.body?.trade_fee_bps ?? 'n/a'}\n`);
-          return;
-        }
-        if (quotePlatformFeeBps > maxPlatformFeeBps) {
-          process.stderr.write(
-            `[taker] quote_reject reason=platform_fee_cap_exceeded quote_id=${quoteId} actual=${quotePlatformFeeBps} max=${maxPlatformFeeBps}\n`
-          );
-          return;
-        }
-        if (quoteTradeFeeBps > maxTradeFeeBps) {
-          process.stderr.write(
-            `[taker] quote_reject reason=trade_fee_cap_exceeded quote_id=${quoteId} actual=${quoteTradeFeeBps} max=${maxTradeFeeBps}\n`
-          );
-          return;
-        }
-        if (quotePlatformFeeBps + quoteTradeFeeBps > maxTotalFeeBps) {
-          process.stderr.write(
-            `[taker] quote_reject reason=total_fee_cap_exceeded quote_id=${quoteId} actual=${quotePlatformFeeBps + quoteTradeFeeBps} max=${maxTotalFeeBps}\n`
-          );
-          return;
-        }
-
-        // Pre-filtering: require explicit refund/claim window advertised in QUOTE (seconds).
-        const quotePair = normalizePair(msg.body?.pair || rfqPair);
-        const quoteRefundWindowSec = Number(msg.body?.[getQuoteRefundFieldForPair(quotePair)]);
-        const effectiveQuoteMinRefundWindowSec = resolveEffectiveQuoteMinRefundWindowSec({
-          quotePair,
-          effectiveMinSettlementRefundAfterSec,
-          minSolRefundWindowSec,
-          maxSolRefundWindowSec,
-          settlementRefundAfterSec,
-          minSec: SETTLEMENT_REFUND_MIN_SEC,
-          maxSec: SETTLEMENT_REFUND_MAX_SEC,
-        });
-        if (!Number.isFinite(quoteRefundWindowSec) || quoteRefundWindowSec <= 0) {
-          process.stderr.write(
-            `[taker] quote_reject reason=invalid_refund_window quote_id=${quoteId} pair=${quotePair} ` +
-              `field=${getQuoteRefundFieldForPair(quotePair)} value=${msg.body?.[getQuoteRefundFieldForPair(quotePair)] ?? 'n/a'}\n`
-          );
-          return;
-        }
-        if (effectiveQuoteMinRefundWindowSec !== null && quoteRefundWindowSec < effectiveQuoteMinRefundWindowSec) {
-          process.stderr.write(
-            `[taker] quote_reject reason=refund_window_too_short quote_id=${quoteId} pair=${quotePair} ` +
-              `actual=${quoteRefundWindowSec} min=${effectiveQuoteMinRefundWindowSec} ` +
-              `unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided}\n`
-          );
-          return;
-        }
-        if (maxSolRefundWindowSec !== null && Number.isFinite(maxSolRefundWindowSec) && quoteRefundWindowSec > maxSolRefundWindowSec) {
-          process.stderr.write(
-            `[taker] quote_reject reason=refund_window_too_long quote_id=${quoteId} pair=${quotePair} actual=${quoteRefundWindowSec} max=${maxSolRefundWindowSec}\n`
-          );
-          return;
-        }
-
-        if (!chosen) {
-          // Guardrail: only accept quotes for the exact requested size.
-          if (Number(msg.body?.btc_sats) !== Number(btcSats)) {
+        if (msg.kind === KIND.QUOTE) {
+          if (String(msg.trade_id) !== tradeId) {
             process.stderr.write(
-              `[taker] quote_reject reason=btc_sats_mismatch quote_id=${quoteId} actual=${msg.body?.btc_sats ?? 'n/a'} expected=${btcSats}\n`
+              `[taker] quote_reject reason=trade_id_mismatch actual_trade_id=${String(msg.trade_id || '')} expected_trade_id=${tradeId}\n`
+            );
+            return;
+          }
+          const v = validateLocalTakerEnvelope(msg, { effectiveMinSettlementRefundAfterSec });
+          if (!v.ok) {
+            process.stderr.write(
+              `[taker] quote_reject reason=invalid_envelope trade_id=${tradeId} rfq_id=${String(msg?.body?.rfq_id || 'n/a')} error=${v.error || 'unknown'}\n`
+            );
+            return;
+          }
+          const quoteAppHash = String(msg?.body?.app_hash || '').trim().toLowerCase();
+          if (quoteAppHash !== expectedAppHash) {
+            process.stderr.write(
+              `[taker] quote_reject reason=app_hash_mismatch trade_id=${tradeId} rfq_id=${String(msg?.body?.rfq_id || 'n/a')} ` +
+                `actual_app_hash=${quoteAppHash || 'n/a'} expected_app_hash=${expectedAppHash || 'n/a'}\n`
+            );
+            return;
+          }
+          const quoteUnsigned = stripSignature(msg);
+          const quoteId = hashUnsignedEnvelope(quoteUnsigned);
+          const rfqIdGot = String(msg.body?.rfq_id || '').trim().toLowerCase();
+          if (rfqIdGot !== rfqId) {
+            process.stderr.write(
+              `[taker] quote_reject reason=rfq_id_mismatch trade_id=${tradeId} actual_rfq_id=${rfqIdGot || 'n/a'} expected_rfq_id=${rfqId}\n`
             );
             return;
           }
 
-          const quoteAmountStr = String(getAmountForPair(msg.body, quotePair) || '').trim();
-          const quoteAmount = asBigIntAmount(quoteAmountStr);
-          if (quoteAmount === null) {
+          const validUntil = Number(msg.body?.valid_until_unix);
+          const now = Math.floor(Date.now() / 1000);
+          if (Number.isFinite(validUntil) && validUntil <= now) {
             process.stderr.write(
-              `[taker] quote_reject reason=invalid_amount quote_id=${quoteId} pair=${quotePair} value=${quoteAmountStr || 'n/a'}\n`
+              `[taker] quote_reject reason=expired quote_id=${quoteId} valid_until_unix=${validUntil} now_unix=${now}\n`
+            );
+            if (debug) process.stderr.write(`[taker] ignore expired quote quote_id=${quoteId}\n`);
+            return;
+          }
+
+          // Pre-filtering: require explicit fee preview in QUOTE so we can reject before joining swap:<id>.
+          const quotePlatformFeeBps = Number(msg.body?.platform_fee_bps);
+          const quoteTradeFeeBps = Number(msg.body?.trade_fee_bps);
+          if (!Number.isFinite(quotePlatformFeeBps) || quotePlatformFeeBps < 0) {
+            process.stderr.write(`[taker] quote_reject reason=invalid_platform_fee quote_id=${quoteId} value=${msg.body?.platform_fee_bps ?? 'n/a'}\n`);
+            return;
+          }
+          if (!Number.isFinite(quoteTradeFeeBps) || quoteTradeFeeBps < 0) {
+            process.stderr.write(`[taker] quote_reject reason=invalid_trade_fee quote_id=${quoteId} value=${msg.body?.trade_fee_bps ?? 'n/a'}\n`);
+            return;
+          }
+          if (quotePlatformFeeBps > maxPlatformFeeBps) {
+            process.stderr.write(
+              `[taker] quote_reject reason=platform_fee_cap_exceeded quote_id=${quoteId} actual=${quotePlatformFeeBps} max=${maxPlatformFeeBps}\n`
+            );
+            return;
+          }
+          if (quoteTradeFeeBps > maxTradeFeeBps) {
+            process.stderr.write(
+              `[taker] quote_reject reason=trade_fee_cap_exceeded quote_id=${quoteId} actual=${quoteTradeFeeBps} max=${maxTradeFeeBps}\n`
+            );
+            return;
+          }
+          if (quotePlatformFeeBps + quoteTradeFeeBps > maxTotalFeeBps) {
+            process.stderr.write(
+              `[taker] quote_reject reason=total_fee_cap_exceeded quote_id=${quoteId} actual=${quotePlatformFeeBps + quoteTradeFeeBps} max=${maxTotalFeeBps}\n`
             );
             return;
           }
 
-          // Guardrail: treat RFQ usdt_amount as a minimum when set (>0).
-          const rfqMin = asBigIntAmount(usdtAmount) ?? 0n;
-          if (rfqMin > 0n && quoteAmount < rfqMin) {
-            process.stderr.write(
-              `[taker] quote_reject reason=amount_below_rfq_min quote_id=${quoteId} actual=${quoteAmount.toString()} min=${rfqMin.toString()}\n`
-            );
-            return;
-          }
-
-          chosen = { rfq_id: rfqId, quote_id: quoteId, quote: msg };
-          process.stderr.write(
-            `[taker] quote_accept quote_id=${quoteId} pair=${quotePair} actual=${quoteRefundWindowSec} ` +
-              `min=${effectiveQuoteMinRefundWindowSec} unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided}\n`
-          );
-          const quoteAcceptUnsigned = createUnsignedEnvelope({
-            v: 1,
-            kind: KIND.QUOTE_ACCEPT,
-            tradeId,
-            body: {
-              rfq_id: rfqId,
-              quote_id: quoteId,
-            },
+          // Pre-filtering: require explicit refund/claim window advertised in QUOTE (seconds).
+          const quotePair = normalizePair(msg.body?.pair || rfqPair);
+          const quoteRefundWindowSec = Number(msg.body?.[getQuoteRefundFieldForPair(quotePair)]);
+          const effectiveQuoteMinRefundWindowSec = resolveEffectiveQuoteMinRefundWindowSec({
+            quotePair,
+            effectiveMinSettlementRefundAfterSec,
+            minSolRefundWindowSec,
+            maxSolRefundWindowSec,
+            settlementRefundAfterSec,
+            minSec: SETTLEMENT_REFUND_MIN_SEC,
+            maxSec: SETTLEMENT_REFUND_MAX_SEC,
           });
-          quoteAcceptSigned = signSwapEnvelope(quoteAcceptUnsigned, signing);
-          ensureOk(await sc.send(rfqChannel, quoteAcceptSigned), 'send quote_accept');
-          if (debug) process.stderr.write(`[taker] accepted quote trade_id=${tradeId} quote_id=${quoteId}\n`);
-          process.stdout.write(`${JSON.stringify({ type: 'quote_accepted', trade_id: tradeId, rfq_id: rfqId, quote_id: quoteId })}\n`);
+          if (!Number.isFinite(quoteRefundWindowSec) || quoteRefundWindowSec <= 0) {
+            process.stderr.write(
+              `[taker] quote_reject reason=invalid_refund_window quote_id=${quoteId} pair=${quotePair} ` +
+                `field=${getQuoteRefundFieldForPair(quotePair)} value=${msg.body?.[getQuoteRefundFieldForPair(quotePair)] ?? 'n/a'}\n`
+            );
+            return;
+          }
+          if (effectiveQuoteMinRefundWindowSec !== null && quoteRefundWindowSec < effectiveQuoteMinRefundWindowSec) {
+            process.stderr.write(
+              `[taker] quote_reject reason=refund_window_too_short quote_id=${quoteId} pair=${quotePair} ` +
+                `actual=${quoteRefundWindowSec} min=${effectiveQuoteMinRefundWindowSec} ` +
+                `unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided}\n`
+            );
+            return;
+          }
+          if (maxSolRefundWindowSec !== null && Number.isFinite(maxSolRefundWindowSec) && quoteRefundWindowSec > maxSolRefundWindowSec) {
+            process.stderr.write(
+              `[taker] quote_reject reason=refund_window_too_long quote_id=${quoteId} pair=${quotePair} actual=${quoteRefundWindowSec} max=${maxSolRefundWindowSec}\n`
+            );
+            return;
+          }
 
-          persistTrade({ state: STATE.INIT }, 'quote_accepted', quoteAcceptSigned);
-        }
-        return;
-      }
+          if (!chosen) {
+            // Guardrail: only accept quotes for the exact requested size.
+            if (Number(msg.body?.btc_sats) !== Number(btcSats)) {
+              process.stderr.write(
+                `[taker] quote_reject reason=btc_sats_mismatch quote_id=${quoteId} actual=${msg.body?.btc_sats ?? 'n/a'} expected=${btcSats}\n`
+              );
+              return;
+            }
 
-      if (msg.kind === KIND.SWAP_INVITE) {
-        if (String(msg.trade_id) !== tradeId) return;
-        const v = validateSwapEnvelope(msg);
-        if (!v.ok) return;
-        if (!chosen) return;
-        if (String(msg.body?.rfq_id || '').trim().toLowerCase() !== chosen.rfq_id) return;
-        if (String(msg.body?.quote_id || '').trim().toLowerCase() !== chosen.quote_id) return;
+            const quoteAmountStr = String(getAmountForPair(msg.body, quotePair) || '').trim();
+            const quoteAmount = asBigIntAmount(quoteAmountStr);
+            if (quoteAmount === null) {
+              process.stderr.write(
+                `[taker] quote_reject reason=invalid_amount quote_id=${quoteId} pair=${quotePair} value=${quoteAmountStr || 'n/a'}\n`
+              );
+              return;
+            }
 
-        // Guardrail: only accept swap invites from the same maker that authored the quote we accepted.
-        const quoteMaker = String(chosen?.quote?.signer || '').trim().toLowerCase();
-        const ownerPubkey = String(msg.body?.owner_pubkey || '').trim().toLowerCase();
-        const inviterPubkey = String(msg.body?.invite?.payload?.inviterPubKey || '').trim().toLowerCase();
-        const inviteMaker = ownerPubkey || inviterPubkey;
-        if (quoteMaker && inviteMaker && inviteMaker !== quoteMaker) return;
+            // Guardrail: treat RFQ usdt_amount as a minimum when set (>0).
+            const rfqMin = asBigIntAmount(usdtAmount) ?? 0n;
+            if (rfqMin > 0n && quoteAmount < rfqMin) {
+              process.stderr.write(
+                `[taker] quote_reject reason=amount_below_rfq_min quote_id=${quoteId} actual=${quoteAmount.toString()} min=${rfqMin.toString()}\n`
+              );
+              return;
+            }
 
-        const swapChannel = String(msg.body?.swap_channel || '').trim();
-        if (!swapChannel) return;
+            chosen = { rfq_id: rfqId, quote_id: quoteId, quote: msg };
+            process.stderr.write(
+              `[taker] quote_accept quote_id=${quoteId} pair=${quotePair} actual=${quoteRefundWindowSec} ` +
+                `min=${effectiveQuoteMinRefundWindowSec} unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided}\n`
+            );
+            const quoteAcceptUnsigned = createUnsignedEnvelope({
+              v: 1,
+              kind: KIND.QUOTE_ACCEPT,
+              tradeId,
+              body: {
+                rfq_id: rfqId,
+                quote_id: quoteId,
+              },
+            });
+            quoteAcceptSigned = signSwapEnvelope(quoteAcceptUnsigned, signing);
+            ensureOk(await sc.send(rfqChannel, quoteAcceptSigned), 'send quote_accept');
+            if (debug) process.stderr.write(`[taker] accepted quote trade_id=${tradeId} quote_id=${quoteId}\n`);
+            process.stdout.write(`${JSON.stringify({ type: 'quote_accepted', trade_id: tradeId, rfq_id: rfqId, quote_id: quoteId })}\n`);
 
-        const invite = msg.body?.invite || null;
-        const welcome = msg.body?.welcome || null;
-
-        // Best-effort: ensure the invite is for us (defense-in-depth).
-        const invitee = String(invite?.payload?.inviteePubKey || '').trim().toLowerCase();
-        if (invitee && invitee !== takerPubkey) return;
-
-        // Dedupe: SWAP_INVITE can be re-broadcast. Never restart the swap state machine.
-        if (joined || swapCtx || joinSwapInFlight) {
-          if (debug) process.stderr.write(`[taker] ignore duplicate swap_invite trade_id=${tradeId}\n`);
-          return;
-        }
-        joinSwapInFlight = true;
-        try {
-          ensureOk(await sc.join(swapChannel, { invite, welcome }), `join ${swapChannel}`);
-        } finally {
-          joinSwapInFlight = false;
-        }
-        joined = true;
-        stopTimers();
-        clearInterval(enforceTimeout);
-        process.stdout.write(
-          `${JSON.stringify({
-            type: 'swap_joined',
-            trade_id: tradeId,
-            swap_channel: swapChannel,
-            ...buildSwapLogFields({
-              pair: rfqPair,
-              settlementKind,
-              btcSats,
-              amountAtomic: usdtAmount,
-            }),
-          })}\n`
-        );
-
-        persistTrade(
-          {
-            swap_channel: swapChannel,
-            maker_peer: msg.body?.owner_pubkey ? String(msg.body.owner_pubkey).trim().toLowerCase() : null,
-            btc_sats: btcSats,
-            usdt_amount: isTaoPair(rfqPair) ? null : usdtAmount,
-            ...(isTaoPair(rfqPair) ? { tao_amount_atomic: usdtAmount } : {}),
-            state: STATE.INIT,
-          },
-          'swap_joined',
-          { swap_channel: swapChannel }
-        );
-
-        if (!runSwap) {
-          if (once) await leaveSidechannel(swapChannel);
-          done = true;
-          maybeExit();
+            persistTrade({ state: STATE.INIT }, 'quote_accepted', quoteAcceptSigned);
+          }
           return;
         }
 
-        // Swap state machine is run asynchronously; the process stays alive.
-        startSwap({ swapChannel, invite }).catch(async (err) => {
-          await leaveSidechannel(swapChannel);
-          die(err?.stack || err?.message || String(err));
-        });
-      }
-    } catch (err) {
-      process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
-    }
-  });
+        if (msg.kind === KIND.SWAP_INVITE) {
+          if (String(msg.trade_id) !== tradeId) return;
+          const v = validateSwapEnvelope(msg);
+          if (!v.ok) return;
+          if (!chosen) return;
+          if (String(msg.body?.rfq_id || '').trim().toLowerCase() !== chosen.rfq_id) return;
+          if (String(msg.body?.quote_id || '').trim().toLowerCase() !== chosen.quote_id) return;
 
-  // Keep process alive.
-  await new Promise(() => {});
+          // Guardrail: only accept swap invites from the same maker that authored the quote we accepted.
+          const quoteMaker = String(chosen?.quote?.signer || '').trim().toLowerCase();
+          const ownerPubkey = String(msg.body?.owner_pubkey || '').trim().toLowerCase();
+          const inviterPubkey = String(msg.body?.invite?.payload?.inviterPubKey || '').trim().toLowerCase();
+          const inviteMaker = ownerPubkey || inviterPubkey;
+          if (quoteMaker && inviteMaker && inviteMaker !== quoteMaker) return;
+
+          const swapChannel = String(msg.body?.swap_channel || '').trim();
+          if (!swapChannel) return;
+
+          const invite = msg.body?.invite || null;
+          const welcome = msg.body?.welcome || null;
+
+          // Best-effort: ensure the invite is for us (defense-in-depth).
+          const invitee = String(invite?.payload?.inviteePubKey || '').trim().toLowerCase();
+          if (invitee && invitee !== takerPubkey) return;
+
+          // Dedupe: SWAP_INVITE can be re-broadcast. Never restart the swap state machine.
+          if (joined || swapCtx || joinSwapInFlight) {
+            if (debug) process.stderr.write(`[taker] ignore duplicate swap_invite trade_id=${tradeId}\n`);
+            return;
+          }
+          joinSwapInFlight = true;
+          try {
+            ensureOk(await sc.join(swapChannel, { invite, welcome }), `join ${swapChannel}`);
+          } finally {
+            joinSwapInFlight = false;
+          }
+          joined = true;
+          stopTimers();
+          clearInterval(enforceTimeout);
+          process.stdout.write(
+            `${JSON.stringify({
+              type: 'swap_joined',
+              trade_id: tradeId,
+              swap_channel: swapChannel,
+              ...buildSwapLogFields({
+                pair: rfqPair,
+                settlementKind,
+                btcSats,
+                amountAtomic: usdtAmount,
+              }),
+            })}\n`
+          );
+
+          persistTrade(
+            {
+              swap_channel: swapChannel,
+              maker_peer: msg.body?.owner_pubkey ? String(msg.body.owner_pubkey).trim().toLowerCase() : null,
+              btc_sats: btcSats,
+              usdt_amount: isTaoPair(rfqPair) ? null : usdtAmount,
+              ...(isTaoPair(rfqPair) ? { tao_amount_atomic: usdtAmount } : {}),
+              state: STATE.INIT,
+            },
+            'swap_joined',
+            { swap_channel: swapChannel }
+          );
+
+          if (!runSwap) {
+            if (once) await leaveSidechannel(swapChannel);
+            done = true;
+            maybeExit();
+            return;
+          }
+
+          // Swap state machine is run asynchronously; the process stays alive.
+          startSwap({ swapChannel, invite }).catch(async (err) => {
+            await leaveSidechannel(swapChannel);
+            die(err?.stack || err?.message || String(err));
+          });
+        }
+      } catch (err) {
+        process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
+      }
+    });
+
+    // Keep process alive.
+    await new Promise(() => {});
+  };
+
+  await runSingleTradeCycle();
 }
 
 const isDirectRun = (() => {

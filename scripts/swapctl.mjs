@@ -21,6 +21,10 @@ import {
 import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { loadPeerWalletFromFile } from '../src/peer/keypair.js';
 import { getSettlementBinding } from '../settlement/providerFactory.js';
+import { getDefaultTaoEvmHtlcAddress } from '../settlement/tao-evm/TaoEvmSettlementProvider.js';
+
+const DEFAULT_SC_TOKEN_PATH = 'onchain/sc-bridge/swap-maker.token';
+const DEFAULT_PEER_KEYPAIR_PATH = 'stores/swap-maker/db/keypair.json';
 
 function die(msg) {
   process.stderr.write(`${msg}\n`);
@@ -219,6 +223,28 @@ function requireFlag(flags, name) {
   return String(v);
 }
 
+function loadTokenFromFile(filePath) {
+  try {
+    return String(fs.readFileSync(filePath, 'utf8') || '').trim();
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      throw new Error(`Missing SC token file at default path: ${filePath}`);
+    }
+    throw new Error(`Failed to read SC token file at ${filePath}: ${err?.message || String(err)}`);
+  }
+}
+
+function resolveToken(cliToken) {
+  const raw = cliToken && cliToken !== true ? String(cliToken).trim() : '';
+  if (raw) return raw;
+  return loadTokenFromFile(DEFAULT_SC_TOKEN_PATH);
+}
+
+function resolvePeerKeypairPath(cliPath) {
+  const raw = cliPath && cliPath !== true ? String(cliPath).trim() : '';
+  return raw || DEFAULT_PEER_KEYPAIR_PATH;
+}
+
 function maybeInt(value, label) {
   if (value === undefined || value === null) return null;
   const n = Number.parseInt(String(value), 10);
@@ -242,10 +268,16 @@ async function withScBridge({ url, token }, fn) {
 }
 
 async function loadPeerSigning(flags, { label }) {
-  const raw = flags.get('peer-keypair') ? String(flags.get('peer-keypair')).trim() : '';
-  if (!raw) die(`${label} requires --peer-keypair <path>`);
-  const { pubHex, secHex } = await loadPeerWalletFromFile(raw);
-  return { pubHex, secHex };
+  const keypairPath = resolvePeerKeypairPath(flags.get('peer-keypair'));
+  try {
+    const { pubHex, secHex } = await loadPeerWalletFromFile(keypairPath);
+    return { pubHex, secHex };
+  } catch (err) {
+    if ((!flags.get('peer-keypair') || flags.get('peer-keypair') === true) && err?.code === 'ENOENT') {
+      die(`Missing peer keypair file at default path: ${keypairPath}`);
+    }
+    die(err?.message || `${label} requires --peer-keypair <path>`);
+  }
 }
 
 function signSwapEnvelope(unsignedEnvelope, { pubHex, secHex }) {
@@ -313,7 +345,12 @@ async function main() {
   }
 
   const url = requireFlag(flags, 'url');
-  const token = requireFlag(flags, 'token');
+  let token;
+  try {
+    token = resolveToken(flags.get('token'));
+  } catch (err) {
+    die(err?.message || String(err));
+  }
 
   if (cmd === 'info') {
     const res = await withScBridge({ url, token }, (sc) => sc.info());
@@ -476,7 +513,7 @@ async function main() {
     const rfqChannels = splitCsv(flags.get('rfq-channels'));
     const note = flags.get('note') ? String(flags.get('note')) : null;
     const offers = injectMissingOfferAppHashes(parseJsonMaybeFile(flags.get('offers-json')), {
-      taoHtlcAddress: process.env.TAO_EVM_HTLC_ADDRESS,
+      taoHtlcAddress: getDefaultTaoEvmHtlcAddress(),
     });
     if (flags.get('offers-json') && !offers) die('Invalid --offers-json (expected JSON or @file)');
 
