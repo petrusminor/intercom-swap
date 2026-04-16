@@ -548,6 +548,7 @@ async function main() {
 
   const timeoutSec = parseIntFlag(flags.get('timeout-sec'), 'timeout-sec', 30);
   const rfqResendMs = parseIntFlag(flags.get('rfq-resend-ms'), 'rfq-resend-ms', 1200);
+  const rfqRetryIntervalMs = 10000; // 10 seconds
   const acceptResendMs = parseIntFlag(flags.get('accept-resend-ms'), 'accept-resend-ms', 1200);
 
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 200);
@@ -964,11 +965,6 @@ async function main() {
 
     await initSettlementRuntime();
 
-    const nowSec = Math.floor(Date.now() / 1000);
-    let rfqValidUntil = nowSec + rfqValidSec;
-    if (offerMeta && Number.isFinite(offerMeta.offer_valid_until_unix) && offerMeta.offer_valid_until_unix > 0) {
-      rfqValidUntil = Math.min(rfqValidUntil, Math.trunc(offerMeta.offer_valid_until_unix));
-    }
     if (!Number.isInteger(Number(btcSats)) || Number(btcSats) < 1) {
       die('Invalid --btc-sats (must be >= 1)');
     }
@@ -976,29 +972,39 @@ async function main() {
       const amountFlagLabel = isTaoSettlement ? '--tao-amount-atomic' : '--usdt-amount';
       die(`Invalid ${amountFlagLabel} (must be a positive base-unit integer; open RFQ amount=0 is not supported)`);
     }
-    const rfqUnsigned = buildRfqUnsignedEnvelope({
-      tradeId,
-      pair: rfqPair,
-      expectedAppHash,
-      btcSats,
-      amountAtomic: usdtAmount,
-      maxPlatformFeeBps,
-      maxTradeFeeBps,
-      maxTotalFeeBps,
-      settlementRefundAfterSec,
-      minSolRefundWindowSec,
-      maxSolRefundWindowSec,
-      solRecipient: runSwap ? sol.recipientAddress : null,
-      solMint: runSwap && solMintStr ? solMintStr : null,
-      validUntilUnix: rfqValidUntil,
-    });
-    process.stderr.write(
-      `[taker] rfq settlement_refund_after_sec=${rfqUnsigned?.body?.settlement_refund_after_sec} rfq_id=${rfqUnsigned?.body?.rfq_id ?? 'n/a'} trade_id=${rfqUnsigned?.tradeId ?? 'n/a'}\n`
-    );
-    const rfqId = hashUnsignedEnvelope(rfqUnsigned);
-    const rfqSigned = signSwapEnvelope(rfqUnsigned, signing, {
-      effectiveMinSettlementRefundAfterSec,
-    });
+    const buildSignedRfq = () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      let rfqValidUntil = nowSec + rfqValidSec;
+      if (offerMeta && Number.isFinite(offerMeta.offer_valid_until_unix) && offerMeta.offer_valid_until_unix > 0) {
+        rfqValidUntil = Math.min(rfqValidUntil, Math.trunc(offerMeta.offer_valid_until_unix));
+      }
+      const rfqUnsigned = buildRfqUnsignedEnvelope({
+        tradeId,
+        pair: rfqPair,
+        expectedAppHash,
+        btcSats,
+        amountAtomic: usdtAmount,
+        maxPlatformFeeBps,
+        maxTradeFeeBps,
+        maxTotalFeeBps,
+        settlementRefundAfterSec,
+        minSolRefundWindowSec,
+        maxSolRefundWindowSec,
+        solRecipient: runSwap ? sol.recipientAddress : null,
+        solMint: runSwap && solMintStr ? solMintStr : null,
+        validUntilUnix: rfqValidUntil,
+      });
+      process.stderr.write(
+        `[taker] rfq settlement_refund_after_sec=${rfqUnsigned?.body?.settlement_refund_after_sec} rfq_id=${rfqUnsigned?.body?.rfq_id ?? 'n/a'} trade_id=${rfqUnsigned?.tradeId ?? 'n/a'}\n`
+      );
+      return {
+        rfqId: hashUnsignedEnvelope(rfqUnsigned),
+        rfqSigned: signSwapEnvelope(rfqUnsigned, signing, {
+          effectiveMinSettlementRefundAfterSec,
+        }),
+      };
+    };
+    let { rfqId, rfqSigned } = buildSignedRfq();
     ensureOk(await sc.send(rfqChannel, rfqSigned), 'send rfq');
 
     persistTrade(
@@ -1028,6 +1034,7 @@ async function main() {
     let joined = false;
     let joinSwapInFlight = false;
     let done = false;
+    let loggedRfqWaitHint = false;
     let swapCtx = null; // { swapChannel, invite, trade, waiters, sent }
     let resolveCycleDone = null;
     const cycleDone = new Promise((resolve) => {
@@ -1040,7 +1047,7 @@ async function main() {
       resolve();
     };
 
-    const deadlineMs = Date.now() + timeoutSec * 1000;
+    let deadlineMs = Date.now() + timeoutSec * 1000;
 
     const maybeExit = () => {
       if (!once) return;
@@ -1065,16 +1072,28 @@ async function main() {
       }
     };
 
-    const resendRfqTimer = setInterval(async () => {
+    let resendRfqTimer = null;
+    const scheduleNextRfqAttempt = async () => {
+      if (chosen) return;
+      if (Date.now() > deadlineMs) return;
+      const jitter = Math.floor(Math.random() * 3000);
+      const delay = Math.max(rfqResendMs, rfqRetryIntervalMs + jitter, 200);
+      process.stderr.write(`[taker] waiting before next RFQ attempt (+${delay}ms)\n`);
+      await new Promise((resolve) => {
+        resendRfqTimer = setTimeout(resolve, delay);
+      });
       try {
         if (chosen) return;
         if (Date.now() > deadlineMs) return;
+        ({ rfqId, rfqSigned } = buildSignedRfq());
         ensureOk(await sc.send(rfqChannel, rfqSigned), 'resend rfq');
         if (debug) process.stderr.write(`[taker] resend rfq trade_id=${tradeId}\n`);
       } catch (err) {
         process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
       }
-    }, Math.max(rfqResendMs, 200));
+      scheduleNextRfqAttempt();
+    };
+    scheduleNextRfqAttempt();
 
     let quoteAcceptSigned = null;
     const resendAcceptTimer = setInterval(async () => {
@@ -1091,22 +1110,25 @@ async function main() {
     }, Math.max(acceptResendMs, 200));
 
     const stopTimers = () => {
-      clearInterval(resendRfqTimer);
+      clearTimeout(resendRfqTimer);
       clearInterval(resendAcceptTimer);
       clearInterval(enforceTimeout);
     };
 
     const enforceTimeout = setInterval(() => {
       if (Date.now() <= deadlineMs) return;
-      stopTimers();
       process.stderr.write(
         `[taker] still waiting for RFQ handshake expected_next=${chosen ? 'swap_invite' : 'quote'} ` +
           `trade_id=${tradeId} rfq_id=${rfqId} rfq_channel=${rfqChannel}\n`
       );
-      process.stderr.write(
-        '[taker] hint: common offer-listen skip causes: offer missing app_hash; offer app_hash mismatch vs settlement binding\n'
-      );
-      die(`Timeout waiting for RFQ handshake (timeout-sec=${timeoutSec})`);
+      process.stderr.write('[taker] still waiting for RFQ handshake (no maker yet)\n');
+      if (!loggedRfqWaitHint) {
+        process.stderr.write(
+          '[taker] hint: common offer-listen skip causes: offer missing app_hash; offer app_hash mismatch vs settlement binding\n'
+        );
+        loggedRfqWaitHint = true;
+      }
+      deadlineMs = Date.now() + timeoutSec * 1000;
     }, 200);
 
     const waitForSwapMessage = (match, { timeoutMs, label }) =>
