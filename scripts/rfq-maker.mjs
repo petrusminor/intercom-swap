@@ -3,6 +3,7 @@ import process from 'node:process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
@@ -489,11 +490,47 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 750);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
-  const maxTrades = flags.get('max-trades') !== undefined
-    ? Number(flags.get('max-trades'))
+  const rawMaxTrades = flags.get('max-trades');
+  let maxTrades;
+  if (rawMaxTrades === undefined) {
+    maxTrades = 1;
+  } else {
+    maxTrades = Number(rawMaxTrades);
+    if (!Number.isInteger(maxTrades) || maxTrades < 0) die('Invalid --max-trades (expected integer >= 0)');
+  }
+  const autoAnnounceIntervalSec = flags.get('auto-announce-interval-sec')
+    ? Number(flags.get('auto-announce-interval-sec'))
     : null;
-  if (maxTrades !== null) {
-    if (!Number.isInteger(maxTrades) || maxTrades < 1) die('Invalid --max-trades (expected integer >= 1)');
+  const announceName = flags.get('announce-name')
+    ? String(flags.get('announce-name')).trim()
+    : '';
+  const announceOffersJson = flags.get('announce-offers-json')
+    ? String(flags.get('announce-offers-json'))
+    : '';
+  const announceTtlSec = flags.get('announce-ttl-sec') !== undefined
+    ? parseIntFlag(flags.get('announce-ttl-sec'), 'announce-ttl-sec', null)
+    : null;
+  const announceJoin = flags.get('announce-join') !== undefined
+    ? parseBool(flags.get('announce-join'), false)
+    : false;
+
+  if (autoAnnounceIntervalSec !== null) {
+    if (!Number.isInteger(autoAnnounceIntervalSec) || autoAnnounceIntervalSec < 5) {
+      die('Invalid --auto-announce-interval-sec (expected integer >= 5)');
+    }
+  }
+  if (announceTtlSec !== null) {
+    if (!Number.isInteger(announceTtlSec) || announceTtlSec < 1) {
+      die('Invalid --announce-ttl-sec (expected integer >= 1)');
+    }
+  }
+
+  if (autoAnnounceIntervalSec) {
+    process.stderr.write(`[maker] auto announce enabled (${autoAnnounceIntervalSec}s)\n`);
+    process.stderr.write(
+      `[maker] auto announce config: name=${announceName ? 'set' : 'missing'} ` +
+      `offers=${announceOffersJson ? 'set' : 'missing'} ttl=${announceTtlSec ?? 'missing'} join=${announceJoin ? 1 : 0}\n`
+    );
   }
   const settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
   const isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
@@ -588,7 +625,9 @@ async function main() {
   }
   const receipts = receiptsRuntime.receipts;
   process.stderr.write(`[receipts] enabled=${receiptsRuntime.enabled} db_path=${receiptsRuntime.dbPath}\n`);
-  if (maxTrades !== null) {
+  if (rawMaxTrades === undefined) {
+    process.stderr.write('[maker] max trades set to 1 (default)\n');
+  } else if (maxTrades > 0) {
     process.stderr.write(`[maker] max trades set to ${maxTrades}\n`);
   } else {
     process.stderr.write('[maker] max trades: unlimited\n');
@@ -645,6 +684,73 @@ async function main() {
   const swapChannelToLockKey = new Map(); // swap_channel -> lockKey
   let completedTrades = 0;
   let shouldStop = false;
+  let autoAnnounceInProgress = false;
+  let autoAnnounceTimer = null;
+  let warnedMissingAutoAnnounceConfig = false;
+
+  const runAutoAnnounce = async () => {
+    if (!autoAnnounceIntervalSec || autoAnnounceInProgress) return false;
+    if (maxTrades > 0 && completedTrades >= maxTrades) return false;
+    if (!announceName || !announceOffersJson) {
+      if (!warnedMissingAutoAnnounceConfig) {
+        process.stderr.write('[maker] auto announce skipped: missing announce-name or announce-offers-json\n');
+        warnedMissingAutoAnnounceConfig = true;
+      }
+      return false;
+    }
+    autoAnnounceInProgress = true;
+
+    try {
+      await new Promise((resolve, reject) => {
+        const argv = [
+          path.join(repoRoot, 'scripts/swapctl.mjs'),
+          'svc-announce',
+          '--url',
+          url,
+          '--token',
+          token,
+          '--peer-keypair',
+          peerKeypairPath,
+          '--channels',
+          rfqChannel,
+          '--rfq-channels',
+          rfqChannel,
+          '--name',
+          announceName,
+          '--offers-json',
+          announceOffersJson,
+          '--join',
+          announceJoin ? '1' : '0',
+        ];
+        if (announceTtlSec !== null) {
+          argv.push('--ttl-sec', String(announceTtlSec));
+        }
+        const proc = spawn(
+          process.execPath,
+          argv,
+          { stdio: ['ignore', 'ignore', 'pipe'] }
+        );
+
+        let errBuf = '';
+
+        proc.stderr.on('data', (chunk) => {
+          errBuf += String(chunk);
+        });
+
+        proc.on('error', reject);
+
+        proc.on('close', (code) => {
+          if (code === 0) return resolve();
+          reject(new Error(errBuf.trim() || `svc-announce failed (${code})`));
+        });
+      });
+
+      warnedMissingAutoAnnounceConfig = false;
+      return true;
+    } finally {
+      autoAnnounceInProgress = false;
+    }
+  };
 
   const clearRfqLock = (lockKey, reason = 'unknown') => {
     if (!lockKey) return;
@@ -969,6 +1075,10 @@ async function main() {
   const createInvoiceAndEscrow = async (ctx) => {
     if (ctx.startedSettlement) {
       process.stderr.write(`[maker] SKIP settlement already started trade_id=${ctx.tradeId}\n`);
+      return;
+    }
+    if (maxTrades > 0 && completedTrades >= maxTrades) {
+      process.stderr.write(`[maker] capacity reached (${completedTrades}/${maxTrades}), skipping execution\n`);
       return;
     }
     ctx.startedSettlement = true;
@@ -1498,17 +1608,22 @@ async function main() {
           done = true;
           const evtType =
             ctx.trade.state === STATE.CLAIMED ? 'swap_done' : (ctx.trade.state === STATE.REFUNDED ? 'swap_refunded' : 'swap_canceled');
+          process.stdout.write(
+            `${JSON.stringify({ type: evtType, trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, state: ctx.trade.state })}\n`
+          );
           if (ctx.trade.state === STATE.CLAIMED) {
             completedTrades += 1;
-            process.stderr.write(`[maker] completed trades: ${completedTrades}\n`);
+            process.stdout.write(`[maker] completed trades: ${completedTrades}\n`);
             if (maxTrades && completedTrades >= maxTrades && !shouldStop) {
+              if (autoAnnounceTimer) {
+                clearInterval(autoAnnounceTimer);
+                autoAnnounceTimer = null;
+                process.stderr.write('[maker] max trades reached, stopping auto announce timer\n');
+              }
               shouldStop = true;
               process.stderr.write('[maker] reached max trades, stopping new trades\n');
             }
           }
-          process.stdout.write(
-            `${JSON.stringify({ type: evtType, trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, state: ctx.trade.state })}\n`
-          );
           const terminalPatch = { state: ctx.trade.state };
           if (isTaoSettlement && msg?.kind === KIND.TAO_CLAIMED) {
             terminalPatch.tao_settlement_id = msg.body?.settlement_id || null;
@@ -2100,6 +2215,27 @@ async function main() {
   });
 
   process.stdout.write(`${JSON.stringify({ type: 'ready', role: 'maker', rfq_channel: rfqChannel, pubkey: makerPubkey })}\n`);
+  if (autoAnnounceIntervalSec) {
+    const jitterMs = Math.floor(Math.random() * 2000);
+    const autoAnnounceIntervalMs = autoAnnounceIntervalSec * 1000 + jitterMs;
+
+    process.stderr.write(`[maker] auto announce jitter applied (+${jitterMs}ms)\n`);
+
+    autoAnnounceTimer = setInterval(async () => {
+      try {
+        if (maxTrades > 0 && completedTrades >= maxTrades) return;
+        if (shouldStop) return;
+
+        const ok = await runAutoAnnounce();
+
+        if (ok) {
+          process.stderr.write('[maker] auto announce fired (jittered)\n');
+        }
+      } catch (e) {
+        process.stderr.write(`[maker] auto announce error: ${e?.message || e}\n`);
+      }
+    }, autoAnnounceIntervalMs);
+  }
   // Keep process alive.
   await new Promise(() => {});
 }
