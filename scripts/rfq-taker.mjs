@@ -1005,7 +1005,16 @@ async function main() {
       };
     };
     let { rfqId, rfqSigned } = buildSignedRfq();
+    const lifecycle = {
+      startTs: Date.now(),
+      rfqSent: false,
+      quoteAccepted: false,
+      swapJoined: false,
+      lnPaid: false,
+      settlementClaimed: false,
+    };
     ensureOk(await sc.send(rfqChannel, rfqSigned), 'send rfq');
+    lifecycle.rfqSent = true;
 
     persistTrade(
       {
@@ -1030,6 +1039,7 @@ async function main() {
 
     process.stdout.write(`${JSON.stringify({ type: 'ready', role: 'taker', rfq_channel: rfqChannel, trade_id: tradeId, rfq_id: rfqId, pubkey: takerPubkey })}\n`);
 
+    const ctx = { rfqActive: true };
     let chosen = null; // { rfq_id, quote_id, quote }
     let joined = false;
     let joinSwapInFlight = false;
@@ -1074,6 +1084,7 @@ async function main() {
 
     let resendRfqTimer = null;
     const scheduleNextRfqAttempt = async () => {
+      if (!ctx.rfqActive) return;
       if (chosen) return;
       if (Date.now() > deadlineMs) return;
       const jitter = Math.floor(Math.random() * 3000);
@@ -1083,6 +1094,7 @@ async function main() {
         resendRfqTimer = setTimeout(resolve, delay);
       });
       try {
+        if (!ctx.rfqActive) return;
         if (chosen) return;
         if (Date.now() > deadlineMs) return;
         ({ rfqId, rfqSigned } = buildSignedRfq());
@@ -1091,6 +1103,7 @@ async function main() {
       } catch (err) {
         process.stderr.write(`[taker] ERROR: ${err?.stack || err?.message || String(err)}\n`);
       }
+      if (!ctx.rfqActive) return;
       scheduleNextRfqAttempt();
     };
     scheduleNextRfqAttempt();
@@ -1655,6 +1668,7 @@ async function main() {
   }
     swapCtx.sent.ln_paid = lnPaidSigned;
     await sc.send(swapChannel, lnPaidSigned);
+    lifecycle.lnPaid = true;
     process.stdout.write(`${JSON.stringify({ type: 'ln_paid_sent', trade_id: tradeId, swap_channel: swapChannel })}\n`);
 
     persistTrade(
@@ -1744,6 +1758,7 @@ async function main() {
   const solClaimedSigned = signSwapEnvelope(solClaimedUnsigned, signing);
   swapCtx.sent.sol_claimed = solClaimedSigned;
   await sc.send(swapChannel, solClaimedSigned);
+    lifecycle.settlementClaimed = true;
     process.stdout.write(
       `${JSON.stringify({
         type: isTaoSettlement ? 'tao_claimed_sent' : 'sol_claimed_sent',
@@ -1782,6 +1797,31 @@ async function main() {
     stopTimers();
     clearTimers();
     process.stdout.write(`${JSON.stringify({ type: 'swap_done', trade_id: tradeId, swap_channel: swapChannel })}\n`);
+    const endTs = Date.now();
+    process.stdout.write(
+      JSON.stringify({
+        type: 'swap_summary',
+        role: 'taker',
+        trade_id: tradeId,
+        swap_channel: swapChannel,
+        settlement: {
+          type: settlementKind || null,
+        },
+        path: 'rfq',
+        timing: {
+          start_ts: lifecycle.startTs,
+          end_ts: endTs,
+          duration_ms: endTs - lifecycle.startTs,
+        },
+        stages: {
+          rfq_sent: lifecycle.rfqSent,
+          quote_accepted: lifecycle.quoteAccepted,
+          swap_joined: lifecycle.swapJoined,
+          ln_paid: lifecycle.lnPaid,
+          settlement_claimed: lifecycle.settlementClaimed,
+        },
+      }) + '\n'
+    );
     persistTrade({ state: STATE.CLAIMED }, 'swap_done', { trade_id: tradeId, swap_channel: swapChannel });
     await leaveSidechannel(swapChannel);
     finishCycle();
@@ -1968,6 +2008,8 @@ async function main() {
             });
             quoteAcceptSigned = signSwapEnvelope(quoteAcceptUnsigned, signing);
             ensureOk(await sc.send(rfqChannel, quoteAcceptSigned), 'send quote_accept');
+            ctx.rfqActive = false;
+            lifecycle.quoteAccepted = true;
             if (debug) process.stderr.write(`[taker] accepted quote trade_id=${tradeId} quote_id=${quoteId}\n`);
             process.stdout.write(`${JSON.stringify({ type: 'quote_accepted', trade_id: tradeId, rfq_id: rfqId, quote_id: quoteId })}\n`);
 
@@ -2013,6 +2055,8 @@ async function main() {
             joinSwapInFlight = false;
           }
           joined = true;
+          ctx.rfqActive = false;
+          lifecycle.swapJoined = true;
           stopTimers();
           clearInterval(enforceTimeout);
           process.stdout.write(
