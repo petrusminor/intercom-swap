@@ -682,6 +682,7 @@ async function main() {
   const quoteIdToLockKey = new Map(); // quote_id -> lockKey
   const tradeIdToLockKey = new Map(); // trade_id -> lockKey
   const swapChannelToLockKey = new Map(); // swap_channel -> lockKey
+  let activeTrades = 0;
   let completedTrades = 0;
   let shouldStop = false;
   let autoAnnounceInProgress = false;
@@ -1082,6 +1083,8 @@ async function main() {
       return;
     }
     ctx.startedSettlement = true;
+    activeTrades += 1;
+    ctx.lifecycle.executionStarted = true;
     process.stderr.write(`[maker] execution_start trade_id=${ctx.tradeId}\n`);
 
     const isRetryableSettlementError = (err) => {
@@ -1185,6 +1188,7 @@ async function main() {
       ctx.trade = r.trade;
     }
     ctx.sent.invoice = lnInvSigned;
+    ctx.lifecycle.invoiceCreated = true;
     const invoicePersisted = persistTrade(
       ctx.tradeId,
       {
@@ -1468,6 +1472,7 @@ async function main() {
       throw new Error('Failed to persist settlement lock proof before send');
     }
     ctx.sent.escrow = solEscrowSigned;
+    ctx.lifecycle.settlementLocked = true;
     await sc.send(ctx.swapChannel, solEscrowSigned, { invite: ctx.invite || null });
     ctx.lastEscrowSendAtMs = Date.now();
     process.stdout.write(
@@ -1577,6 +1582,9 @@ async function main() {
             `[maker] tao_claimed_received trade_id=${ctx.tradeId} settlement_id=${String(msg.body?.settlement_id || 'n/a')} tx_id=${String(msg.body?.tx_id || 'n/a')}\n`
           );
         }
+        if (ctx.trade.state === STATE.CLAIMED) {
+          ctx.lifecycle.settlementClaimed = true;
+        }
 
         const statusNote = String(msg.body?.note || '').trim().toLowerCase();
         if (msg.kind === KIND.STATUS && statusNote === 'ready' && ctx.awaitingTakerReady && !ctx.sendingTerms) {
@@ -1624,6 +1632,33 @@ async function main() {
               process.stderr.write('[maker] reached max trades, stopping new trades\n');
             }
           }
+          if (activeTrades > 0) {
+            activeTrades -= 1;
+          }
+          const endTs = Date.now();
+          process.stdout.write(
+            JSON.stringify({
+              type: 'swap_summary',
+              trade_id: ctx.tradeId,
+              swap_channel: ctx.swapChannel,
+              state: ctx.trade.state,
+              settlement: {
+                type: ctx.settlementKind || settlementKind || null,
+              },
+              path: ctx.initiationPath,
+              timing: {
+                start_ts: ctx.lifecycle.startTs,
+                end_ts: endTs,
+                duration_ms: endTs - ctx.lifecycle.startTs,
+              },
+              stages: {
+                execution_started: ctx.lifecycle.executionStarted,
+                invoice_created: ctx.lifecycle.invoiceCreated,
+                settlement_locked: ctx.lifecycle.settlementLocked,
+                settlement_claimed: ctx.lifecycle.settlementClaimed,
+              },
+            }) + '\n'
+          );
           const terminalPatch = { state: ctx.trade.state };
           if (isTaoSettlement && msg?.kind === KIND.TAO_CLAIMED) {
             terminalPatch.tao_settlement_id = msg.body?.settlement_id || null;
@@ -1790,6 +1825,12 @@ async function main() {
           if (currentLock && currentLock.state === 'quoted' && Number.isFinite(quotedUntil) && quotedUntil <= lockNowSec) {
             clearRfqLock(lockKey, 'quote_expired_repost');
           }
+        }
+        if (maxTrades !== null && activeTrades >= maxTrades) {
+          process.stderr.write(
+            `[maker] SKIP rfq active trade limit reached active=${activeTrades} max=${maxTrades}\n`
+          );
+          return;
         }
 
         // Pre-filtering: only quote if we can meet the RFQ fee ceilings.
@@ -2135,6 +2176,7 @@ async function main() {
             rfqId,
             quoteId,
             swapChannel,
+            settlementKind,
             inviteePubKey,
             pair: buildSettlementContext({ settlementKind, pair: known.pair }).pair,
             invite,
@@ -2144,6 +2186,14 @@ async function main() {
             trade: createInitialTrade(tradeId),
             sent: {},
             startedSettlement: false,
+            initiationPath: 'rfq',
+            lifecycle: {
+              startTs: Date.now(),
+              executionStarted: false,
+              invoiceCreated: false,
+              settlementLocked: false,
+              settlementClaimed: false,
+            },
             paymentHashHex: null,
             done: false,
             deadlineMs: Date.now() + swapTimeoutSec * 1000,
