@@ -23,6 +23,7 @@ const DEFAULT_RPC_URL = 'https://lite.chain.opentensor.ai';
 const DEFAULT_CHAIN_ID = 964n;
 const DEFAULT_CONFIRMATIONS = 1;
 const DEFAULT_MIN_REFUND_SAFETY_SEC = 3600;
+const DEFAULT_TAO_EVM_HTLC_ADDRESS = '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653';
 
 const TAO_HTLC_ABI = [
   'function lock(address receiver, bytes32 hashlock, uint256 refundAfter, bytes32 clientSalt) payable returns (bytes32 swapId)',
@@ -30,6 +31,10 @@ const TAO_HTLC_ABI = [
   'function refund(bytes32 swapId)',
   'function swaps(bytes32 swapId) view returns (address sender, address receiver, uint256 amount, uint256 refundAfter, bytes32 hashlock, bool claimed, bool refunded)',
 ];
+
+export function getDefaultTaoEvmHtlcAddress() {
+  return DEFAULT_TAO_EVM_HTLC_ADDRESS;
+}
 
 export class NotImplementedError extends Error {
   constructor(message) {
@@ -189,7 +194,7 @@ export class TaoEvmSettlementProvider {
     privateKey = process.env.TAO_EVM_PRIVATE_KEY || '',
     keyfilePath = '',
     confirmations = process.env.TAO_EVM_CONFIRMATIONS || DEFAULT_CONFIRMATIONS,
-    htlcAddress = process.env.TAO_EVM_HTLC_ADDRESS || '',
+    htlcAddress = process.env.TAO_EVM_HTLC_ADDRESS || getDefaultTaoEvmHtlcAddress() || '',
   } = {}) {
     this.rpcUrl = String(rpcUrl || DEFAULT_RPC_URL).trim() || DEFAULT_RPC_URL;
     this.expectedChainId = parseChainId(chainId, DEFAULT_CHAIN_ID);

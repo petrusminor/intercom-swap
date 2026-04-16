@@ -1,7 +1,9 @@
 import {
-  SolanaSettlementProvider,
+  resolveSolanaProgramId,
+  resolveTaoEvmHtlcAddress,
   SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID,
-} from './solana/SolanaSettlementProvider.js';
+} from './defaults.js';
+import { SolanaSettlementProvider } from './solana/SolanaSettlementProvider.js';
 import { TaoEvmSettlementProvider } from './tao-evm/TaoEvmSettlementProvider.js';
 
 export const SETTLEMENT_KIND = Object.freeze({
@@ -20,7 +22,7 @@ export function normalizeSettlementKind(value) {
 export function getSettlementBinding(kind, opts = {}) {
   const normalized = normalizeSettlementKind(kind);
   if (normalized === SETTLEMENT_KIND.SOLANA) {
-    const programId = String(opts.solanaProgramId || SOLANA_SETTLEMENT_DEFAULT_PROGRAM_ID).trim();
+    const programId = resolveSolanaProgramId(opts.solanaProgramId);
     if (!programId) throw new Error('Missing Solana settlement program id');
     return {
       settlement_kind: normalized,
@@ -28,7 +30,7 @@ export function getSettlementBinding(kind, opts = {}) {
       binding_id: programId,
     };
   }
-  const htlcAddress = String(opts.taoHtlcAddress || process.env.TAO_EVM_HTLC_ADDRESS || '').trim();
+  const htlcAddress = resolveTaoEvmHtlcAddress(opts.taoHtlcAddress);
   if (!htlcAddress) throw new Error('Missing TAO_EVM_HTLC_ADDRESS');
   const chainId = Number(opts.taoChainId);
   return {
