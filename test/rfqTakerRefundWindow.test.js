@@ -53,7 +53,7 @@ function buildSignedInboundQuote({ settlementRefundAfterSec }) {
       direction: 'BTC_LN->TAO_EVM',
       app_hash: deriveIntercomswapAppHash({ solanaProgramId: TAO_HTLC_ADDRESS }),
       btc_sats: 50_000,
-      tao_amount_atomic: '4200000000',
+      tao_amount_atomic: '4200000000000000000',
       settlement_kind: 'tao-evm',
       settlement_refund_after_sec: settlementRefundAfterSec,
       platform_fee_bps: 10,

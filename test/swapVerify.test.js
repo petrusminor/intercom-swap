@@ -202,7 +202,7 @@ test('tao provider verifySwapPrePayOnchain: refund_after must be strictly greate
       metadata: {
         sender: '0x3333333333333333333333333333333333333333',
         receiver: '0x1111111111111111111111111111111111111111',
-        amount_atomic: '5000000',
+        amount_atomic: '5000000000000000',
         refund_after_unix: 1770992907,
         hashlock: `0x${'44'.repeat(32)}`,
         claimed: false,
@@ -214,7 +214,7 @@ test('tao provider verifySwapPrePayOnchain: refund_after must be strictly greate
     const input = {
       terms: {
         pair: 'BTC_LN/TAO_EVM',
-        tao_amount_atomic: '5000000',
+        tao_amount_atomic: '5000000000000000',
         sol_recipient: '0x1111111111111111111111111111111111111111',
         sol_refund: '0x3333333333333333333333333333333333333333',
         sol_refund_after_unix: 1770992907,
@@ -227,7 +227,7 @@ test('tao provider verifySwapPrePayOnchain: refund_after must be strictly greate
         payment_hash_hex: '44'.repeat(32),
         settlement_id: `0x${'55'.repeat(32)}`,
         htlc_address: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
-        amount_atomic: '5000000',
+        amount_atomic: '5000000000000000',
         refund_after_unix: 1770992907,
         recipient: '0x1111111111111111111111111111111111111111',
         refund: '0x3333333333333333333333333333333333333333',
@@ -243,7 +243,7 @@ test('tao provider verifySwapPrePayOnchain: refund_after must be strictly greate
       metadata: {
         sender: '0x3333333333333333333333333333333333333333',
         receiver: '0x1111111111111111111111111111111111111111',
-        amount_atomic: '5000000',
+        amount_atomic: '5000000000000000',
         refund_after_unix: 1770992908,
         hashlock: `0x${'44'.repeat(32)}`,
         claimed: false,
@@ -276,7 +276,7 @@ test('tao provider verifySwapPrePayOnchain: refund_after must leave enough time 
       metadata: {
         sender: '0x3333333333333333333333333333333333333333',
         receiver: '0x1111111111111111111111111111111111111111',
-        amount_atomic: '5000000',
+        amount_atomic: '5000000000000000',
         refund_after_unix: 1770990000,
         hashlock: `0x${'44'.repeat(32)}`,
         claimed: false,
@@ -289,7 +289,7 @@ test('tao provider verifySwapPrePayOnchain: refund_after must leave enough time 
       nowUnix: 1770986401,
       terms: {
         pair: 'BTC_LN/TAO_EVM',
-        tao_amount_atomic: '5000000',
+        tao_amount_atomic: '5000000000000000',
         sol_recipient: '0x1111111111111111111111111111111111111111',
         sol_refund: '0x3333333333333333333333333333333333333333',
         sol_refund_after_unix: 1770990000,
@@ -301,7 +301,7 @@ test('tao provider verifySwapPrePayOnchain: refund_after must leave enough time 
         payment_hash_hex: '44'.repeat(32),
         settlement_id: `0x${'66'.repeat(32)}`,
         htlc_address: '0x6B1E5e136c91e5Cb7c5c30C996ae9F3119460653',
-        amount_atomic: '5000000',
+        amount_atomic: '5000000000000000',
         refund_after_unix: 1770990000,
         recipient: '0x1111111111111111111111111111111111111111',
         refund: '0x3333333333333333333333333333333333333333',

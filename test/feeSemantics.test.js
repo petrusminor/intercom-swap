@@ -240,7 +240,7 @@ test('quote_post dry-run: SOL and TAO emit identical settlement fee bps for iden
       rfq_id: 'b'.repeat(64),
       pair: 'BTC_LN/TAO_EVM',
       btc_sats: 10000,
-      tao_amount_atomic: '1000000',
+      tao_amount_atomic: '1000000000000000',
       trade_fee_collector: '0x2222222222222222222222222222222222222222',
       settlement_refund_after_sec: 259200,
       valid_for_sec: 600,
@@ -271,7 +271,7 @@ test('offer matching: settlement fee caps apply consistently across SOL and TAO 
   const taoEvt = makeOfferEvent({
     pair: 'BTC_LN/TAO_EVM',
     amountField: 'tao_amount_atomic',
-    amountAtomic: '1000000',
+    amountAtomic: '1000000000000000',
     appHash: taoAppHash,
   });
 

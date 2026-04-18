@@ -91,7 +91,7 @@ test('rfq taker offer-listen: derives TAO RFQ overrides from svc_announce offers
       settlement_kind: 'tao-evm',
       app_hash: TAO_APP_HASH,
       btc_sats: 50_000,
-      tao_amount_atomic: '4200000000',
+      tao_amount_atomic: '4200000000000000000',
       max_platform_fee_bps: 10,
       max_trade_fee_bps: 10,
       max_total_fee_bps: 20,
@@ -106,7 +106,7 @@ test('rfq taker offer-listen: derives TAO RFQ overrides from svc_announce offers
   assert.equal(matched.settlement_kind, 'tao-evm');
   assert.equal(matched.btc_sats, 50_000);
   assert.equal(matched.amount_field, 'tao_amount_atomic');
-  assert.equal(matched.tao_amount_atomic, '4200000000');
+  assert.equal(matched.tao_amount_atomic, '4200000000000000000');
   assert.equal(matched.settlement_refund_after_sec, 259200);
 });
 
@@ -118,7 +118,7 @@ test('rfq taker offer-listen: derives USDT RFQ overrides and rejects TAO-only fi
       want: ASSET.BTC_LN,
       app_hash: TAO_APP_HASH,
       btc_sats: 50_000,
-      tao_amount_atomic: '4200000000',
+      tao_amount_atomic: '4200000000000000000',
       min_sol_refund_window_sec: 72 * 3600,
       max_platform_fee_bps: 10,
       max_trade_fee_bps: 10,
@@ -161,7 +161,7 @@ test('rfq taker offer-listen: default safe TAO min rejects 115000 refund window'
       settlement_kind: 'tao-evm',
       app_hash: TAO_APP_HASH,
       btc_sats: 50_000,
-      tao_amount_atomic: '4200000000',
+      tao_amount_atomic: '4200000000000000000',
       max_platform_fee_bps: 10,
       max_trade_fee_bps: 10,
       max_total_fee_bps: 20,
@@ -182,7 +182,7 @@ test('rfq taker offer-listen: unsafe min override accepts 115000 refund window',
       settlement_kind: 'tao-evm',
       app_hash: TAO_APP_HASH,
       btc_sats: 50_000,
-      tao_amount_atomic: '4200000000',
+      tao_amount_atomic: '4200000000000000000',
       max_platform_fee_bps: 10,
       max_trade_fee_bps: 10,
       max_total_fee_bps: 20,

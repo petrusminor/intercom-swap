@@ -35,12 +35,12 @@ test('repairToolArguments: preserves TAO offer amount + refund field', () => {
         have: 'TAO_EVM',
         want: 'BTC_LN',
         btc_sats: 1000,
-        tao_amount_atomic: '4200000000',
+        tao_amount_atomic: '4200000000000000000',
         refund_after_sec: '259200',
       },
     ],
   });
-  assert.equal(out.offers[0].tao_amount_atomic, '4200000000');
+  assert.equal(out.offers[0].tao_amount_atomic, '4200000000000000000');
   assert.equal(out.offers[0].settlement_refund_after_sec, 259200);
 });
 

@@ -237,7 +237,7 @@ test('e2e: deterministic TAO refund flow emits TAO_REFUNDED and persists receipt
   const tradeId = 'phase9-tao-refund-trade';
   const channel = 'swap:phase9-tao-refund-trade';
   const btcSats = 1200;
-  const usdtAmount = '5000000';
+  const usdtAmount = '5000000000000000';
   const appHash = executor._settlementAppHash();
   const bolt11 = 'lnbcrt1phase9refunddeterministicinvoice0000000000001';
 

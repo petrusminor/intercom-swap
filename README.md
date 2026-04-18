@@ -357,6 +357,12 @@ Notes:
 
 These are long-running bots that sit in an RFQ channel and negotiate RFQ/quotes. With `--run-swap 1` they run the full swap state machine inside an invite-only `swap:<trade_id>` channel.
 
+Current runtime notes:
+- `rfq-maker` defaults to `--max-trades 1` when omitted.
+- `rfq-taker` defaults to `--max-trades 1` when omitted.
+- `--max-trades 0` means unlimited.
+- Taker is not single-shot internally: it runs trade cycles until capacity is exhausted or the process is stopped.
+
 #### Wrappers
 
 | Wrapper | What it does |
@@ -388,6 +394,7 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--swap-channel-template <tmpl>` | Swap channel name template (default `swap:{trade_id}`) |
 | `--quote-valid-sec <n>` | Quote validity window (default `60`) |
 | `--invite-ttl-sec <n>` | Invite TTL (default `604800`) |
+| `--max-trades <n>` | Total completed-trade capacity. Omitted = `1`, `0` = unlimited, `n>0` = finite cap |
 | `--once 0/1` | Exit after one completed swap (default `0`) |
 | `--once-exit-delay-ms <n>` | Delay before exiting when `--once 1` (default `750`) |
 | `--debug 0/1` | Verbose logs (default `0`) |
@@ -411,6 +418,16 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--solana-refund-after-sec <n>` | Deprecated alias for `--settlement-refund-after-sec` |
 | `--unsafe-min-settlement-refund-after-sec <n>` | UNSAFE maker-only override for the local minimum settlement refund window check (default safe minimum `259200` = 72h; local testing only) |
 | `--ln-invoice-expiry-sec <n>` | LN invoice expiry seconds (default `3600`) |
+
+##### Maker Auto-Announce
+
+| Flag | Meaning |
+|---|---|
+| `--auto-announce-interval-sec <n>` | Enable periodic `svc-announce` from the maker process (`>= 5`) |
+| `--announce-name <text>` | Service name passed to `svc-announce` |
+| `--announce-offers-json <json|@file>` | Offers payload passed to `svc-announce` |
+| `--announce-ttl-sec <n>` | Optional announce TTL override |
+| `--announce-join 0/1` | Optional `svc-announce --join` value |
 
 ##### Solana
 
@@ -457,9 +474,10 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--usdt-amount <atomicStr>` | USDT requested (base units, must be > 0). In `--settlement tao-evm`, accepted as a deprecated alias for `--tao-amount-atomic`. |
 | `--tao-amount-atomic <atomicStr>` | TAO amount in atomic units for `--settlement tao-evm` (preferred) |
 | `--rfq-valid-sec <n>` | RFQ validity window (default `60`) |
-| `--timeout-sec <n>` | RFQ/quote negotiation timeout (default `30`) |
-| `--rfq-resend-ms <n>` | RFQ resend interval (default `1200`) |
+| `--timeout-sec <n>` | RFQ handshake wait window before the taker logs and extends the deadline (default `30`) |
+| `--rfq-resend-ms <n>` | RFQ resend floor. Actual resend delay is throttled by a single timer with additional backoff + jitter |
 | `--accept-resend-ms <n>` | Quote accept resend interval (default `1200`) |
+| `--max-trades <n>` | Trade-cycle capacity. Omitted = `1`, `0` = unlimited, `n>0` = finite cap |
 | `--once 0/1` | Exit after one completed swap (default `0`) |
 | `--once-exit-delay-ms <n>` | Delay before exiting when `--once 1` (default `200`) |
 | `--debug 0/1` | Verbose logs (default `0`) |
@@ -471,6 +489,71 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 
 - Taker accepts/rejects quotes by negotiated terms + protocol guardrails (fees/windows/signers/app binding), not oracle thresholds.
 - Oracle remains informational only.
+- Quote acceptance is also gated by remaining capacity; valid quotes are ignored when no new trade capacity remains.
+
+#### Capacity And Trade Admission Control
+
+- `maxTrades` semantics:
+  - omitted: default `1`
+  - `0`: unlimited
+  - `n > 0`: maximum completed trades / trade cycles
+- Definitions:
+  - `activeTrades`: trades already committed and still in flight
+  - `completedTrades`: terminal claimed trades
+  - `remainingCapacity`: `maxTrades - completedTrades - activeTrades` (or infinity when `maxTrades = 0`)
+- Maker behavior:
+  - rejects new RFQs when `remainingCapacity == 0`
+  - suppresses auto-announce when capacity is exhausted
+- Taker behavior:
+  - does not start a new RFQ cycle when `remainingCapacity == 0`
+  - does not send a new `quote_accept` when `remainingCapacity == 0`
+- Critical invariant:
+  - in-flight swaps still complete even after capacity reaches zero
+
+#### RFQ Retry And Commitment Semantics
+
+- Taker regenerates and re-signs the RFQ on each resend attempt, so retries carry a fresh validity window and a new `rfq_id`.
+- RFQ resend uses a single throttled timer with jitter; it is not a fixed tight interval loop.
+- During RFQ handshake wait, `--timeout-sec` no longer hard-exits the taker. The process logs and extends the deadline while it keeps waiting for a maker.
+- The RFQ resend loop stops once the taker commits to one counterparty:
+  - after `quote_accept` is sent, or
+  - after `swap_joined` is received
+- Purpose:
+  - prevent multiple makers from matching the same taker cycle concurrently
+
+#### Multi-Trade Taker Operation
+
+- `rfq-taker` runs repeated trade cycles until `maxTrades` is reached.
+- Between cycles it stays connected and starts a fresh RFQ lifecycle.
+- It exits cleanly only after the configured finite capacity is consumed.
+- With `--max-trades 0`, it stays in unlimited mode.
+
+#### Swap Summary Events
+
+- Both maker and taker emit `swap_summary` JSON at terminal state.
+- The summary includes:
+  - settlement type
+  - timing (`start_ts`, `end_ts`, `duration_ms`)
+  - lifecycle stages reached by that role
+- `swap_summary` is observability only:
+  - it is not part of the swap protocol
+  - it does not change wire behavior
+
+#### Runtime Invariants
+
+- No protocol or wire-format changes are introduced by these runtime policies.
+- Trade progression remains deterministic for a given accepted swap.
+- Retries are allowed for existing trades even when capacity is full.
+- New trades are blocked when remaining capacity is exhausted.
+- Duplicate network messages are handled idempotently.
+
+#### Maker Auto-Announce Policy
+
+- Maker-side auto-announce requires explicit announce metadata.
+- Auto-announce is suppressed when:
+  - announce config is missing, or
+  - remaining capacity is zero
+- When enabled, the maker runs `svc-announce` on a jittered timer from the bot process.
 
 ##### Swap Execution (`--run-swap 1`)
 

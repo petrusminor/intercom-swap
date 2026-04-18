@@ -95,6 +95,62 @@ function parseIntFlag(value, label, fallback = null) {
   return n;
 }
 
+const TAO_AMOUNT_VALIDATION_ERROR = 'Invalid TAO amount: expected decimal format with up to 18 decimal places';
+const TAO_AMOUNT_LEADING_ZERO_ERROR =
+  'Invalid TAO amount: must include a leading zero (e.g. 0.002), up to 18 decimal places';
+
+function parseTaoAmountToAtomicString(value) {
+  const raw = String(value ?? '').trim();
+  if (/^\.\d+$/.test(raw)) {
+    throw new Error(TAO_AMOUNT_LEADING_ZERO_ERROR);
+  }
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    throw new Error(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  const [whole, fractional = ''] = raw.split('.');
+  if (fractional.length > 18) {
+    throw new Error(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  const atomic = `${whole}${fractional.padEnd(18, '0')}`.replace(/^0+(?=\d)/, '');
+  return atomic || '0';
+}
+
+function formatTaoAtomic(atomicStr) {
+  try {
+    const v = BigInt(atomicStr);
+    const whole = v / 1000000000000000000n;
+    const frac = v % 1000000000000000000n;
+
+    if (frac === 0n) return `${whole.toString()}`;
+
+    const fracStr = frac.toString().padStart(18, '0').replace(/0+$/, '');
+    return `${whole.toString()}.${fracStr}`;
+  } catch {
+    return atomicStr;
+  }
+}
+
+function formatBtcSats(sats) {
+  try {
+    const v = BigInt(sats);
+    const whole = v / 100000000n;
+    const frac = v % 100000000n;
+
+    if (frac === 0n) return `${whole.toString()}`;
+
+    const fracStr = frac.toString().padStart(8, '0').replace(/0+$/, '');
+    return `${whole.toString()}.${fracStr}`;
+  } catch {
+    return String(sats);
+  }
+}
+
+const withinBounds = (value, min, max) => {
+  if (min !== undefined && value < min) return false;
+  if (max !== undefined && value > max) return false;
+  return true;
+};
+
 function parseBps(value, label, fallback) {
   const n = parseIntFlag(value, label, fallback);
   if (!Number.isFinite(n)) return fallback;
@@ -532,11 +588,27 @@ async function main() {
 
   let btcSats = parseIntFlag(flags.get('btc-sats'), 'btc-sats', 50_000);
   let usdtAmount = '100000000';
+  const taoAmountRaw = flags.get('tao-amount');
+  const taoAmountAtomicFlag = flags.get('tao-amount-atomic');
+  if (taoAmountRaw !== undefined && taoAmountAtomicFlag !== undefined) {
+    die('Provide only one of --tao-amount or --tao-amount-atomic');
+  }
+  if (taoAmountRaw !== undefined && settlementKind !== SETTLEMENT_KIND.TAO_EVM) {
+    die('Invalid --tao-amount (only valid when --settlement tao-evm)');
+  }
+  let taoAmountAtomicRaw = taoAmountAtomicFlag;
+  if (taoAmountRaw !== undefined) {
+    try {
+      taoAmountAtomicRaw = parseTaoAmountToAtomicString(taoAmountRaw);
+    } catch (err) {
+      die(err?.message || String(err));
+    }
+  }
   try {
     const amountConfig = resolveRfqSettlementAmountAtomic({
       settlementKind,
       usdtAmountRaw: flags.get('usdt-amount'),
-      taoAmountAtomicRaw: flags.get('tao-amount-atomic'),
+      taoAmountAtomicRaw,
       fallbackUsdtAmount: '100000000',
     });
     usdtAmount = amountConfig.amountAtomic;
@@ -558,6 +630,60 @@ async function main() {
     ? Number.parseInt(String(flags.get('max-trades')), 10)
     : 1;
   if (!Number.isInteger(parsedMaxTrades) || parsedMaxTrades < 0) die('Invalid --max-trades (expected integer >= 0)');
+  const minBtcSats = flags.get('min-btc-sats') !== undefined
+    ? parseIntFlag(flags.get('min-btc-sats'), 'min-btc-sats', null)
+    : undefined;
+  const maxBtcSats = flags.get('max-btc-sats') !== undefined
+    ? parseIntFlag(flags.get('max-btc-sats'), 'max-btc-sats', null)
+    : undefined;
+  const minTaoRaw = flags.get('min-tao');
+  const maxTaoRaw = flags.get('max-tao');
+  const minTaoAtomicCompatRaw = flags.get('min-tao-atomic');
+  const maxTaoAtomicCompatRaw = flags.get('max-tao-atomic');
+  if (minBtcSats !== undefined && (!Number.isInteger(minBtcSats) || minBtcSats < 0)) {
+    die('Invalid --min-btc-sats (expected integer >= 0)');
+  }
+  if (maxBtcSats !== undefined && (!Number.isInteger(maxBtcSats) || maxBtcSats < 0)) {
+    die('Invalid --max-btc-sats (expected integer >= 0)');
+  }
+  if (minTaoRaw !== undefined && minTaoAtomicCompatRaw !== undefined) {
+    die('Provide only one of --min-tao or --min-tao-atomic');
+  }
+  if (maxTaoRaw !== undefined && maxTaoAtomicCompatRaw !== undefined) {
+    die('Provide only one of --max-tao or --max-tao-atomic');
+  }
+  if (minTaoAtomicCompatRaw !== undefined && !/^[0-9]+$/.test(String(minTaoAtomicCompatRaw))) {
+    die(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  if (maxTaoAtomicCompatRaw !== undefined && !/^[0-9]+$/.test(String(maxTaoAtomicCompatRaw))) {
+    die(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  let minTaoAtomic;
+  if (minTaoRaw !== undefined) {
+    try {
+      minTaoAtomic = BigInt(parseTaoAmountToAtomicString(minTaoRaw));
+    } catch (err) {
+      die(err?.message || String(err));
+    }
+  } else if (minTaoAtomicCompatRaw !== undefined) {
+    minTaoAtomic = BigInt(String(minTaoAtomicCompatRaw));
+  }
+  let maxTaoAtomic;
+  if (maxTaoRaw !== undefined) {
+    try {
+      maxTaoAtomic = BigInt(parseTaoAmountToAtomicString(maxTaoRaw));
+    } catch (err) {
+      die(err?.message || String(err));
+    }
+  } else if (maxTaoAtomicCompatRaw !== undefined) {
+    maxTaoAtomic = BigInt(String(maxTaoAtomicCompatRaw));
+  }
+  if (minBtcSats !== undefined && maxBtcSats !== undefined && minBtcSats > maxBtcSats) {
+    die('Invalid BTC size bounds (min > max)');
+  }
+  if (minTaoAtomic !== undefined && maxTaoAtomic !== undefined && minTaoAtomic > maxTaoAtomic) {
+    die('Invalid TAO size bounds (min > max)');
+  }
   let maxTrades = parsedMaxTrades;
   if (once) {
     if (flags.get('max-trades') !== undefined && parsedMaxTrades > 1) {
@@ -565,6 +691,17 @@ async function main() {
     }
     maxTrades = 1;
   }
+  if (maxTrades === 0) {
+    process.stderr.write('[taker] capacity mode: unlimited\n');
+  } else {
+    process.stderr.write('[taker] capacity mode: remaining capacity enforced\n');
+  }
+  let activeTrades = 0;
+  let completedTrades = 0;
+  const getRemainingCapacity = () => {
+    if (maxTrades === 0) return Number.POSITIVE_INFINITY;
+    return Math.max(maxTrades - completedTrades - activeTrades, 0);
+  };
 
   const runSwap = parseBool(flags.get('run-swap'), false);
   const allowNoReceipts = parseBool(flags.get('allow-no-receipts'), false);
@@ -834,6 +971,7 @@ async function main() {
 
   const runSingleTradeCycle = async () => {
     tradeId = configuredTradeId && maxTrades === 1 ? configuredTradeId : `swap_${crypto.randomUUID()}`;
+    let tradeAttempted = false;
     settlementKind = configuredSettlementKind;
     isSolanaSettlement = settlementKind === SETTLEMENT_KIND.SOLANA;
     isTaoSettlement = settlementKind === SETTLEMENT_KIND.TAO_EVM;
@@ -893,6 +1031,21 @@ async function main() {
                   maxRefundSec: maxSolRefundWindowSecCfg,
                 });
                 if (!matchedOffer) return;
+                const offerPair = normalizePair(matchedOffer.pair || rfqPair);
+                const offerBtc = matchedOffer.btc_sats;
+                const offerTaoAtomic = String(getAmountForPair(matchedOffer, offerPair) || '').trim();
+                if (
+                  !withinBounds(offerBtc, minBtcSats, maxBtcSats) ||
+                  (isTaoPair(offerPair) && !withinBounds(BigInt(offerTaoAtomic), minTaoAtomic, maxTaoAtomic))
+                ) {
+                  process.stderr.write(
+                    `[taker] skipping offer (pre-filter) ` +
+                      `btc=${offerBtc} sats (${formatBtcSats(offerBtc)} BTC)` +
+                      (isTaoPair(offerPair) ? ` tao=${formatTaoAtomic(offerTaoAtomic)} TAO (${offerTaoAtomic} atomic)` : '') +
+                      '\n'
+                  );
+                  return;
+                }
                 cleanup();
                 resolve(matchedOffer);
                 return;
@@ -1013,7 +1166,33 @@ async function main() {
       lnPaid: false,
       settlementClaimed: false,
     };
+    if (getRemainingCapacity() <= 0) {
+      process.stderr.write(
+        `[taker] SKIP rfq no remaining capacity completed=${completedTrades} active=${activeTrades} max=${maxTrades}\n`
+      );
+      if (offerMeta) {
+        process.stderr.write('[taker] skipping offer (not counted as trade cycle)\n');
+      }
+      return false;
+    }
+    const taoAmountAtomic = usdtAmount;
+    if (
+      !withinBounds(btcSats, minBtcSats, maxBtcSats) ||
+      !withinBounds(BigInt(taoAmountAtomic), minTaoAtomic, maxTaoAtomic)
+    ) {
+      process.stderr.write(
+        `[taker] SKIP rfq size_out_of_bounds ` +
+          `btc=${btcSats} sats (${formatBtcSats(btcSats)} BTC)` +
+          (isTaoPair(rfqPair) ? ` tao=${formatTaoAtomic(taoAmountAtomic)} TAO (${taoAmountAtomic} atomic)` : '') +
+          '\n'
+      );
+      if (offerMeta) {
+        process.stderr.write('[taker] skipping offer (not counted as trade cycle)\n');
+      }
+      return false;
+    }
     ensureOk(await sc.send(rfqChannel, rfqSigned), 'send rfq');
+    tradeAttempted = true;
     lifecycle.rfqSent = true;
 
     persistTrade(
@@ -1797,6 +1976,8 @@ async function main() {
     stopTimers();
     clearTimers();
     process.stdout.write(`${JSON.stringify({ type: 'swap_done', trade_id: tradeId, swap_channel: swapChannel })}\n`);
+    completedTrades += 1;
+    if (activeTrades > 0) activeTrades -= 1;
     const endTs = Date.now();
     process.stdout.write(
       JSON.stringify({
@@ -1969,7 +2150,9 @@ async function main() {
             // Guardrail: only accept quotes for the exact requested size.
             if (Number(msg.body?.btc_sats) !== Number(btcSats)) {
               process.stderr.write(
-                `[taker] quote_reject reason=btc_sats_mismatch quote_id=${quoteId} actual=${msg.body?.btc_sats ?? 'n/a'} expected=${btcSats}\n`
+                `[taker] quote_reject reason=btc_sats_mismatch quote_id=${quoteId} ` +
+                  `actual=${msg.body?.btc_sats ?? 'n/a'} sats (${formatBtcSats(msg.body?.btc_sats ?? 'n/a')} BTC) ` +
+                  `expected=${btcSats} sats (${formatBtcSats(btcSats)} BTC)\n`
               );
               return;
             }
@@ -1987,7 +2170,31 @@ async function main() {
             const rfqMin = asBigIntAmount(usdtAmount) ?? 0n;
             if (rfqMin > 0n && quoteAmount < rfqMin) {
               process.stderr.write(
-                `[taker] quote_reject reason=amount_below_rfq_min quote_id=${quoteId} actual=${quoteAmount.toString()} min=${rfqMin.toString()}\n`
+                `[taker] quote_reject reason=amount_below_rfq_min quote_id=${quoteId} ` +
+                  (isTaoPair(quotePair)
+                    ? `actual=${formatTaoAtomic(quoteAmount.toString())} TAO (${quoteAmount.toString()} atomic) ` +
+                      `min=${formatTaoAtomic(rfqMin.toString())} TAO (${rfqMin.toString()} atomic)\n`
+                    : `actual=${quoteAmount.toString()} min=${rfqMin.toString()}\n`)
+              );
+              return;
+            }
+            if (getRemainingCapacity() <= 0) {
+              process.stderr.write(
+                `[taker] SKIP quote_accept no remaining capacity completed=${completedTrades} active=${activeTrades} max=${maxTrades}\n`
+              );
+              return;
+            }
+            const quoteBtc = Number(msg.body?.btc_sats);
+            const quoteTaoAtomic = quoteAmountStr;
+            if (
+              !withinBounds(quoteBtc, minBtcSats, maxBtcSats) ||
+              !withinBounds(BigInt(quoteTaoAtomic), minTaoAtomic, maxTaoAtomic)
+            ) {
+              process.stderr.write(
+                `[taker] SKIP quote_accept size_out_of_bounds ` +
+                  `btc=${quoteBtc} sats (${formatBtcSats(quoteBtc)} BTC)` +
+                  (isTaoPair(quotePair) ? ` tao=${formatTaoAtomic(quoteTaoAtomic)} TAO (${quoteTaoAtomic} atomic)` : '') +
+                  '\n'
               );
               return;
             }
@@ -1995,7 +2202,10 @@ async function main() {
             chosen = { rfq_id: rfqId, quote_id: quoteId, quote: msg };
             process.stderr.write(
               `[taker] quote_accept quote_id=${quoteId} pair=${quotePair} actual=${quoteRefundWindowSec} ` +
-                `min=${effectiveQuoteMinRefundWindowSec} unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided}\n`
+                `min=${effectiveQuoteMinRefundWindowSec} unsafe_min_provided=${unsafeMinSettlementRefundAfterSecProvided} ` +
+                `btc=${quoteBtc} sats (${formatBtcSats(quoteBtc)} BTC)` +
+                (isTaoPair(quotePair) ? ` tao=${formatTaoAtomic(quoteTaoAtomic)} TAO (${quoteTaoAtomic} atomic)` : '') +
+                '\n'
             );
             const quoteAcceptUnsigned = createUnsignedEnvelope({
               v: 1,
@@ -2008,6 +2218,7 @@ async function main() {
             });
             quoteAcceptSigned = signSwapEnvelope(quoteAcceptUnsigned, signing);
             ensureOk(await sc.send(rfqChannel, quoteAcceptSigned), 'send quote_accept');
+            activeTrades += 1;
             ctx.rfqActive = false;
             lifecycle.quoteAccepted = true;
             if (debug) process.stderr.write(`[taker] accepted quote trade_id=${tradeId} quote_id=${quoteId}\n`);
@@ -2112,6 +2323,7 @@ async function main() {
       sc.off('sidechannel_message', onSidechannelMessage);
       stopTimers();
     }
+    return tradeAttempted;
   };
 
   if (maxTrades === 0) {
@@ -2121,8 +2333,10 @@ async function main() {
   let tradeCount = 0;
   while (maxTrades === 0 || tradeCount < maxTrades) {
     process.stderr.write(`[taker] starting trade cycle ${tradeCount + 1}\n`);
-    await runSingleTradeCycle();
-    tradeCount += 1;
+    const tradeAttempted = await runSingleTradeCycle();
+    if (tradeAttempted) {
+      tradeCount += 1;
+    }
   }
 
   if (maxTrades !== 0) {

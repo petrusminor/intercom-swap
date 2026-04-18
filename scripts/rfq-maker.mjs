@@ -94,6 +94,62 @@ function parseIntFlag(value, label, fallback = null) {
   return n;
 }
 
+const TAO_AMOUNT_VALIDATION_ERROR = 'Invalid TAO amount: expected decimal format with up to 18 decimal places';
+const TAO_AMOUNT_LEADING_ZERO_ERROR =
+  'Invalid TAO amount: must include a leading zero (e.g. 0.002), up to 18 decimal places';
+
+function parseTaoAmountToAtomicString(value) {
+  const raw = String(value ?? '').trim();
+  if (/^\.\d+$/.test(raw)) {
+    throw new Error(TAO_AMOUNT_LEADING_ZERO_ERROR);
+  }
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    throw new Error(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  const [whole, fractional = ''] = raw.split('.');
+  if (fractional.length > 18) {
+    throw new Error(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  const atomic = `${whole}${fractional.padEnd(18, '0')}`.replace(/^0+(?=\d)/, '');
+  return atomic || '0';
+}
+
+function formatTaoAtomic(atomicStr) {
+  try {
+    const v = BigInt(atomicStr);
+    const whole = v / 1000000000000000000n;
+    const frac = v % 1000000000000000000n;
+
+    if (frac === 0n) return `${whole.toString()}`;
+
+    const fracStr = frac.toString().padStart(18, '0').replace(/0+$/, '');
+    return `${whole.toString()}.${fracStr}`;
+  } catch {
+    return atomicStr;
+  }
+}
+
+function formatBtcSats(sats) {
+  try {
+    const v = BigInt(sats);
+    const whole = v / 100000000n;
+    const frac = v % 100000000n;
+
+    if (frac === 0n) return `${whole.toString()}`;
+
+    const fracStr = frac.toString().padStart(8, '0').replace(/0+$/, '');
+    return `${whole.toString()}.${fracStr}`;
+  } catch {
+    return String(sats);
+  }
+}
+
+const withinBounds = (value, min, max) => {
+  if (min !== undefined && value < min) return false;
+  if (max !== undefined && value > max) return false;
+  return true;
+};
+
 export const DEFAULT_LN_INVOICE_EXPIRY_SEC = 3600;
 
 export function resolveLnInvoiceExpirySec(value) {
@@ -182,6 +238,39 @@ function parseSignedEnvelopeLike(value) {
     }
   }
   return typeof value === 'object' ? value : null;
+}
+
+function normalizeAnnounceOffersJson(rawValue, { repoRoot, debug = false } = {}) {
+  const raw = String(rawValue ?? '').trim();
+  if (!raw) return '';
+  const jsonText = raw.startsWith('@')
+    ? fs.readFileSync(path.isAbsolute(raw.slice(1)) ? raw.slice(1) : path.resolve(repoRoot, raw.slice(1)), 'utf8')
+    : raw;
+  const parsed = JSON.parse(jsonText);
+  const normalizeOffer = (offer) => {
+    if (!offer || typeof offer !== 'object' || Array.isArray(offer)) return offer;
+    if (Object.prototype.hasOwnProperty.call(offer, 'tao_amount') && Object.prototype.hasOwnProperty.call(offer, 'tao_amount_atomic')) {
+      throw new Error('Provide only one of tao_amount or tao_amount_atomic in announce-offers-json');
+    }
+    if (!Object.prototype.hasOwnProperty.call(offer, 'tao_amount')) return offer;
+    const normalized = { ...offer };
+    normalized.tao_amount_atomic = parseTaoAmountToAtomicString(offer.tao_amount);
+    delete normalized.tao_amount;
+    if (debug) {
+      process.stderr.write(`[maker] auto announce normalized tao_amount_atomic=${normalized.tao_amount_atomic}\n`);
+    }
+    return normalized;
+  };
+  if (Array.isArray(parsed)) {
+    return JSON.stringify(parsed.map(normalizeOffer));
+  }
+  if (Array.isArray(parsed?.offers)) {
+    return JSON.stringify({
+      ...parsed,
+      offers: parsed.offers.map(normalizeOffer),
+    });
+  }
+  return JSON.stringify(parsed);
 }
 
 export function quoteMatchesCurrentSettlementPolicy({
@@ -507,21 +596,83 @@ async function main() {
   const announceOffersJson = flags.get('announce-offers-json')
     ? String(flags.get('announce-offers-json'))
     : '';
+  let normalizedAnnounceOffersJson = announceOffersJson;
   const announceTtlSec = flags.get('announce-ttl-sec') !== undefined
     ? parseIntFlag(flags.get('announce-ttl-sec'), 'announce-ttl-sec', null)
     : null;
   const announceJoin = flags.get('announce-join') !== undefined
     ? parseBool(flags.get('announce-join'), false)
     : false;
+  const minBtcSats = flags.get('min-btc-sats') !== undefined
+    ? parseIntFlag(flags.get('min-btc-sats'), 'min-btc-sats', null)
+    : undefined;
+  const maxBtcSats = flags.get('max-btc-sats') !== undefined
+    ? parseIntFlag(flags.get('max-btc-sats'), 'max-btc-sats', null)
+    : undefined;
+  const minTaoRaw = flags.get('min-tao');
+  const maxTaoRaw = flags.get('max-tao');
+  const minTaoAtomicCompatRaw = flags.get('min-tao-atomic');
+  const maxTaoAtomicCompatRaw = flags.get('max-tao-atomic');
 
   if (autoAnnounceIntervalSec !== null) {
     if (!Number.isInteger(autoAnnounceIntervalSec) || autoAnnounceIntervalSec < 5) {
       die('Invalid --auto-announce-interval-sec (expected integer >= 5)');
     }
   }
+  if (minBtcSats !== undefined && (!Number.isInteger(minBtcSats) || minBtcSats < 0)) {
+    die('Invalid --min-btc-sats (expected integer >= 0)');
+  }
+  if (maxBtcSats !== undefined && (!Number.isInteger(maxBtcSats) || maxBtcSats < 0)) {
+    die('Invalid --max-btc-sats (expected integer >= 0)');
+  }
+  if (minTaoRaw !== undefined && minTaoAtomicCompatRaw !== undefined) {
+    die('Provide only one of --min-tao or --min-tao-atomic');
+  }
+  if (maxTaoRaw !== undefined && maxTaoAtomicCompatRaw !== undefined) {
+    die('Provide only one of --max-tao or --max-tao-atomic');
+  }
+  if (minTaoAtomicCompatRaw !== undefined && !/^[0-9]+$/.test(String(minTaoAtomicCompatRaw))) {
+    die(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  if (maxTaoAtomicCompatRaw !== undefined && !/^[0-9]+$/.test(String(maxTaoAtomicCompatRaw))) {
+    die(TAO_AMOUNT_VALIDATION_ERROR);
+  }
+  let minTaoAtomic;
+  if (minTaoRaw !== undefined) {
+    try {
+      minTaoAtomic = BigInt(parseTaoAmountToAtomicString(minTaoRaw));
+    } catch (err) {
+      die(err?.message || String(err));
+    }
+  } else if (minTaoAtomicCompatRaw !== undefined) {
+    minTaoAtomic = BigInt(String(minTaoAtomicCompatRaw));
+  }
+  let maxTaoAtomic;
+  if (maxTaoRaw !== undefined) {
+    try {
+      maxTaoAtomic = BigInt(parseTaoAmountToAtomicString(maxTaoRaw));
+    } catch (err) {
+      die(err?.message || String(err));
+    }
+  } else if (maxTaoAtomicCompatRaw !== undefined) {
+    maxTaoAtomic = BigInt(String(maxTaoAtomicCompatRaw));
+  }
+  if (minBtcSats !== undefined && maxBtcSats !== undefined && minBtcSats > maxBtcSats) {
+    die('Invalid BTC size bounds (min > max)');
+  }
+  if (minTaoAtomic !== undefined && maxTaoAtomic !== undefined && minTaoAtomic > maxTaoAtomic) {
+    die('Invalid TAO size bounds (min > max)');
+  }
   if (announceTtlSec !== null) {
     if (!Number.isInteger(announceTtlSec) || announceTtlSec < 1) {
       die('Invalid --announce-ttl-sec (expected integer >= 1)');
+    }
+  }
+  if (announceOffersJson) {
+    try {
+      normalizedAnnounceOffersJson = normalizeAnnounceOffersJson(announceOffersJson, { repoRoot, debug });
+    } catch (err) {
+      die(err?.message || String(err));
     }
   }
 
@@ -529,7 +680,7 @@ async function main() {
     process.stderr.write(`[maker] auto announce enabled (${autoAnnounceIntervalSec}s)\n`);
     process.stderr.write(
       `[maker] auto announce config: name=${announceName ? 'set' : 'missing'} ` +
-      `offers=${announceOffersJson ? 'set' : 'missing'} ttl=${announceTtlSec ?? 'missing'} join=${announceJoin ? 1 : 0}\n`
+      `offers=${normalizedAnnounceOffersJson ? 'set' : 'missing'} ttl=${announceTtlSec ?? 'missing'} join=${announceJoin ? 1 : 0}\n`
     );
   }
   const settlementKind = normalizeSettlementKind(flags.get('settlement') || SETTLEMENT_KIND.SOLANA);
@@ -633,6 +784,11 @@ async function main() {
     process.stderr.write('[maker] max trades: unlimited\n');
     process.stderr.write('[maker] WARNING: unlimited mode enabled — may consume all available liquidity\n');
   }
+  if (maxTrades === 0) {
+    process.stderr.write('[maker] capacity mode: unlimited\n');
+  } else {
+    process.stderr.write('[maker] capacity mode: remaining capacity enforced\n');
+  }
 
   if (runSwap) {
     if (isSolanaSettlement) {
@@ -688,11 +844,25 @@ async function main() {
   let autoAnnounceInProgress = false;
   let autoAnnounceTimer = null;
   let warnedMissingAutoAnnounceConfig = false;
+  let warnedAutoAnnounceCapacitySuppressed = false;
+
+  const getRemainingCapacity = () => {
+    if (maxTrades === 0) return Number.POSITIVE_INFINITY;
+    return Math.max(maxTrades - completedTrades - activeTrades, 0);
+  };
 
   const runAutoAnnounce = async () => {
     if (!autoAnnounceIntervalSec || autoAnnounceInProgress) return false;
+    if (getRemainingCapacity() <= 0) {
+      if (!warnedAutoAnnounceCapacitySuppressed) {
+        process.stderr.write('[maker] auto announce suppressed: no remaining capacity\n');
+        warnedAutoAnnounceCapacitySuppressed = true;
+      }
+      return false;
+    }
+    warnedAutoAnnounceCapacitySuppressed = false;
     if (maxTrades > 0 && completedTrades >= maxTrades) return false;
-    if (!announceName || !announceOffersJson) {
+    if (!announceName || !normalizedAnnounceOffersJson) {
       if (!warnedMissingAutoAnnounceConfig) {
         process.stderr.write('[maker] auto announce skipped: missing announce-name or announce-offers-json\n');
         warnedMissingAutoAnnounceConfig = true;
@@ -719,7 +889,7 @@ async function main() {
           '--name',
           announceName,
           '--offers-json',
-          announceOffersJson,
+          normalizedAnnounceOffersJson,
           '--join',
           announceJoin ? '1' : '0',
         ];
@@ -1085,7 +1255,12 @@ async function main() {
     ctx.startedSettlement = true;
     activeTrades += 1;
     ctx.lifecycle.executionStarted = true;
-    process.stderr.write(`[maker] execution_start trade_id=${ctx.tradeId}\n`);
+    process.stderr.write(
+      `[maker] execution_start trade_id=${ctx.tradeId} ` +
+        `btc=${ctx.btcSats} sats (${formatBtcSats(ctx.btcSats)} BTC)` +
+        (isTaoPair(ctx.pair) ? ` tao=${formatTaoAtomic(ctx.usdtAmount)} TAO (${ctx.usdtAmount} atomic)` : '') +
+        '\n'
+    );
 
     const isRetryableSettlementError = (err) => {
       const message = String(err?.message ?? err ?? '').toLowerCase();
@@ -1545,7 +1720,33 @@ async function main() {
       if (evt?.channel !== rfqChannel && !swaps.has(evt?.channel)) return;
       const msg = evt?.message;
       if (!msg || typeof msg !== 'object') return;
-      process.stderr.write(`[maker] msg kind=${msg?.kind} trade_id=${msg?.trade_id} channel=${evt?.channel}\n`);
+      let duplicateQuoteAcceptIgnored = false;
+      if (evt?.channel === rfqChannel && msg.kind === KIND.QUOTE_ACCEPT) {
+        const tradeId = String(msg.trade_id || '');
+        const quoteId = String(msg.body?.quote_id || '').trim().toLowerCase();
+        const swapChannel = tradeId ? swapChannelTemplate.replaceAll('{trade_id}', tradeId) : '';
+        const known = quoteId ? quotes.get(quoteId) : null;
+        const lockKey =
+          known?.lock_key ||
+          (quoteId ? quoteIdToLockKey.get(quoteId) : null) ||
+          (tradeId ? tradeIdToLockKey.get(tradeId) : null) ||
+          (swapChannel ? swapChannelToLockKey.get(swapChannel) : null) ||
+          null;
+        const lock = lockKey ? rfqLocks.get(lockKey) : null;
+        const existing = swapChannel ? swaps.get(swapChannel) : null;
+        const pendingInvitee = swapChannel ? pendingSwaps.get(swapChannel) : null;
+        const duplicateQuoteAcceptLogTarget = existing || lock || known || null;
+        if ((lock?.swapChannel || existing || pendingInvitee) && duplicateQuoteAcceptLogTarget) {
+          duplicateQuoteAcceptIgnored = true;
+          if (!duplicateQuoteAcceptLogTarget.duplicateQuoteAcceptLogged) {
+            process.stderr.write(`[maker] duplicate quote_accept ignored trade_id=${tradeId}\n`);
+            duplicateQuoteAcceptLogTarget.duplicateQuoteAcceptLogged = true;
+          }
+        }
+      }
+      if (!duplicateQuoteAcceptIgnored) {
+        process.stderr.write(`[maker] msg kind=${msg?.kind} trade_id=${msg?.trade_id} channel=${evt?.channel}\n`);
+      }
 
       // Swap channel traffic
       if (swaps.has(evt.channel)) {
@@ -1717,6 +1918,8 @@ async function main() {
         const rfqId = hashUnsignedEnvelope(rfqUnsigned);
         const pair = normalizePair(msg.body?.pair || PAIR.BTC_LN__USDT_SOL);
         const rfqAmountAtomic = normalizeAmountString(getAmountForPair(msg.body, pair, { allowLegacyTaoFallback: true }));
+        const rfqBtc = Number(msg.body?.btc_sats);
+        const rfqTaoAtomic = rfqAmountAtomic;
         persistTrade(
           String(msg.trade_id || '').trim(),
           {
@@ -1737,8 +1940,23 @@ async function main() {
         process.stderr.write(
           `[maker] rfq_received rfq_id=${rfqId} trade_id=${String(msg.trade_id || '').trim() || 'n/a'} ` +
             `rfq_channel=${rfqChannel} settlement_kind=${String(msg.body?.settlement_kind || '').trim() || 'n/a'} ` +
-            `settlement_refund_after_sec=${msg.body?.settlement_refund_after_sec ?? 'n/a'}\n`
+            `settlement_refund_after_sec=${msg.body?.settlement_refund_after_sec ?? 'n/a'} ` +
+            `btc=${rfqBtc} sats (${formatBtcSats(rfqBtc)} BTC)` +
+            (isTaoPair(pair) ? ` tao=${formatTaoAtomic(rfqTaoAtomic)} TAO (${rfqTaoAtomic} atomic)` : '') +
+            '\n'
         );
+        if (
+          !withinBounds(rfqBtc, minBtcSats, maxBtcSats) ||
+          !withinBounds(BigInt(rfqTaoAtomic), minTaoAtomic, maxTaoAtomic)
+        ) {
+          process.stderr.write(
+            `[maker] SKIP rfq size_out_of_bounds ` +
+              `btc=${rfqBtc} sats (${formatBtcSats(rfqBtc)} BTC)` +
+              (isTaoPair(pair) ? ` tao=${formatTaoAtomic(rfqTaoAtomic)} TAO (${rfqTaoAtomic} atomic)` : '') +
+              '\n'
+          );
+          return;
+        }
 
         if (msg.body?.valid_until_unix !== undefined) {
           const nowSec = Math.floor(Date.now() / 1000);
@@ -1775,7 +1993,10 @@ async function main() {
             `existing_lock=${existingLock ? 'yes' : 'no'} existing_quote_id=${existingLock?.quoteId || 'n/a'} ` +
             `existing_settlement_kind=${String(existingQuoteBody?.settlement_kind || '').trim() || 'n/a'} ` +
             `existing_settlement_refund_after_sec=${existingQuoteBody?.settlement_refund_after_sec ?? 'n/a'} ` +
-            `maker_settlement_refund_after_sec=${settlementRefundAfterSec}\n`
+            `maker_settlement_refund_after_sec=${settlementRefundAfterSec} ` +
+            `btc=${rfqBtc} sats (${formatBtcSats(rfqBtc)} BTC)` +
+            (isTaoPair(pair) ? ` tao=${formatTaoAtomic(rfqTaoAtomic)} TAO (${rfqTaoAtomic} atomic)` : '') +
+            '\n'
         );
         if (existingLock) {
           existingLock.lastSeenMs = lockNowMs;
@@ -1826,7 +2047,13 @@ async function main() {
             clearRfqLock(lockKey, 'quote_expired_repost');
           }
         }
-        if (maxTrades !== null && activeTrades >= maxTrades) {
+        if (getRemainingCapacity() <= 0) {
+          process.stderr.write(
+            `[maker] SKIP rfq no remaining capacity remaining=0 completed=${completedTrades} active=${activeTrades} max=${maxTrades}\n`
+          );
+          return;
+        }
+        if (maxTrades > 0 && activeTrades >= maxTrades) {
           process.stderr.write(
             `[maker] SKIP rfq active trade limit reached active=${activeTrades} max=${maxTrades}\n`
           );
@@ -2005,7 +2232,10 @@ async function main() {
         const signed = signSwapEnvelope(quoteUnsigned, signing, { effectiveMinSettlementRefundAfterSec });
         process.stderr.write(
           `[maker] new_quote begin rfq_id=${rfqId} quote_id=${quoteId} settlement_kind=${settlementKind} ` +
-            `settlement_refund_after_sec=${isTaoPair(pair) ? settlementRefundAfterSec : 'n/a'}\n`
+            `settlement_refund_after_sec=${isTaoPair(pair) ? settlementRefundAfterSec : 'n/a'} ` +
+            `btc=${msg.body.btc_sats} sats (${formatBtcSats(msg.body.btc_sats)} BTC)` +
+            (isTaoPair(pair) ? ` tao=${formatTaoAtomic(quoteUsdtAmount)} TAO (${quoteUsdtAmount} atomic)` : '') +
+            '\n'
         );
         const sent = ensureOk(await sc.send(rfqChannel, signed), 'send quote');
         process.stderr.write(`[maker] new_quote sent rfq_id=${rfqId} quote_id=${quoteId}\n`);
@@ -2115,7 +2345,7 @@ async function main() {
           }
           const duplicateQuoteAcceptLogTarget = existing || lock || known;
           if (duplicateQuoteAcceptLogTarget && !duplicateQuoteAcceptLogTarget.duplicateQuoteAcceptLogged) {
-            process.stderr.write(`[maker] SKIP duplicate QUOTE_ACCEPT trade_id=${tradeId} swap_channel=${swapChannel} resent=${resent}\n`);
+            process.stderr.write(`[maker] duplicate quote_accept ignored trade_id=${tradeId}\n`);
             duplicateQuoteAcceptLogTarget.duplicateQuoteAcceptLogged = true;
           }
           return;

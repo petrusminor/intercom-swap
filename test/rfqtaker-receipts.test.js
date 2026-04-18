@@ -23,7 +23,7 @@ test('rfq-taker receipts: crash-before-pay checkpoint persists invoice hash for 
       role: 'taker',
       swap_channel: `swap:${tradeId}`,
       btc_sats: 50000,
-      tao_amount_atomic: '4200000000',
+      tao_amount_atomic: '4200000000000000000',
       state: 'accepted',
     });
 

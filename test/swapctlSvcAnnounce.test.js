@@ -14,7 +14,7 @@ test('swapctl svc-announce autofills missing offer app_hash from settlement bind
         have: 'TAO_EVM',
         want: 'BTC_LN',
         btc_sats: 10000,
-        tao_amount_atomic: '4200000000',
+        tao_amount_atomic: '4200000000000000000',
         settlement_refund_after_sec: 259200,
       },
       {

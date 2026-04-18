@@ -10,7 +10,7 @@ This runbook is copy/paste oriented for running maker + taker in `tao-evm` settl
 - Run from repo root:
   - `~/intercom-swap`
 
-Required TAO env:
+TAO env:
 
 ```bash
 cd ~/intercom-swap
@@ -19,6 +19,10 @@ export TAO_EVM_RPC_URL="https://lite.chain.opentensor.ai"
 export TAO_EVM_PRIVATE_KEY="0x<your_32_byte_hex_private_key>"
 export TAO_EVM_HTLC_ADDRESS="0x<deployed_tao_htlc_address>"
 ```
+
+Notes:
+- `TAO_EVM_PRIVATE_KEY` is required for live signing unless you use `--tao-keyfile`.
+- `TAO_EVM_HTLC_ADDRESS` is recommended for explicitness, but current settlement binding also has a canonical default fallback when the address is omitted.
 
 Warning:
 - Use a fresh dev key with small funds only.
@@ -224,7 +228,7 @@ Example TAO offer announcement payload (`intercomswap_offer_post`):
       "have": "TAO_EVM",
       "want": "BTC_LN",
       "btc_sats": 50000,
-      "tao_amount_atomic": "100000000",
+      "tao_amount_atomic": "100000000000000000",
       "max_platform_fee_bps": 10,
       "max_trade_fee_bps": 10,
       "max_total_fee_bps": 20,
@@ -244,7 +248,7 @@ curl -sS http://127.0.0.1:7700/v1/run \
   -d '{
     "auto_approve": true,
     "max_steps": 1,
-    "prompt": "{\"type\":\"tool\",\"name\":\"intercomswap_offer_post\",\"arguments\":{\"channels\":[\"0000intercomswapbtctao\"],\"name\":\"maker:tao\",\"rfq_channels\":[\"0000intercomswapbtctao\"],\"offers\":[{\"pair\":\"BTC_LN/TAO_EVM\",\"have\":\"TAO_EVM\",\"want\":\"BTC_LN\",\"btc_sats\":50000,\"tao_amount_atomic\":\"100000000\",\"max_platform_fee_bps\":10,\"max_trade_fee_bps\":10,\"max_total_fee_bps\":20,\"settlement_refund_after_sec\":259200}]}}"
+    "prompt": "{\"type\":\"tool\",\"name\":\"intercomswap_offer_post\",\"arguments\":{\"channels\":[\"0000intercomswapbtctao\"],\"name\":\"maker:tao\",\"rfq_channels\":[\"0000intercomswapbtctao\"],\"offers\":[{\"pair\":\"BTC_LN/TAO_EVM\",\"have\":\"TAO_EVM\",\"want\":\"BTC_LN\",\"btc_sats\":50000,\"tao_amount_atomic\":\"100000000000000000\",\"max_platform_fee_bps\":10,\"max_trade_fee_bps\":10,\"max_total_fee_bps\":20,\"settlement_refund_after_sec\":259200}]}}"
   }'
 ```
 

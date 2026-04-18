@@ -68,7 +68,7 @@ test('offer_post: accepts TAO offer line in tao-evm mode', async () => {
           have: 'TAO_EVM',
           want: 'BTC_LN',
           btc_sats: 10_000,
-          tao_amount_atomic: '4200000000',
+          tao_amount_atomic: '4200000000000000000',
           settlement_refund_after_sec: 259200,
           max_platform_fee_bps: 10,
           max_trade_fee_bps: 10,
@@ -81,7 +81,7 @@ test('offer_post: accepts TAO offer line in tao-evm mode', async () => {
 
   assert.equal(out.type, 'dry_run');
   assert.equal(out.unsigned.body.pairs[0], 'BTC_LN/TAO_EVM');
-  assert.equal(out.unsigned.body.offers[0].tao_amount_atomic, '4200000000');
+  assert.equal(out.unsigned.body.offers[0].tao_amount_atomic, '4200000000000000000');
   assert.equal(out.unsigned.body.offers[0].settlement_refund_after_sec, 259200);
   assert.equal(out.unsigned.body.offers[0].settlement_kind, 'tao-evm');
 });
@@ -109,7 +109,7 @@ test('offer_post: rejects mixed sol/usdt fields on TAO pair', async () => {
               have: 'TAO_EVM',
               want: 'BTC_LN',
               btc_sats: 10_000,
-              tao_amount_atomic: '4200000000',
+              tao_amount_atomic: '4200000000000000000',
               min_sol_refund_window_sec: 259200,
             },
           ],
@@ -144,7 +144,7 @@ test('offer_post: rejects TAO fields on USDT pair', async () => {
               want: 'BTC_LN',
               btc_sats: 10_000,
               usdt_amount: '4200000',
-              tao_amount_atomic: '4200000000',
+              tao_amount_atomic: '4200000000000000000',
               min_sol_refund_window_sec: 259200,
               max_sol_refund_window_sec: 259200,
             },

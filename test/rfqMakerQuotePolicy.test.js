@@ -21,7 +21,7 @@ function makeSignedQuote({ settlementRefundAfterSec }) {
         direction: 'BTC_LN->TAO_EVM',
         app_hash: '11'.repeat(32),
         btc_sats: 50000,
-        tao_amount_atomic: '4200000000',
+        tao_amount_atomic: '4200000000000000000',
         settlement_kind: 'tao-evm',
         settlement_refund_after_sec: settlementRefundAfterSec,
         valid_until_unix: Math.floor(Date.now() / 1000) + 60,

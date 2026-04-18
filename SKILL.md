@@ -219,9 +219,47 @@ This repo also provides long-running RFQ “agent bots” that sit in an RFQ cha
 - `scripts/rfq-taker.mjs`: sends a `swap.rfq`, waits for a `swap.quote`, sends `swap.quote_accept`, waits for `swap.swap_invite`, then joins the `swap:<id>` channel.
   - With `--run-swap 1`, it also runs the **full swap state machine** (accept -> verify escrow on-chain -> pay LN -> claim Solana escrow).
 
+### Capacity And Trade Admission Control
+- `maxTrades` semantics:
+  - omitted: default `1`
+  - `0`: unlimited
+  - `n > 0`: finite total trade capacity
+- Definitions:
+  - `activeTrades`: trades already committed and still in flight
+  - `completedTrades`: terminal claimed trades
+  - `remainingCapacity`: `maxTrades - completedTrades - activeTrades` (or infinity when `maxTrades = 0`)
+- Maker behavior:
+  - rejects new RFQs when `remainingCapacity == 0`
+  - suppresses maker-side auto-announce when capacity is exhausted
+- Taker behavior:
+  - does not start a new RFQ cycle when `remainingCapacity == 0`
+  - does not accept a new quote when `remainingCapacity == 0`
+- Critical invariant:
+  - in-flight swaps must always complete, regardless of later capacity state
+
+### RFQ Retry And Commitment Semantics
+- `rfq-taker` regenerates and re-signs the RFQ on each resend attempt:
+  - fresh validity window
+  - fresh `rfq_id`
+- RFQ resend uses a single throttled timer with jitter; it is not a fixed tight resend loop.
+- RFQ handshake wait does not hard-exit on the first timeout:
+  - the taker logs the wait condition
+  - the handshake deadline is extended and the process keeps waiting
+- The RFQ resend loop stops once the taker commits to one counterparty:
+  - after `quote_accept` is sent, or
+  - after `swap_joined` is received
+- Purpose:
+  - prevent multi-maker race conditions and overlapping matches
+
+### Multi-Trade Taker Operation
+- `rfq-taker` is cycle-based, not single-shot internally.
+- It runs multiple trade cycles until `maxTrades` is reached.
+- It continues listening between cycles and starts a fresh RFQ lifecycle for each new trade.
+- It exits only when finite capacity is exhausted, unless running in unlimited mode.
+
 ### RFQ Selection Behavior (Current Limitation)
 - Current behavior:
-  - `rfq-taker` accepts the first valid offer/quote it receives.
+  - `rfq-taker` accepts the first valid offer/quote it receives when remaining capacity is available.
   - There is no aggregation or ranking across multiple offers.
   - There is no best-price selection based on `tao_amount_atomic` or economic value.
 - Maker behavior:
@@ -243,6 +281,37 @@ This repo also provides long-running RFQ “agent bots” that sit in an RFQ cha
   - no multi-offer comparison window
 - Future direction:
   - best-offer selection would require collecting multiple offers, ranking candidates, and applying a deterministic selection rule
+
+### Swap Summary Events
+- Both `rfq-maker` and `rfq-taker` emit a structured `swap_summary` JSON event at terminal state.
+- The summary includes:
+  - settlement type
+  - timing (`start_ts`, `end_ts`, `duration_ms`)
+  - lifecycle stages reached by that role
+- `swap_summary` is observability only:
+  - not part of the protocol
+  - not a wire-level requirement
+  - does not alter swap execution
+
+### Runtime Invariants
+- No protocol changes.
+- No wire changes.
+- No settlement logic changes.
+- Lifecycle handling remains deterministic for a given accepted trade.
+- Retries are allowed for existing trades even when capacity is full.
+- New trades are blocked when remaining capacity is exhausted.
+- Duplicate network messages must be handled idempotently.
+
+### Maker Auto-Announce Policy
+- Maker-side auto-announce runs `svc-announce` from `rfq-maker` on a jittered timer.
+- It requires explicit announce config:
+  - `--auto-announce-interval-sec`
+  - `--announce-name`
+  - `--announce-offers-json`
+  - optional: `--announce-ttl-sec`, `--announce-join`
+- Auto-announce is suppressed when:
+  - announce config is missing, or
+  - remaining capacity is zero
 
 ### Deterministic Test Flags (Regtest Only)
 - `--test-stop-before-ln-pay 1`
@@ -342,7 +411,8 @@ This repo also provides long-running RFQ “agent bots” that sit in an RFQ cha
 
 These bots are designed for:
 - unattended end-to-end tests (`--once`)
-- “sit in channel all day” operation (default: run forever)
+- bounded operation with finite capacity (`--max-trades <n>`)
+- continuous operation with `--max-trades 0`
 
 To avoid copy/pasting SC-Bridge URLs/tokens for the bots, use:
 - `scripts/rfq-maker-peer.sh`, `scripts/rfq-maker-peer.ps1`

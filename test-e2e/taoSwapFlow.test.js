@@ -243,7 +243,7 @@ test('e2e: deterministic TAO settlement swap flow through prompt executor', asyn
   const tradeId = 'phase8-tao-trade';
   const channel = 'swap:phase8-tao-trade';
   const btcSats = 1200;
-  const usdtAmount = '5000000';
+  const usdtAmount = '5000000000000000';
   const appHash = executor._settlementAppHash();
   const bolt11 = 'lnbcrt1phase8deterministicinvoice0000000000000001';
 
