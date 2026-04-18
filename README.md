@@ -1,3 +1,43 @@
+# Intercom Swap (BTC_LN ↔ TAO_EVM Extension)
+
+This repository extends the original Intercom Swap implementation by Trac Systems to support BTC Lightning ↔ TAO EVM atomic swaps, along with execution-level improvements for real-world trading conditions.
+
+## Attribution
+
+This project is based on:
+
+https://github.com/TracSystems/intercom-swap
+
+Licensed under MIT.  
+All original copyright and licensing terms are preserved.
+
+---
+
+## What This Fork Adds
+
+- TAO EVM settlement provider
+- Capacity-aware execution constraints
+- Deterministic multi-trade lifecycle handling
+- Improved RFQ / offer execution behavior
+- Strict parsing and validation for settlement amounts
+
+---
+
+## Current Focus
+
+- Removal of implicit/default trade amounts
+- Explicit trade-mode enforcement:
+  - Price-defined mode (explicit amounts)
+  - Constraint mode (min/max filtering only)
+- Preparation for oracle-based pricing
+
+---
+
+⚠️ Below is the original Intercom Swap README (retained for full documentation)
+
+
+
+
 # Intercom Swap
 
 This repo is a fork of upstream **Intercom** (Trac-Systems/intercom): a reference implementation of the Intercom stack on Trac Network for an internet of agents.
